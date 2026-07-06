@@ -1,0 +1,17 @@
+---
+slug: content-script-helpers
+name: Content script helpers
+status: curated
+category: browser-extension
+maturity: stable
+applies_to:
+- browser-extension
+description: Helpers for MV3 content scripts and page messaging.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: developer.chrome.com
+  url: https://developer.chrome.com/docs/extensions/develop/concepts/content-scripts
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

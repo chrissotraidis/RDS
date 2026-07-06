@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+# bin/rds-stop — terminate a running build, idempotently (TD-012).
+#
+# Reads $BUILD_DIR/run.pid, sends SIGTERM to the build's process group,
+# waits up to RDS_STOP_TIMEOUT seconds, then escalates to SIGKILL.
+# Always emits build_stopped to events.jsonl (TD-014) and (by default)
+# pings Telegram (TD-011).
+#
+# Idempotency: missing/stale PID file → exit 0 with a message; never errors.
+#
+# Usage:
+#   bin/rds-stop                       # stop the most recent in-flight build
+#   bin/rds-stop <build-id>            # stop a specific build
+#   bin/rds-stop --slug=<slug>         # stop the most recent build matching slug
+#   bin/rds-stop --all                 # stop every in-flight build
+#
+# Flags:
+#   --no-notify     don't ping Telegram (event still logged)
+#   --timeout=<s>   override SIGTERM grace period (default 15s)
+#
+# Env:
+#   RDS_STOP_TIMEOUT   default grace period if --timeout is unset
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck disable=SC1091
+source "$ROOT/bin/lib/common.sh"
+
+NOTIFY=1
+ALL=0
+TIMEOUT="${RDS_STOP_TIMEOUT:-15}"
+SLUG=""
+TARGET_BUILD=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --all)         ALL=1; shift ;;
+    --no-notify)   NOTIFY=0; shift ;;
+    --timeout=*)   TIMEOUT="${1#--timeout=}"; shift ;;
+    --timeout)     TIMEOUT="$2"; shift 2 ;;
+    --slug=*)      SLUG="${1#--slug=}"; shift ;;
+    --slug)        SLUG="$2"; shift 2 ;;
+    -h|--help)     sed -n '2,24p' "$0"; exit 0 ;;
+    -*)            echo "ERROR: unknown flag '$1'" >&2; exit 2 ;;
+    *)
+      if [[ -z "$TARGET_BUILD" ]]; then TARGET_BUILD="$1"
+      else echo "ERROR: unexpected positional '$1'" >&2; exit 2; fi
+      shift ;;
+  esac
+done
+
+if [[ ! "$TIMEOUT" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: --timeout must be a positive integer" >&2; exit 2
+fi
+
+# --- Collect candidate builds ----------------------------------------------
+candidates=()
+if [[ "$ALL" -eq 1 ]]; then
+  shopt -s nullglob
+  for pidfile in "$RDS_BUILDS_DIR"/*/run.pid; do
+    candidates+=("$(basename "$(dirname "$pidfile")")")
+  done
+  shopt -u nullglob
+elif [[ -n "$TARGET_BUILD" ]]; then
+  candidates=("$TARGET_BUILD")
+elif [[ -n "$SLUG" ]]; then
+  match="$(ls -1t "$RDS_BUILDS_DIR" 2>/dev/null | grep -F "$SLUG" | head -n1 || true)"
+  [[ -n "$match" ]] || { echo "[rds-stop] no build matching slug '$SLUG'"; exit 0; }
+  candidates=("$match")
+else
+  # Default: the most recent build with a live run.pid.
+  shopt -s nullglob
+  newest=""
+  newest_mtime=0
+  for pidfile in "$RDS_BUILDS_DIR"/*/run.pid; do
+    pid="$(awk -F= '/^pid=/{print $2; exit}' "$pidfile" 2>/dev/null || true)"
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    build_id="$(basename "$(dirname "$pidfile")")"
+    if rds_pid_is_build_runner "$pid" "$build_id"; then
+      mtime="$(stat -c %Y "$pidfile" 2>/dev/null || echo 0)"
+      if (( mtime > newest_mtime )); then
+        newest_mtime="$mtime"
+        newest="$build_id"
+      fi
+    fi
+  done
+  shopt -u nullglob
+  if [[ -z "$newest" ]]; then
+    echo "[rds-stop] no in-flight builds; nothing to do."
+    exit 0
+  fi
+  candidates=("$newest")
+fi
+
+# --- Stop each candidate ----------------------------------------------------
+stopped_any=0
+for build_id in "${candidates[@]}"; do
+  build_dir="$RDS_BUILDS_DIR/$build_id"
+  pidfile="$build_dir/run.pid"
+
+  if [[ ! -f "$pidfile" ]]; then
+    echo "[rds-stop] $build_id: no PID file, nothing to stop"
+    continue
+  fi
+
+  pid="$(awk -F= '/^pid=/{print $2; exit}'  "$pidfile" 2>/dev/null || true)"
+  pgid="$(awk -F= '/^pgid=/{print $2; exit}' "$pidfile" 2>/dev/null || true)"
+  : "${pgid:=$pid}"
+
+  if [[ -z "$pid" || ! "$pid" =~ ^[0-9]+$ ]]; then
+    echo "[rds-stop] $build_id: PID file is malformed, removing"
+    rm -f "$pidfile"
+    continue
+  fi
+
+  if ! rds_pid_is_build_runner "$pid" "$build_id"; then
+    echo "[rds-stop] $build_id: pid $pid is not an active RDS runner, removing stale PID file"
+    rm -f "$pidfile"
+    continue
+  fi
+
+  echo "[rds-stop] $build_id: terminating pgid=$pgid (SIGTERM)"
+  # Negative pid → kill the process group.
+  kill -TERM "-$pgid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+
+  # Wait for graceful exit.
+  waited=0
+  while (( waited < TIMEOUT )); do
+    if ! kill -0 "$pid" 2>/dev/null; then break; fi
+    sleep 1
+    waited=$(( waited + 1 ))
+  done
+
+  if kill -0 "$pid" 2>/dev/null; then
+    echo "[rds-stop] $build_id: still alive after ${TIMEOUT}s — escalating to SIGKILL"
+    kill -KILL "-$pgid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+    sleep 1
+  fi
+
+  if kill -0 "$pid" 2>/dev/null; then
+    echo "[rds-stop] $build_id: WARNING pid $pid is still alive after SIGKILL" >&2
+  else
+    echo "[rds-stop] $build_id: stopped"
+    rm -f "$pidfile"
+    stopped_any=1
+  fi
+
+  # --- Emit lifecycle event + (optional) Telegram --------------------------
+  if [[ "$NOTIFY" -eq 1 ]]; then
+    "$ROOT/bin/rds-notify" build_blocked \
+      --build-id "$build_id" \
+      --build-dir "$build_dir" \
+      --message "🛑 RDS build STOPPED by operator: $build_id" \
+      || true
+  else
+    "$ROOT/bin/rds-event" build_stopped \
+      --build-id "$build_id" --build-dir "$build_dir" \
+      reason="operator-stop" \
+      || true
+  fi
+done
+
+exit 0

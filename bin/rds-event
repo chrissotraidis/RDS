@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+# bin/rds-event — append-only structured event stream (TD-014).
+#
+# Writes JSONL records to:
+#   - $RDS_ROOT/events.jsonl                 (global feed; always)
+#   - $BUILD_DIR/events.jsonl                (if BUILD_DIR is set)
+#   - $APP_DEST/.scaffold/events.jsonl       (if APP_DEST is set)
+#
+# The dashboard (TD-001) and bin/rds-notify (TD-011) read these.
+#
+# Usage:
+#   bin/rds-event <event-name>                            # no payload
+#   bin/rds-event <event-name> key1=val1 key2=val2 ...   # k=v pairs
+#   bin/rds-event <event-name> --json '{"k":"v"}'        # raw JSON object
+#
+# Required env (or flags) for build-scoped events:
+#   BUILD_DIR  (or --build-dir=PATH)         — RDS-side build dir (preferred)
+#   APP_DEST   (or --app-dest=PATH)          — project dir (alternate)
+#   BUILD_ID   (or --build-id=ID)            — opaque tag, defaulted from BUILD_DIR
+#
+# Each line is a single JSON object:
+#   {"ts":"2026-04-27T10:20:00Z","build_id":"...","event":"task_started",
+#    "payload":{...},"pid":1234}
+set -euo pipefail
+
+# Resolve RDS root regardless of cwd. The script is in bin/ ; root is its parent.
+RDS_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+ROOT="$RDS_ROOT"
+# shellcheck disable=SC1091
+source "$RDS_ROOT/bin/lib/common.sh"
+
+# --- Argument parsing ------------------------------------------------------
+EVENT=""
+JSON_PAYLOAD=""
+KV_PAYLOAD=""
+EXPLICIT_BUILD_ID=""
+EXPLICIT_BUILD_DIR=""
+EXPLICIT_APP_DEST=""
+
+# Collect positional kv pairs after the event name.
+positional=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --json)         JSON_PAYLOAD="$2"; shift 2 ;;
+    --json=*)       JSON_PAYLOAD="${1#--json=}"; shift ;;
+    --build-id=*)   EXPLICIT_BUILD_ID="${1#--build-id=}"; shift ;;
+    --build-id)     EXPLICIT_BUILD_ID="$2"; shift 2 ;;
+    --build-dir=*)  EXPLICIT_BUILD_DIR="${1#--build-dir=}"; shift ;;
+    --build-dir)    EXPLICIT_BUILD_DIR="$2"; shift 2 ;;
+    --app-dest=*)   EXPLICIT_APP_DEST="${1#--app-dest=}"; shift ;;
+    --app-dest)     EXPLICIT_APP_DEST="$2"; shift 2 ;;
+    -h|--help)
+      sed -n '2,28p' "$0"; exit 0 ;;
+    *)              positional+=("$1"); shift ;;
+  esac
+done
+
+if [[ ${#positional[@]} -eq 0 ]]; then
+  echo "ERROR: bin/rds-event requires an event name. See --help." >&2
+  exit 2
+fi
+
+EVENT="${positional[0]}"
+positional=("${positional[@]:1}")
+
+# Validate event name (snake_case-ish; refuse spaces/quotes).
+if [[ ! "$EVENT" =~ ^[a-zA-Z][a-zA-Z0-9_.-]{0,63}$ ]]; then
+  echo "ERROR: invalid event name '$EVENT' (alnum/underscore/dot/dash only, ≤64 chars)" >&2
+  exit 2
+fi
+
+# Build kv-payload from remaining positional args.
+if [[ ${#positional[@]} -gt 0 && -z "$JSON_PAYLOAD" ]]; then
+  KV_PAYLOAD="$(
+    for kv in "${positional[@]}"; do
+      printf '%s\n' "$kv"
+    done
+  )"
+fi
+
+# --- Resolve scopes --------------------------------------------------------
+build_dir="${EXPLICIT_BUILD_DIR:-${BUILD_DIR:-}}"
+app_dest="${EXPLICIT_APP_DEST:-${APP_DEST:-}}"
+build_id="${EXPLICIT_BUILD_ID:-${BUILD_ID:-}}"
+
+if [[ -z "$build_id" && -n "$build_dir" ]]; then
+  build_id="$(basename "$build_dir")"
+fi
+if [[ -z "$build_id" && -n "$app_dest" ]]; then
+  build_id="$(basename "$app_dest")"
+fi
+build_id="${build_id:-unknown}"
+
+# --- Compose JSON record ---------------------------------------------------
+# Use jq to guarantee well-formed JSON; never rely on shell quoting.
+ts="$(date -u +%FT%TZ)"
+
+# Start payload as either passed JSON or {} for kv merging.
+if [[ -n "$JSON_PAYLOAD" ]]; then
+  # Validate it's a JSON object.
+  if ! printf '%s' "$JSON_PAYLOAD" | jq -e 'type == "object"' >/dev/null 2>&1; then
+    echo "ERROR: --json must be a valid JSON object, got: $JSON_PAYLOAD" >&2
+    exit 2
+  fi
+  payload_json="$JSON_PAYLOAD"
+else
+  payload_json="{}"
+fi
+
+# Merge k=v pairs into payload (string values; jq preserves nesting).
+if [[ -n "$KV_PAYLOAD" ]]; then
+  while IFS= read -r kv; do
+    [[ -z "$kv" ]] && continue
+    if [[ "$kv" != *=* ]]; then
+      echo "ERROR: positional payload arg '$kv' is not key=value" >&2
+      exit 2
+    fi
+    k="${kv%%=*}"
+    v="${kv#*=}"
+    payload_json="$(printf '%s' "$payload_json" \
+      | jq --arg k "$k" --arg v "$v" '. + {($k): $v}')"
+  done <<< "$KV_PAYLOAD"
+fi
+
+record="$(jq -nc \
+  --arg ts "$ts" \
+  --arg build_id "$build_id" \
+  --arg event "$EVENT" \
+  --argjson payload "$payload_json" \
+  --argjson pid "$$" \
+  '{ts: $ts, build_id: $build_id, event: $event, payload: $payload, pid: $pid}')"
+
+# --- Write to all applicable streams (atomic append) -----------------------
+emit() {
+  local target="$1"
+  mkdir -p "$(dirname "$target")"
+  # Each line on its own; flock is overkill for append-only JSONL on local fs,
+  # but use it anyway to be safe under parallel writers (TD-003).
+  if command -v flock >/dev/null 2>&1; then
+    (
+      flock -x 9
+      printf '%s\n' "$record" >> "$target"
+    ) 9>>"$target.lock"
+  else
+    printf '%s\n' "$record" >> "$target"
+  fi
+}
+
+# Global feed.
+emit "$RDS_EVENTS_PATH"
+
+# Per-build feed (RDS-side).
+if [[ -n "$build_dir" && -d "$build_dir" ]]; then
+  emit "$build_dir/events.jsonl"
+fi
+
+# Per-project feed (app-side).
+if [[ -n "$app_dest" && -d "$app_dest" ]]; then
+  emit "$app_dest/.scaffold/events.jsonl"
+fi
+
+# Quiet on success — callers don't want noise.
+exit 0

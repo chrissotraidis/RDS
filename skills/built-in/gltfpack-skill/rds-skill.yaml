@@ -1,0 +1,20 @@
+---
+slug: gltfpack-skill
+name: gltfpack
+status: ready
+default: false
+applies_to:
+- web-3d
+description: gltfpack optimization contract for 3D web assets.
+install:
+  command: bin/rds-skill-materialize gltfpack-skill
+verify:
+  command: bin/rds-skill-verify gltfpack-skill
+maturity: stable
+category: asset-pipeline
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should
+  understand during stack selection, skill resolution, implementation guidance, or
+  verification.
+source_links:
+- label: github.com
+  url: https://github.com/zeux/meshoptimizer/tree/master/gltf

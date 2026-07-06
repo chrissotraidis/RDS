@@ -1,0 +1,43 @@
+{
+  "id": "game-asset-pipeline",
+  "name": "Game asset pipeline",
+  "language": "python",
+  "runtime": {
+    "python": ">=3.12",
+    "uv": ">=0.4"
+  },
+  "framework": {
+    "name": "headless-asset-pipeline",
+    "version": "1"
+  },
+  "database": "none",
+  "default_port_range": [
+    4000,
+    4099
+  ],
+  "health_path": "/health.json",
+  "stages": [
+    "intake",
+    "spec",
+    "init",
+    "scaffold",
+    "local-run",
+    "deploy",
+    "qa"
+  ],
+  "init": "stacks/game-asset-pipeline/init.sh",
+  "local_run": "stacks/game-asset-pipeline/local-run.sh",
+  "doctor": "stacks/game-asset-pipeline/doctor.sh",
+  "scaffold_recipe": "game_asset_pipeline",
+  "service_entrypoint": "bash -c 'uv sync; PYTHONPATH=. uv run python scripts/build_preview.py; exec env PYTHONPATH=. uv run python scripts/serve_preview.py'",
+  "service_env": {
+    "PYTHONUNBUFFERED": "1",
+    "RDS_RUNTIME": "zo"
+  },
+  "supports_modes": [
+    "green",
+    "brown"
+  ],
+  "status": "ready",
+  "notes": "Ready V1 Phase 1c asset pipeline stack with uv, deterministic transforms, validation, and model-viewer/download preview. Blender/bpy hooks are present but optional until Blender is installed."
+}

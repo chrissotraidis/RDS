@@ -1,0 +1,17 @@
+---
+slug: realtime-solid-cable
+name: Solid Cable realtime
+status: curated
+category: realtime
+maturity: stable
+applies_to:
+- rails-web
+description: Rails realtime through Solid Cable.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: guides.rubyonrails.org
+  url: https://guides.rubyonrails.org/
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

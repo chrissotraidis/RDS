@@ -1,0 +1,17 @@
+---
+slug: mcp-builder
+name: MCP builder
+status: curated
+category: mcp
+maturity: beta
+applies_to:
+- python-ai-service
+description: Builds MCP servers from Python service briefs.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: modelcontextprotocol.io
+  url: https://modelcontextprotocol.io/
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

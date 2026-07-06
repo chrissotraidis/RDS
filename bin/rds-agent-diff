@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+RDS_ROOT="$ROOT"
+source "$ROOT/bin/lib/common.sh"
+source "$ROOT/bin/lib/agents.sh"
+ID="${1:-}"
+[[ -n "$ID" ]] || { echo "usage: bin/rds-agent-diff <session-id>" >&2; exit 2; }
+JSON_PATH="$(agent_find_session_json "$ID")" || { echo "No agent session named $ID" >&2; exit 1; }
+WORKTREE="$(agent_json_get "$JSON_PATH" '.worktree_path')"
+OUT_DIR="$(dirname "$JSON_PATH")"
+DIFF_PATH="$OUT_DIR/$ID.diff"
+git -C "$WORKTREE" status --short
+echo
+git -C "$WORKTREE" diff --stat || true
+git -C "$WORKTREE" diff >"$DIFF_PATH" || true
+echo
+echo "full_diff=$DIFF_PATH"
+

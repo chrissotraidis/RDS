@@ -1,0 +1,25 @@
+---
+slug: storage-s3-r2
+name: S3/R2 object storage
+status: ready
+default: false
+applies_to:
+- rails-web
+- nextjs-fullstack
+- python-ai-service
+- astro-thin-web
+- game-asset-pipeline
+- mobile-native
+description: Adds the object storage implementation contract for uploads and generated artifacts.
+install:
+  command: bin/rds-skill-materialize storage-s3-r2
+verify:
+  command: bin/rds-skill-verify storage-s3-r2
+maturity: operational
+category: storage
+rationale: Uploads and generated assets need durable object storage, signed URL rules, and local fallback behavior. This skill keeps storage decisions explicit.
+source_links:
+- label: Cloudflare R2 Docs
+  url: https://developers.cloudflare.com/r2/
+- label: Amazon S3 Docs
+  url: https://docs.aws.amazon.com/s3/

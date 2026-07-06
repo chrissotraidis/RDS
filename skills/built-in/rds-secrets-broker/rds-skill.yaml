@@ -1,0 +1,18 @@
+---
+slug: rds-secrets-broker
+name: RDS secrets broker
+status: ready
+default: true
+applies_to:
+- universal
+description: Records secret requirements without copying or exposing actual secret values.
+install:
+  mode: metadata
+verify:
+  command: skills/built-in/rds-secrets-broker/scripts/verify.sh
+maturity: operational
+category: security
+rationale: Default RDS skill for all stacks because any generated app can introduce credentials, analytics keys, OAuth, webhooks, or deploy secrets, and generated apps must not hardcode or expose secret values.
+source_links:
+- label: zo.computer docs
+  url: https://docs.zocomputer.com/

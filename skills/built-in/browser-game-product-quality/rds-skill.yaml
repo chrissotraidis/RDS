@@ -1,0 +1,18 @@
+---
+slug: browser-game-product-quality
+name: Browser game product quality
+status: ready
+default: false
+applies_to:
+- game-engine
+description: Product, UI, visual-direction, and game-feel contract for browser-playable games.
+install:
+  command: bin/rds-skill-materialize browser-game-product-quality
+verify:
+  command: bin/rds-skill-verify browser-game-product-quality
+maturity: beta
+category: game
+rationale: The game-engine stack currently ships HTML5 browser games. This skill makes product taste, board/canvas layout, mobile controls, feedback, and replay loop explicit before scaffold starts instead of relying on post-QA polish.
+source_links:
+- label: Playwright screenshots
+  url: https://playwright.dev/docs/screenshots

@@ -1,0 +1,46 @@
+{
+  "id": "rails",
+  "name": "Rails 8 + Hotwire",
+  "language": "ruby",
+  "runtime": {
+    "min": "4.0.1"
+  },
+  "framework": {
+    "name": "rails",
+    "version": "8.0"
+  },
+  "database": "postgresql-15",
+  "default_port_range": [
+    4000,
+    4099
+  ],
+  "health_path": "/up",
+  "stages": [
+    "intake",
+    "spec",
+    "init",
+    "scaffold",
+    "local-run",
+    "deploy"
+  ],
+  "init": "bin/rds-rails-init",
+  "local_run": null,
+  "doctor": "stacks/rails/doctor.sh",
+  "scaffold_recipe": "web_app",
+  "service_entrypoint": "bash -c 'if [ -f tmp/pids/server.pid ]; then pid=$(cat tmp/pids/server.pid 2>/dev/null || true); if [ -n \"$pid\" ]; then kill \"$pid\" 2>/dev/null || true; fi; rm -f tmp/pids/server.pid; fi; bin/rails db:prepare && exec bin/rails server -b 0.0.0.0 -p %(ENV_PORT)s'",
+  "service_env": {
+    "RAILS_ENV": "development",
+    "SOLID_QUEUE_IN_PUMA": "true",
+    "DB_HOST": "localhost",
+    "DB_USERNAME": "postgres",
+    "DB_PASSWORD": "",
+    "RAILS_LOG_TO_STDOUT": "1",
+    "APP_EXTRA_HOSTS": ".zocomputer.io"
+  },
+  "status": "ready",
+  "supports_modes": [
+    "green",
+    "brown"
+  ],
+  "notes": "Default stack. Backed by vendor/rails-starter; uses Zo's pg-15 on 5432."
+}

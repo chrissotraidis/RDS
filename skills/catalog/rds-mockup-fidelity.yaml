@@ -1,0 +1,16 @@
+---
+slug: rds-mockup-fidelity
+name: RDS mockup fidelity
+status: curated
+scope: visual
+description: Compare rendered output to a provided mockup target and produce actionable visual deltas.
+install:
+  phase: resolve-only
+verify:
+  command:
+maturity: curated-reference
+category: capability
+source_links:
+- label: playwright.dev
+  url: https://playwright.dev/
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

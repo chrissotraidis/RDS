@@ -1,0 +1,17 @@
+---
+slug: wxt-config-skill
+name: WXT config
+status: curated
+category: browser-extension
+maturity: stable
+applies_to:
+- browser-extension
+description: WXT manifest and config setup for MV3 extensions.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: wxt.dev
+  url: https://wxt.dev/
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

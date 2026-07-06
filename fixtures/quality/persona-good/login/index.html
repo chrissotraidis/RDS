@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8" /><title>Login</title></head>
+  <body>
+    <main>
+      <h1>Operator login</h1>
+      <p>Local review sign-in values are available for QA.</p>
+      <label>Email <input type="email" name="email" /></label>
+      <label>Review code <input type="password" name="review-code" /></label>
+      <button id="fill">Fill local review values</button>
+      <button id="login">Log in</button>
+    </main>
+    <script>
+      const email = "operator@example.com";
+      const reviewCode = "local-review-code";
+      document.getElementById("fill").onclick = () => {
+        document.querySelector("input[type=email]").value = email;
+        document.querySelector("input[type=password]").value = reviewCode;
+      };
+      document.getElementById("login").onclick = () => {
+        if (document.querySelector("input[type=email]").value === email && document.querySelector("input[type=password]").value === reviewCode) {
+          localStorage.setItem("operator-session", "ok");
+          location.href = "/dashboard/";
+        }
+      };
+    </script>
+  </body>
+</html>

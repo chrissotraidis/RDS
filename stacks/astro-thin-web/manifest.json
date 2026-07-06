@@ -1,0 +1,43 @@
+{
+  "id": "astro-thin-web",
+  "name": "Astro thin web",
+  "language": "typescript",
+  "runtime": {
+    "bun": ">=1.1.0",
+    "node": ">=20"
+  },
+  "framework": {
+    "name": "astro",
+    "version": "6"
+  },
+  "database": "none",
+  "default_port_range": [
+    4000,
+    4099
+  ],
+  "health_path": "/health.json",
+  "stages": [
+    "intake",
+    "spec",
+    "init",
+    "scaffold",
+    "local-run",
+    "deploy",
+    "qa"
+  ],
+  "init": "stacks/astro-thin-web/init.sh",
+  "local_run": "stacks/astro-thin-web/local-run.sh",
+  "doctor": "stacks/astro-thin-web/doctor.sh",
+  "scaffold_recipe": "astro_thin_web",
+  "service_entrypoint": "bash -c 'bun install --frozen-lockfile || bun install; exec bunx astro dev --host 0.0.0.0 --port %(ENV_PORT)s'",
+  "service_env": {
+    "NODE_ENV": "development",
+    "RDS_RUNTIME": "zo"
+  },
+  "supports_modes": [
+    "green",
+    "brown"
+  ],
+  "status": "ready",
+  "notes": "Ready V1 Phase 1a stack for content-led Astro sites and thin web apps."
+}

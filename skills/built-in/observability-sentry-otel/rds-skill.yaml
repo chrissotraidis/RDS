@@ -1,0 +1,28 @@
+---
+slug: observability-sentry-otel
+name: Sentry and OpenTelemetry
+status: ready
+default: false
+applies_to:
+- rails-web
+- nextjs-fullstack
+- python-ai-service
+- astro-thin-web
+- web-3d
+- game-engine
+- game-asset-pipeline
+- mobile-native
+- browser-extension
+description: Adds the runtime error, tracing, and release-observability contract.
+install:
+  command: bin/rds-skill-materialize observability-sentry-otel
+verify:
+  command: bin/rds-skill-verify observability-sentry-otel
+maturity: operational
+category: observability
+rationale: Production-like previews need a plan for runtime failures and traces. This skill ensures observability is either configured with secrets or clearly stubbed until credentials exist.
+source_links:
+- label: Sentry Docs
+  url: https://docs.sentry.io/
+- label: OpenTelemetry Docs
+  url: https://opentelemetry.io/docs/

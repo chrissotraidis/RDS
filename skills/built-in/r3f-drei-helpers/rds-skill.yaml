@@ -1,0 +1,20 @@
+---
+slug: r3f-drei-helpers
+name: R3F Drei helpers
+status: ready
+default: false
+applies_to:
+- web-3d
+description: React Three Fiber and Drei scene helpers.
+install:
+  command: bin/rds-skill-materialize r3f-drei-helpers
+verify:
+  command: bin/rds-skill-verify r3f-drei-helpers
+maturity: stable
+category: frontend
+rationale: Web 3D builds need a nonblank, framed, interactive scene with sane camera, lights, controls, loading, and responsive canvas behavior. This skill anchors R3F/Drei usage to those product requirements.
+source_links:
+- label: r3f.docs.pmnd.rs
+  url: https://r3f.docs.pmnd.rs/
+- label: drei.docs.pmnd.rs
+  url: https://drei.docs.pmnd.rs/

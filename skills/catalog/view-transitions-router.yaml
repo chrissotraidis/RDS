@@ -1,0 +1,17 @@
+---
+slug: view-transitions-router
+name: View transitions router
+status: curated
+category: frontend
+maturity: beta
+applies_to:
+- astro-thin-web
+description: Astro view-transition routing conventions.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: modelcontextprotocol.io
+  url: https://modelcontextprotocol.io/
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

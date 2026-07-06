@@ -1,0 +1,12 @@
+providers:
+  claude-code:
+    interactive_command: "claude --name {name}"
+    print_command: "claude -p --permission-mode auto --output-format text"
+  codex:
+    interactive_command: "codex"
+    print_command: "codex exec --sandbox danger-full-access --skip-git-repo-check --color never -"
+defaults:
+  worktree: true
+  auto_merge: false
+  auto_push: false
+  require_confirmation: true

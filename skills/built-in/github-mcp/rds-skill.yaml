@@ -1,0 +1,20 @@
+---
+slug: github-mcp
+name: GitHub MCP
+status: ready
+default: false
+applies_to:
+- universal
+description: Adds the repository-context contract for GitHub-backed brown-field or handoff builds.
+install:
+  command: bin/rds-skill-materialize github-mcp
+verify:
+  command: bin/rds-skill-verify github-mcp
+maturity: operational
+category: mcp
+rationale: Brown-field builds fail when repository context is guessed. This skill requires reading the repo structure, branch, docs, issues or handoff notes before implementation.
+source_links:
+- label: GitHub MCP Server
+  url: https://github.com/github/github-mcp-server
+- label: GitHub Docs
+  url: https://docs.github.com/

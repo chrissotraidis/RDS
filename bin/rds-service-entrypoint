@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+LOGFILE="${RDS_POSTGRES_LOG:-/dev/shm/rds-postgres.log}"
+BUN="${BUN_BIN:-/root/.bun/bin/bun}"
+PORT="${PORT:-4000}"
+
+log() {
+  printf '[%s] %s\n' "$(date -u +%FT%TZ)" "$*" | tee -a "$LOGFILE" >&2
+}
+
+ensure_postgres() {
+  if pg_isready -h 127.0.0.1 -p 5432 >/dev/null 2>&1; then
+    log "postgres already accepting connections on 127.0.0.1:5432"
+    return 0
+  fi
+
+  log "postgres not ready; starting cluster 15/main"
+  pg_ctlcluster 15 main start >>"$LOGFILE" 2>&1 || true
+
+  for _ in $(seq 1 30); do
+    if pg_isready -h 127.0.0.1 -p 5432 >/dev/null 2>&1; then
+      log "postgres ready"
+      return 0
+    fi
+    sleep 1
+  done
+
+  log "FATAL: postgres did not become ready"
+  tail -50 "$LOGFILE" >&2 || true
+  return 1
+}
+
+start_postgres_monitor() {
+  (
+    while sleep "${RDS_POSTGRES_MONITOR_INTERVAL:-15}"; do
+      if ! pg_isready -h 127.0.0.1 -p 5432 >/dev/null 2>&1; then
+        log "postgres readiness check failed; attempting restart"
+        pg_ctlcluster 15 main start >>"$LOGFILE" 2>&1 || true
+      fi
+    done
+  ) &
+}
+
+listener_pid_for_port() {
+  ss -ltnp "sport = :$PORT" 2>/dev/null \
+    | awk -F'pid=' 'NR>1 && $2 {split($2,a,","); print a[1]; exit}'
+}
+
+claim_dashboard_port() {
+  local listener=""
+  if curl -fsS --max-time 2 "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1; then
+    listener="$(listener_pid_for_port || true)"
+    if [[ "$listener" =~ ^[0-9]+$ && "$listener" != "$$" ]]; then
+      log "dashboard already listening on port $PORT as pid $listener; replacing stale listener for supervised service"
+      kill -TERM "$listener" 2>/dev/null || true
+      for _ in $(seq 1 10); do
+        kill -0 "$listener" 2>/dev/null || return 0
+        sleep 0.3
+      done
+      log "dashboard listener pid $listener did not exit after TERM; killing"
+      kill -KILL "$listener" 2>/dev/null || true
+    fi
+  fi
+}
+
+ensure_postgres
+if [[ "${RDS_POSTGRES_MONITOR_AUTOSTART:-0}" == "1" ]]; then
+  start_postgres_monitor
+fi
+
+if [[ -f /root/.zo_secrets ]]; then
+  # Refresh short-lived Zo identity tokens before dashboard/watchdog launch.
+  # The managed service env can contain an expired token from service creation.
+  # shellcheck disable=SC1090
+  source /root/.zo_secrets
+fi
+
+if [[ -f "$ROOT/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$ROOT/.env"
+  set +a
+fi
+
+export RDS_ROOT="${RDS_ROOT:-$ROOT}"
+export PORT
+
+if [[ "${RDS_WATCHDOG_AUTOSTART:-1}" == "1" && -x "$ROOT/bin/rds-watchdog" ]]; then
+  "$ROOT/bin/rds-watchdog" --status >/dev/null 2>&1 || \
+    "$ROOT/bin/rds-watchdog" --detach >/dev/null 2>&1 || true
+fi
+
+cd "$ROOT/dashboard"
+claim_dashboard_port
+exec "$BUN" run src/server.ts

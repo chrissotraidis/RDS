@@ -1,0 +1,381 @@
+#!/usr/bin/env python3
+"""Analyze a PRD/build brief and recommend stack, app type, skills, and questions."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+from pathlib import Path
+from typing import Any
+
+
+STACKS = [
+    "rails-web",
+    "nextjs-fullstack",
+    "python-ai-service",
+    "astro-thin-web",
+    "web-3d",
+    "game-engine",
+    "game-asset-pipeline",
+    "mobile-native",
+    "browser-extension",
+]
+
+# Skill recommendations are sourced from stacks/<runtime>/stack.yaml contracts
+# (compatible_skills.primary + compatible_skills.universal). The legacy hard-coded
+# STACK_SKILLS / CORE_SKILLS constants diverged from the contracts and from the
+# dashboard recommender, which caused stack-primary skills like shadcn-add to
+# silently drop out of the resolved skill list for Next.js builds.
+
+STACK_RUNTIME = {
+    "rails-web": "rails",
+    "nextjs-fullstack": "nextjs",
+    "react-spa": "react",
+    "mobile-native": "react-native",
+}
+
+
+def _load_stack_skills(root: Path, stack: str) -> tuple[list[str], list[str]]:
+    runtime = STACK_RUNTIME.get(stack, stack)
+    path = root / "stacks" / runtime / "stack.yaml"
+    if not path.exists():
+        return [], []
+    try:
+        import yaml  # type: ignore
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except ModuleNotFoundError:
+        # Minimal inline parser: pull `compatible_skills:` { primary: [...], universal: [...] }
+        text = path.read_text(encoding="utf-8")
+        block = re.search(r"^compatible_skills:\s*\n((?:[ \t]+.*\n?)+)", text, re.M)
+        if not block:
+            return [], []
+        inner = block.group(1)
+        def slugs_for(label: str) -> list[str]:
+            m = re.search(rf"^[ \t]+{label}:\s*\n((?:[ \t]+-[ \t]+\S.*\n?)+)", inner, re.M)
+            if not m:
+                return []
+            return [line.split("-", 1)[1].strip() for line in m.group(1).splitlines() if line.strip().startswith("-")]
+        return slugs_for("primary"), slugs_for("universal")
+    cs = (data or {}).get("compatible_skills") or {}
+    return list(cs.get("primary") or []), list(cs.get("universal") or [])
+
+
+def core_and_stack_skills(root: Path, stack: str) -> tuple[list[str], list[str]]:
+    primary, universal = _load_stack_skills(root, stack)
+    return universal, primary
+
+
+def read_json(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+    except Exception:
+        return None
+
+
+def read_source(value: str, root: Path) -> tuple[str, str]:
+    if value == "-":
+        import sys
+        return sys.stdin.read(), "stdin"
+    path = Path(value)
+    if not path.is_absolute():
+        path = root / value
+    if path.exists() and path.is_file():
+        return path.read_text(encoding="utf-8", errors="ignore"), str(path)
+    return value, "inline"
+
+
+def has(text: str, pattern: str) -> bool:
+    return re.search(pattern, text, re.I) is not None
+
+
+def positive_intent_text(text: str) -> str:
+    """Remove sections that describe what the build should not do."""
+    blocks = re.split(r"(?m)(?=^(?:#{1,6}\s*)?(?:\d+(?:\.\d+)?\s*)?(?:non[- ]goals?|out of scope|not in scope)\b)", text)
+    kept: list[str] = []
+    for block in blocks:
+        header = block.splitlines()[0] if block.splitlines() else ""
+        if re.search(r"^(?:#{1,6}\s*)?(?:\d+(?:\.\d+)?\s*)?(?:non[- ]goals?|out of scope|not in scope)\b", header.strip(), re.I):
+            continue
+        kept.append(block)
+    lines = []
+    for line in "".join(kept).splitlines():
+        marker = re.search(r"\b(non[- ]goals?|out of scope|not in scope)\b", line, re.I)
+        if marker:
+            prefix = line[:marker.start()].strip()
+            if re.search(r"[a-z]", prefix, re.I):
+                lines.append(prefix)
+            continue
+        if re.search(r"\b(deferred|do not build|do not include|not required|no native)\b", line, re.I):
+            continue
+        if re.search(r"^\s*(?:[-*]\s*)?(?:no|without)\s+(?:login|auth|authentication|database|backend|payments?|native|wp rest|direct publishing)\b", line, re.I):
+            continue
+        line = re.sub(
+            r"\b(?:no|without)\s+(?:login|auth|authentication|database|backend|payments?|native|wp rest|direct publishing)(?:\s+or\s+(?:login|auth|authentication|database|backend|payments?|native|wp rest|direct publishing))*[.;]?",
+            "",
+            line,
+            flags=re.I,
+        )
+        lines.append(line)
+    return "\n".join(lines)
+
+
+GAME_TERMS = (
+    r"game|arcade|enemy|sprite|collision|"
+    r"platformer|puzzle game|board game|strategy game|two-player|turn-based|"
+    r"tetris|pong|missile command|missile defense|dig dug|breakout|snake|"
+    r"pac[- ]?man|space invaders|asteroids|chess|checkers"
+)
+
+NON_GAME_PRODUCT_TERMS = (
+    r"dashboard|portfolio|financial|fintech|copilot|trading|brokerage|"
+    r"holdings|alerts?|journal|executor|agent chat|integrations?|read-only|"
+    r"pre-market|briefing|web3|crypto|equities"
+)
+
+FINTECH_PRODUCT_TERMS = (
+    r"portfolio|financial|fintech|copilot|trading|brokerage|holdings|"
+    r"pre-market|briefing|web3|crypto|equities|read-only"
+)
+
+
+def game_signal_text(text: str) -> str:
+    """Strip gamification/sandbox phrasing that is not the product category."""
+    cleaned_lines: list[str] = []
+    for line in text.splitlines():
+        if re.search(r"\b(paper[- ]?trading|gamified|sandbox|calibration|process score|no confetti)\b", line, re.I):
+            cleaned_lines.append(re.sub(r"\b(game|gamified|sandbox|score|scoring|rounds?|predictions?)\b", " ", line, flags=re.I))
+        else:
+            cleaned_lines.append(line)
+    return "\n".join(cleaned_lines)
+
+
+def has_game_intent(text: str) -> bool:
+    game_text = game_signal_text(text)
+    non_game_context = has(text, rf"\b({NON_GAME_PRODUCT_TERMS})\b")
+    has_core_game = has(game_text, rf"\b({GAME_TERMS})\b")
+    has_play_loop = has(game_text, r"\b(playable|player|score|levels?)\b") and has(game_text, r"\b(game|arcade|sprite|enemy|collision|physics|win condition|lose condition|gameplay)\b")
+    if non_game_context and not has(game_text, r"\b(playable arcade|browser[- ]playable|player controls?|enemy|sprite|collision|levels?|game over|win condition|lose condition|gameplay loop)\b"):
+        return False
+    if has_core_game:
+        return True
+    if has_play_loop:
+        return True
+    return False
+
+
+def infer_app_type(text: str, explicit: str = "auto") -> tuple[str, list[str]]:
+    explicit = explicit.strip().lower().replace("_", "-")
+    if explicit and explicit not in {"auto", "unknown"}:
+        return explicit, [f"explicit app_type={explicit}"]
+    rules = [
+        ("browser-extension", "web-app", r"\b(chrome extension|browser extension|manifest v3|mv3|content script|popup|extension)\b"),
+        ("mobile-native", "web-app", r"\b(ios|android|mobile app|react native|expo|eas)\b"),
+        ("dashboard", "dashboard", r"\b(dashboard|operator console|admin console|metrics|analytics view|reporting console)\b"),
+        ("game", "game", rf"\b({GAME_TERMS})\b"),
+        ("internal-tool", "internal-tool", r"\b(internal tool|back office|approval queue|ops tool|internal workflow|admin workflow)\b"),
+        ("web-app", "web-app", r"\b(web app|web tool|tool|saas|portal|crud|auth|login|account|database|records|forms?|file upload|upload|download|copy-to-clipboard|dynamic form|generated output)\b"),
+        ("website", "website", r"\b(marketing site|landing page|docs site|documentation site|developer docs|reference docs|portfolio|content site|static site|brochure site)\b"),
+    ]
+    for reason, value, pattern in rules:
+        if reason == "game" and not has_game_intent(text):
+            continue
+        if has(text, pattern):
+            return value, [f"matched {reason}"]
+    return "web-app", ["defaulted to web-app for unspecified interactive product"]
+
+
+def score_stacks(text: str, app_type: str) -> tuple[str, int, dict[str, int], list[str]]:
+    score = {stack: 0 for stack in STACKS}
+    reasons: list[str] = []
+
+    def bump(stack: str, points: int, reason: str) -> None:
+        score[stack] += points
+        reasons.append(f"{stack}+{points}: {reason}")
+
+    explicit = re.search(r"(?:stack:\s*|build with\s+)(rails-web|nextjs-fullstack|python-ai-service|astro-thin-web|web-3d|game-engine|game-asset-pipeline|mobile-native|browser-extension|rails|nextjs|react-native)\b", text, re.I)
+    if explicit:
+        value = {"rails": "rails-web", "nextjs": "nextjs-fullstack", "react-native": "mobile-native"}.get(explicit.group(1), explicit.group(1))
+        return value, 98, {**score, value: 99}, [f"explicit stack={value}"]
+
+    if app_type == "website":
+        bump("astro-thin-web", 8, "website app_type")
+    if app_type in {"web-app", "dashboard", "internal-tool"}:
+        bump("rails-web", 4, f"{app_type} app_type")
+        bump("nextjs-fullstack", 5, f"{app_type} app_type")
+    if app_type == "game":
+        bump("game-engine", 10, "game app_type")
+
+    patterns = [
+        ("rails-web", 14, r"\b(rails|ruby on rails|hotwire|turbo|stimulus|active record)\b", "Rails signal"),
+        ("nextjs-fullstack", 14, r"\b(next\.js|nextjs|react server components|app router|server actions|vercel)\b", "Next.js signal"),
+        ("rails-web", 6, r"\b(crud|admin|dashboard|workflow|portal|back office|internal tool|database|forms?|approvals?|records?)\b", "database workflow signal"),
+        ("nextjs-fullstack", 8, r"\b(saas|react|auth|payments?|checkout|subscription|customer-facing|frontend|polished ui|component library|file upload|upload|download|copy-to-clipboard|dynamic form|image processing|metadata|vision model)\b", "modern SaaS/frontend signal"),
+        ("nextjs-fullstack", 12, rf"\b({FINTECH_PRODUCT_TERMS})\b", "financial product signal"),
+        ("python-ai-service", 9, r"\b(fastapi|llm|rag|agent|embedding|vector|inference|python|webhook|tool endpoint|pydantic)\b|(?<!\bapi\s)\bapi\b(?!\s+docs?)", "AI/API service signal"),
+        ("astro-thin-web", 14, r"\b(docs site|documentation site|developer docs|reference docs|api docs|marketing site|landing page|static site|portfolio|brochure site)\b", "content/static site signal"),
+        ("web-3d", 14, r"\b(three\.js|webgl|3d experience|3d scene|r3f|canvas scene|configurator|model viewer|product configurator)\b", "3D/WebGL signal"),
+        ("web-3d", 6, r"\b(gltf|glb|usd|3d model|mesh|texture)\b", "3D asset-in-scene signal"),
+        ("game-engine", 10, rf"\b({GAME_TERMS}|godot|phaser)\b", "gameplay signal"),
+        ("game-asset-pipeline", 10, r"\b(asset pipeline|asset processing|model validation|asset validation|convert (?:fbx|gltf|glb|usd)|optimi[sz]e (?:assets?|models?|meshes?)|blender|bpy)\b", "asset pipeline signal"),
+        ("mobile-native", 18, r"\b(ios app|android app|native mobile|mobile app|react native|expo|eas)\b", "native mobile signal"),
+        ("browser-extension", 11, r"\b(chrome extension|browser extension|manifest v3|mv3|content script|popup|extension)\b", "browser extension signal"),
+    ]
+    for stack, points, pattern, reason in patterns:
+        if stack == "game-engine" and not has_game_intent(text):
+            continue
+        if has(text, pattern):
+            bump(stack, points, reason)
+
+    ranked = sorted(STACKS, key=lambda stack: (-score[stack], STACKS.index(stack)))
+    winner = ranked[0]
+    if score[winner] <= 0:
+        winner = "nextjs-fullstack"
+        reasons.append("defaulted to nextjs-fullstack")
+    confidence = min(95, max(42, 36 + score[winner] * 5))
+    return winner, confidence, score, reasons[:12]
+
+
+def ready_skill_filter(root: Path, slugs: list[str], stack: str) -> list[str]:
+    registry = read_json(root / "skills" / "registry.json") or {}
+    by_slug = {item.get("slug"): item for item in registry.get("skills", []) if isinstance(item, dict)}
+    result: list[str] = []
+    for slug in slugs:
+        skill = by_slug.get(slug)
+        if not skill or skill.get("status") != "ready":
+            continue
+        applies = skill.get("applies_to") or []
+        if "universal" in applies or stack in applies:
+            if slug not in result:
+                result.append(slug)
+    return result
+
+
+# Negative signals suppress matching intent-driven skill recommendations.
+# A PRD saying "static export, no database, no uploads" should NOT pull in
+# postgres-mcp / storage-s3-r2 just because the word "upload" or "metadata"
+# appears in some unrelated sentence. Each entry maps a negative-intent regex
+# (matched against the *original* text, not the positive-intent-stripped one,
+# so the "no X" phrasing survives) to a set of skill slugs to suppress.
+NEGATIVE_SIGNAL_PATTERNS: list[tuple[str, tuple[str, ...]]] = [
+    # No persistence at all.
+    (r"\b(?:no|without|zero|excludes?)\s+(?:database|persistence|backend|server[- ]side|storage|state)\b",
+     ("postgres-mcp", "vector-pgvector", "drizzle-introspect-skill", "storage-s3-r2", "solid-queue")),
+    (r"\b(?:static[- ]?(?:export|site|html|build)|client[- ]?(?:side|only)\s+(?:only|app)?|fully[- ]?static|jamstack|prerendered? only)\b",
+     ("postgres-mcp", "vector-pgvector", "drizzle-introspect-skill", "storage-s3-r2", "solid-queue", "auth-better-auth", "auth-rails-generator")),
+    # No file storage / uploads explicitly disclaimed.
+    (r"\b(?:no|without)\s+(?:file )?(?:uploads?|attachments?|media files?|user[- ]uploaded)\b",
+     ("storage-s3-r2",)),
+    # No authentication / accounts.
+    (r"\b(?:no|without|zero)\s+(?:auth(?:entication)?|login|accounts?|sign[- ]?(?:in|up)|users?)\b",
+     ("auth-better-auth", "auth-rails-generator")),
+    # No payments.
+    (r"\b(?:no|without)\s+(?:payments?|billing|subscriptions?|stripe|checkout)\b",
+     ("payments-stripe-mcp",)),
+    # No background work.
+    (r"\b(?:no|without)\s+(?:background jobs?|queues?|workers?|async (?:work|jobs?))\b",
+     ("solid-queue",)),
+    # No vector / semantic search even if RAG-adjacent words appear elsewhere.
+    (r"\b(?:no|without)\s+(?:vector|embeddings?|semantic search|rag|llm|ai)\b",
+     ("vector-pgvector", "llm-vercel-ai-sdk", "llm-pydantic-ai")),
+]
+
+
+def negative_suppressed_skills(raw_text: str) -> set[str]:
+    """Return slugs explicitly disclaimed by the PRD."""
+    suppressed: set[str] = set()
+    lowered = raw_text.lower()
+    for pattern, slugs in NEGATIVE_SIGNAL_PATTERNS:
+        if re.search(pattern, lowered, re.I):
+            suppressed.update(slugs)
+    return suppressed
+
+
+def recommend_skills(root: Path, raw_text: str, text: str, stack: str) -> list[str]:
+    universals, primaries = core_and_stack_skills(root, stack)
+    skills = [*universals, *primaries]
+    intent_patterns = [
+        ("auth-better-auth", r"\b(auth|login|account|session|oauth|protected route|sign in|signup|user account)\b"),
+        ("auth-rails-generator", r"\b(auth|login|account|session|oauth|protected route|sign in|signup|user account)\b"),
+        ("drizzle-introspect-skill", r"\b(database|postgres|schema|migration|crud|records?|admin|dashboard|forms?|table|sql)\b"),
+        ("payments-stripe-mcp", r"\b(stripe|payment|checkout|subscription|billing|invoice|paid plan|customer portal)\b"),
+        ("email-resend", r"\b(email|invite|notification|receipt|magic link|resend|transactional)\b"),
+        ("solid-queue", r"\b(background job|queue|async|scheduled|retry|worker|import|export)\b"),
+        ("storage-s3-r2", r"\b(upload|file storage|s3|r2|bucket|media|downloadable|artifact storage)\b"),
+        ("llm-vercel-ai-sdk", r"\b(chat|streaming|tool call|ai sdk|completion|generate|generated|vision[- ]model|llm app)\b"),
+        ("llm-pydantic-ai", r"\b(pydantic ai|python agent|structured output|typed extraction)\b"),
+        ("vector-pgvector", r"\b(rag|semantic search|embedding|embeddings|vector search|pgvector)\b"),
+        ("postgres-mcp", r"\b(database|postgres|schema|migration|crud|records?|admin|dashboard)\b"),
+        ("analytics-posthog", r"\b(analytics|events?|funnel|posthog|metrics|activation|retention)\b"),
+        ("observability-sentry-otel", r"\b(sentry|observability|telemetry|tracing|monitoring|errors?|alerts?)\b"),
+        ("starlight-add", r"\b(docs site|documentation site|developer docs|reference docs|api docs|starlight)\b"),
+        ("gltf-transform-pipeline", r"\b(gltf|glb|3d model|mesh|texture|asset optimization|model optimization)\b"),
+        ("gltf-validator-skill", r"\b(gltf|glb|3d model|mesh|asset validation|model validation)\b"),
+        ("blender-mcp-mount", r"\b(blender|bpy|blend file|procedural model|modeling pipeline)\b"),
+        ("rds-usd-validator", r"\b(usd|usdz|openusd|3d model|mesh)\b"),
+        ("eas-build-skill", r"\b(eas|expo application services|native build|app store|testflight|apk|aab)\b"),
+    ]
+    suppressed = negative_suppressed_skills(raw_text)
+    intent_slugs: set[str] = set()
+    for slug, pattern in intent_patterns:
+        if has(text, pattern):
+            intent_slugs.add(slug)
+    # Negative signals only suppress *intent-driven* additions; stack contract
+    # primaries/universals win even if a PRD says "no database" — those slugs
+    # are the stack's required toolkit, not optional intent matches.
+    for slug in intent_slugs:
+        if slug in suppressed:
+            continue
+        skills.append(slug)
+    return ready_skill_filter(root, skills, stack)
+
+
+def questions_for(text: str, stack: str) -> list[str]:
+    questions: list[str] = []
+    if not has(text, r"\b(success|acceptance|done|must|requirements?|criteria)\b"):
+        questions.append("What are the acceptance criteria for the first working preview?")
+    if not has(text, r"\b(mockup|figma|screenshot|reference|inspiration|styleguide)\b"):
+        questions.append("Is there a mockup, screenshot, or reference product RDS should match?")
+    if has(text, r"\b(auth|login|account|payment|stripe|email|sms|notion|gmail|calendar|github)\b"):
+        questions.append("Which integrations need real credentials now versus placeholders?")
+    if stack == "mobile-native":
+        questions.append("Should the first pass prioritize mobile UI fidelity or backend functionality?")
+    if stack == "browser-extension":
+        questions.append("Which pages should the extension run on, and what permissions are acceptable?")
+    return questions[:4]
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("source")
+    parser.add_argument("--root", default=str(Path(__file__).resolve().parents[1]))
+    parser.add_argument("--app-type", default="auto")
+    parser.add_argument("--out")
+    args = parser.parse_args()
+
+    root = Path(args.root).resolve()
+    raw_text, source_kind = read_source(args.source, root)
+    text = positive_intent_text(raw_text.lower())
+    app_type, app_reasons = infer_app_type(text, args.app_type)
+    stack, confidence, scores, stack_reasons = score_stacks(text, app_type)
+    skills = recommend_skills(root, raw_text, text, stack)
+    payload = {
+        "schema": "rds.analysis.v1",
+        "source": source_kind,
+        "stack": stack,
+        "appType": app_type,
+        "confidence": confidence,
+        "skills": skills,
+        "questions": questions_for(text, stack),
+        "scores": scores,
+        "reasons": app_reasons + stack_reasons,
+    }
+    data = json.dumps(payload, indent=2) + "\n"
+    if args.out:
+        Path(args.out).write_text(data, encoding="utf-8")
+    print(data, end="")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+"""Expand an RDS spec with a deterministic taste brief before implementation."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+from pathlib import Path
+from typing import Any
+
+MARKER = "<!-- RDS_TASTE_BRIEF_V1 -->"
+
+GAME_TERMS = {
+    "game", "pong", "snake", "tetris", "dig dug", "breakout", "asteroids",
+    "missile command", "space invaders", "arcade", "enemy", "score", "level",
+    "player", "boss", "wave", "combat", "platformer", "puzzle"
+}
+BOARD_GAME_TERMS = {
+    "board game", "abstract strategy", "strategy game", "turn-based",
+    "two-player", "custodial capture", "legal moves", "grid board",
+    "polis", "chess", "checkers", "go"
+}
+WEBSITE_TERMS = {"landing page", "portfolio", "marketing", "homepage", "website", "brand", "hero", "pricing"}
+TOOL_TERMS = {"dashboard", "crm", "kanban", "notes", "todo", "tool", "workflow", "admin", "analytics", "calendar"}
+
+
+def read_text(path: Path, limit: int = 500_000) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")[:limit]
+    except Exception:
+        return ""
+
+
+def hits(text: str, terms: set[str]) -> list[str]:
+    lower = text.lower()
+    return sorted(term for term in terms if re.search(rf"\b{re.escape(term)}\b", lower))
+
+
+def normalize_kind(value: str) -> str:
+    value = value.strip().lower().replace("_", "-")
+    aliases = {
+        "games": "game",
+        "site": "website",
+        "landing": "website",
+        "landing-page": "website",
+        "webapp": "web-app",
+        "app": "web-app",
+        "interactive-web": "web-app",
+        "tool": "internal-tool",
+        "internal": "internal-tool",
+    }
+    return aliases.get(value, value)
+
+
+def infer_kind(text: str, stack: str, explicit: str = "auto") -> tuple[str, list[str]]:
+    explicit = normalize_kind(explicit)
+    if explicit and explicit != "auto":
+        return explicit, [f"explicit app_type={explicit}"]
+    game_hits = hits(text, GAME_TERMS)
+    site_hits = hits(text, WEBSITE_TERMS)
+    tool_hits = hits(text, TOOL_TERMS)
+    if game_hits:
+        return "game", game_hits[:8]
+    if site_hits and not tool_hits:
+        return "website", site_hits[:8]
+    if tool_hits:
+        return "app", tool_hits[:8]
+    if stack == "react":
+        return "interactive_web", ["react stack"]
+    return "app", ["default"]
+
+
+def title_from_spec(spec: str, fallback: str) -> str:
+    match = re.search(r"^#\s+(.+?)\s*$", spec, flags=re.MULTILINE)
+    return match.group(1).strip() if match else fallback
+
+
+def addendum_for(kind: str) -> dict[str, Any]:
+    common = [
+        "Preserve the user's original intent, but do not settle for a generic demo.",
+        "Make the first 10 seconds clear without explanatory copy that reads like documentation.",
+        "Prefer one excellent core workflow over a broad set of shallow features.",
+        "Include meaningful empty, loading, failure, and success states where the product shape calls for them.",
+        "Use visual hierarchy, spacing, motion/feedback, and responsive layout deliberately.",
+    ]
+    if kind == "game":
+        return {
+            "quality_bar": common + [
+                "The game must be fun after 60 seconds, not merely playable.",
+                "Require a complete core loop: start, play, score/progress, fail/win, restart.",
+                "Add risk/reward, enemy or obstacle behavior, difficulty progression, and immediate feedback.",
+                "Give the game one memorable hook beyond the obvious clone.",
+                "Tune movement feel, collision feedback, pacing, and readability before adding extra features.",
+            ],
+            "anti_goals": [
+                "Static board with weak interaction.",
+                "Single-state toy with no escalation, scoring pressure, or replay reason.",
+                "Controls that technically work but feel sluggish, confusing, or unrewarding.",
+            ],
+            "acceptance": [
+                "A new player understands the goal within 10 seconds.",
+                "The player faces meaningful choices or pressure within 30 seconds.",
+                "Difficulty changes over time through waves, speed, enemy behavior, map pressure, or resource scarcity.",
+                "Scoring/progression is visible and tied to player skill.",
+                "Restarting is instant and the second attempt feels worth playing.",
+            ],
+        }
+    if kind == "website":
+        return {
+            "quality_bar": common + [
+                "The first viewport must communicate the concrete offer, object, or brand immediately.",
+                "Use real or highly specific visual assets when the subject benefits from inspection.",
+                "Avoid generic SaaS/agency filler sections; every section should answer a likely visitor question.",
+            ],
+            "anti_goals": [
+                "Vague hero copy with decorative cards.",
+                "One-note palette or stock-like visuals that could fit any product.",
+                "Calls to action without enough context to earn the click.",
+            ],
+            "acceptance": [
+                "The page's subject is obvious in the first viewport.",
+                "Primary CTA and secondary path are distinct.",
+                "The visual system feels specific to the offer, not template-default.",
+            ],
+        }
+    return {
+        "quality_bar": common + [
+            "Design around the primary job-to-be-done, not around a feature checklist.",
+            "Make the main workflow obvious, fast, and repeatable.",
+            "Use realistic sample data and states so the product feels inhabited.",
+            "Expose power and status where a real operator would need confidence.",
+        ],
+        "anti_goals": [
+            "Empty shell dashboard with decorative metrics.",
+            "Buttons and filters that exist but do not change anything meaningful.",
+            "Unclear information hierarchy or workflows hidden behind generic cards.",
+        ],
+        "acceptance": [
+            "A user can complete the primary workflow without guessing.",
+            "There is meaningful state change after interaction.",
+            "The interface handles empty/error/success states gracefully.",
+            "The app has enough density and specificity to avoid feeling like a toy.",
+        ],
+    }
+
+
+def game_mode(text: str) -> str:
+    return "turn-based-board-game" if hits(text, BOARD_GAME_TERMS) else "arcade-action-game"
+
+
+def refine_game_framework(framework: dict[str, Any], source_text: str) -> dict[str, Any]:
+    if game_mode(source_text) != "turn-based-board-game":
+        return framework
+    refined = dict(framework)
+    refined["quality_bar"] = [
+        "Preserve the user's original intent, but do not settle for a generic demo.",
+        "Make the first 10 seconds clear without explanatory copy that reads like documentation.",
+        "Prefer one excellent core workflow over a broad set of shallow features.",
+        "Include meaningful empty, loading, failure, and success states where the product shape calls for them.",
+        "Use visual hierarchy, spacing, motion/feedback, and responsive layout deliberately.",
+        "Treat the board as the product: it must be large, tactile, legible, and visually dominant.",
+        "Make legal moves, selected piece, captures, turn, AI thinking, victory pressure, history, and restart visible without crowding the board.",
+        "Give every move meaningful feedback: hover/focus, selection, legal/illegal move, capture, score/victory implication, and next-turn state.",
+        "Use an opinionated visual system suited to an abstract strategy game, not a dashboard/control-panel shell.",
+        "Tune mobile layout so the board remains playable and controls do not overlap or shrink into unusable text.",
+    ]
+    refined["anti_goals"] = [
+        "Static board with weak interaction.",
+        "Admin-panel layout around a small game board.",
+        "Generic beige cards, placeholder controls, or documentation-first copy.",
+        "Idle animation used as a substitute for strategic clarity.",
+    ]
+    refined["acceptance"] = [
+        "A new player understands whose turn it is and what can be moved within 10 seconds.",
+        "Selecting a piece reveals legal moves and illegal moves are clearly rejected.",
+        "Captures, score/victory pressure, and draw/restart state are visible.",
+        "Desktop and mobile both prioritize a stable, readable board.",
+        "The game has enough visual identity that screenshots do not look like a generated admin form.",
+    ]
+    return refined
+
+
+def render_brief(payload: dict[str, Any]) -> str:
+    lines = [
+        MARKER,
+        "",
+        "## RDS Taste Brief",
+        "",
+        f"Detected product type: **{payload['kind']}**.",
+        "",
+        "This section is generated by the RDS taste layer. Treat it as binding acceptance criteria unless it conflicts with an explicit user requirement.",
+        "",
+        "### Taste Position",
+        "",
+        payload["position"],
+        "",
+        "### Quality Bar",
+        "",
+    ]
+    lines.extend(f"- {item}" for item in payload["quality_bar"])
+    lines.extend(["", "### Anti-Goals", ""])
+    lines.extend(f"- {item}" for item in payload["anti_goals"])
+    lines.extend(["", "### Taste Acceptance Criteria", ""])
+    lines.extend(f"- {item}" for item in payload["acceptance"])
+    lines.extend(["", "### Builder Instruction", ""])
+    lines.extend([
+        "- If the literal prompt would produce a boring or toy-like result, improve the concept while preserving the core intent.",
+        "- During implementation, spend effort on depth, polish, feedback, and the primary loop before adding breadth.",
+        "- Before declaring the build done, inspect it as a real user and fix the highest-leverage weakness.",
+        "",
+    ])
+    return "\n".join(lines)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("build_id")
+    parser.add_argument("--root", default=str(Path(__file__).resolve().parents[1]))
+    args = parser.parse_args()
+
+    root = Path(args.root).resolve()
+    build_dir = root / "builds" / args.build_id
+    state_path = build_dir / "state.json"
+    spec_path = build_dir / "spec.md"
+    if not state_path.exists():
+        raise SystemExit(f"FATAL: state not found: {state_path}")
+    if not spec_path.exists():
+        raise SystemExit(f"FATAL: spec not found: {spec_path}")
+
+    state = json.loads(read_text(state_path) or "{}")
+    spec = read_text(spec_path)
+    if MARKER in spec:
+        print(f"taste brief already present in {spec_path}")
+        return 0
+
+    stack = str(state.get("stack") or "")
+    source_bits = [
+        spec,
+        read_text(build_dir / "research.md", 200_000),
+        str(state.get("trigger") or ""),
+        str(state.get("prd_source") or ""),
+    ]
+    source_text = "\n".join(source_bits)
+    explicit_type = str(state.get("app_type") or "auto")
+    kind, evidence = infer_kind(source_text, stack, explicit_type)
+    title = title_from_spec(spec, args.build_id)
+    framework = addendum_for(kind)
+    if kind == "game":
+        framework = refine_game_framework(framework, source_text)
+    payload = {
+        "schema": "rds.taste.brief.v1",
+        "build_id": args.build_id,
+        "kind": kind,
+        "app_type": kind,
+        "title": title,
+        "evidence": evidence,
+        "position": f"Build {title} as a coherent {kind} with a strong primary experience, not as a feature checklist.",
+        **framework,
+    }
+
+    brief_path = build_dir / "taste-brief.json"
+    md_path = build_dir / "taste-brief.md"
+    brief_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    md = render_brief(payload)
+    md_path.write_text(md, encoding="utf-8")
+    spec_path.write_text(spec.rstrip() + "\n\n" + md + "\n", encoding="utf-8")
+    print(json.dumps({"ok": True, "kind": kind, "brief": str(md_path), "spec": str(spec_path)}))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

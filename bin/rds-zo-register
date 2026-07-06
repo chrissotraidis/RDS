@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+# bin/rds-zo-register — finalize a pending Zo deploy by asking Zo to
+# register a durable HTTP user service for the built app.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck disable=SC1091
+source "$ROOT/bin/lib/common.sh"
+# shellcheck disable=SC1091
+source "$ROOT/bin/lib/logging.sh"
+
+BUILD_ID="$(parse_flag --build-id "$@" || echo "")"
+APP_DIR="$(parse_flag --app-dir "$@" || echo "")"
+PORT="$(parse_flag --port "$@" || echo "")"
+STACK="$(parse_flag --stack "$@" || echo "")"
+LABEL="$(parse_flag --label "$@" || echo "")"
+OUT="$(parse_flag --out "$@" || echo "")"
+
+[[ -n "$BUILD_ID" ]] || { echo "FATAL: --build-id is required" >&2; exit 1; }
+[[ -n "$APP_DIR"  ]] || { echo "FATAL: --app-dir is required" >&2; exit 1; }
+[[ -n "$PORT"     ]] || { echo "FATAL: --port is required" >&2; exit 1; }
+[[ "$PORT" =~ ^[0-9]+$ ]] || { echo "FATAL: --port must be numeric" >&2; exit 1; }
+[[ -d "$APP_DIR"  ]] || { echo "FATAL: app dir not found: $APP_DIR" >&2; exit 1; }
+if [[ -z "$STACK" ]]; then
+  BUILD_DIR_FOR_STACK="$RDS_BUILDS_DIR/$BUILD_ID"
+  STACK="$(jq -r '.stack // "rails"' "$BUILD_DIR_FOR_STACK/state.json" 2>/dev/null || echo rails)"
+fi
+stack_validate "$STACK"
+STACK_MANIFEST="$(stack_manifest_path "$STACK")"
+
+if [[ -f /root/.zo_secrets ]]; then
+  # Prefer the refreshed Zo runtime token over a stale inherited service env.
+  # shellcheck disable=SC1090
+  source /root/.zo_secrets
+fi
+
+if [[ -z "$LABEL" ]]; then
+  slug="$(derive_slug "$BUILD_ID")"
+  suffix="$(printf '%s' "$BUILD_ID" | sha1sum | cut -c1-6)"
+  LABEL="rds-${slug:0:21}-${suffix}"
+fi
+LABEL="$(printf '%s' "$LABEL" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//; s/-+/-/g' | cut -c1-32)"
+[[ -n "$LABEL" ]] || LABEL="rds-build"
+
+ZO_OWNER="${RDS_ZO_OWNER:-${ZO_OWNER:-}}"
+ZO_OWNER="$(printf '%s' "$ZO_OWNER" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//; s/-+/-/g')"
+[[ -n "$ZO_OWNER" ]] || { echo "FATAL: set RDS_ZO_OWNER or ZO_OWNER before Zo registration" >&2; exit 1; }
+
+HOST="${LABEL}-${ZO_OWNER}.zocomputer.io"
+URL="https://${HOST}"
+BUILD_DIR="$RDS_BUILDS_DIR/$BUILD_ID"
+SERVICE_INFO_PATH="${OUT:-$BUILD_DIR/service.json}"
+mkdir -p "$(dirname "$SERVICE_INFO_PATH")"
+
+ENTRYPOINT="$(stack_field "$STACK" '.service_entrypoint // empty')"
+if [[ -z "$ENTRYPOINT" || "$ENTRYPOINT" == "null" ]]; then
+  echo "FATAL: stack '$STACK' has no service_entrypoint in its manifest" >&2
+  exit 1
+fi
+
+ENV_VARS="$(python3 - "$STACK_MANIFEST" "$HOST" <<'PY'
+import json, sys
+manifest_path, host = sys.argv[1:]
+data = json.load(open(manifest_path))
+env = data.get("service_env") or {}
+env["APP_PUBLIC_HOST"] = host
+for key, val in env.items():
+    print(f"{key}={val}")
+PY
+)"
+
+schema='{"type":"object","properties":{"ok":{"type":"boolean"},"service_id":{"type":"string"},"http_url":{"type":"string"},"label":{"type":"string"},"error":{"type":"string"}},"required":["ok"],"additionalProperties":false}'
+
+read -r -d '' prompt <<PROMPT || true
+Register a durable Zo user service for an RDS ${STACK} build. Use the Zo register_user_service tool directly.
+
+Requirements:
+- Do not create a proxy.
+- Do not use any /tmp or /home/.z/workspaces path as an entrypoint or workdir.
+- Do not delete or modify any existing service.
+- Register exactly this service unless an existing service already has the requested label, workdir, and local_port.
+- If that matching service already exists, update/restart it with the requested entrypoint, workdir, local_port, public flag, and env_vars using update_user_service; then return ok=true with its service_id, http_url, and label. Do not merely adopt a running service, because RDS must prove the live runtime is serving the latest deploy snapshot.
+- If the label exists but points at a different workdir or local_port, return ok=false with error "label conflict".
+  - label: ${LABEL}
+  - mode: http
+  - public: true
+  - local_port: ${PORT}
+  - workdir: ${APP_DIR}
+  - entrypoint: ${ENTRYPOINT}
+  - env_vars:
+$(printf '%s\n' "$ENV_VARS" | sed 's/^/      /')
+
+After the tool call, return JSON only:
+{
+  "ok": true_or_false,
+  "service_id": "service id if created",
+  "http_url": "public https URL if created",
+  "label": "${LABEL}",
+  "error": "short error if not created"
+}
+PROMPT
+
+write_service_info() {
+  python3 - "$1" "$SERVICE_INFO_PATH" "$BUILD_ID" "$LABEL" "$PORT" "$APP_DIR" "$URL" "$STACK" <<'PY'
+import json, sys
+raw_path, out_path, build_id, label, port, app_dir, expected_url, stack = sys.argv[1:]
+raw = json.load(open(raw_path))
+payload = raw.get("output", raw)
+if not payload.get("ok"):
+    raise SystemExit(f"FATAL: Zo registration failed: {payload.get('error') or payload}")
+url = payload.get("http_url") or expected_url
+service_id = payload.get("service_id") or ""
+if not service_id:
+    raise SystemExit(f"FATAL: Zo registration returned no service_id: {payload}")
+info = {
+    "build_id": build_id,
+    "service_id": service_id,
+    "label": payload.get("label") or label,
+    "url": url,
+    "local_port": int(port),
+    "app_dir": app_dir,
+    "stack": stack,
+    "status": "live",
+    "updated_at": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat().replace("+00:00", "Z"),
+}
+with open(out_path, "w") as f:
+    json.dump(info, f, indent=2)
+    f.write("\n")
+print(url)
+PY
+}
+
+log "registering Zo service label=$LABEL port=$PORT app_dir=$APP_DIR" >&2
+
+call_zo_register() {
+  local prompt_file="$1"
+  local schema_file="$2"
+  local out_file="$3"
+  python3 - "$prompt_file" "$schema_file" "$out_file" <<'PY'
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+prompt_path, schema_path, out_path = sys.argv[1:]
+token = os.environ.get("ZO_CLIENT_IDENTITY_TOKEN")
+if not token:
+    raise SystemExit("FATAL: ZO_CLIENT_IDENTITY_TOKEN environment variable is required")
+
+with open(prompt_path) as f:
+    prompt = f.read()
+with open(schema_path) as f:
+    schema = json.load(f)
+
+timeout = int(os.environ.get("RDS_ZO_ASK_TIMEOUT_SEC", "180"))
+model_name = os.environ.get("RDS_ZO_ASK_MODEL", "byok:a48f26a1-6765-4644-8d36-68ef5a9a51ad")
+payload = {"input": prompt, "model_name": model_name, "output_format": schema}
+request = urllib.request.Request(
+    "https://api.zo.computer/zo/ask",
+    data=json.dumps(payload).encode("utf-8"),
+    headers={"authorization": token, "content-type": "application/json"},
+    method="POST",
+)
+try:
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        status = response.status
+        body = response.read().decode("utf-8", errors="replace")
+except urllib.error.HTTPError as exc:
+    body = exc.read().decode("utf-8", errors="replace")
+    raise SystemExit(f"FATAL: Zo ask failed HTTP {exc.code}: {body[:1000]}")
+except urllib.error.URLError as exc:
+    raise SystemExit(f"FATAL: Zo ask failed: {exc}")
+
+if status != 200:
+    raise SystemExit(f"FATAL: Zo ask failed HTTP {status}: {body[:1000]}")
+
+try:
+    data = json.loads(body)
+except Exception as exc:
+    raise SystemExit(f"FATAL: Zo ask returned invalid JSON: {exc}; body={body[:1000]}")
+
+with open(out_path, "w") as f:
+    json.dump(data, f)
+    f.write("\n")
+PY
+}
+
+tmp="$(mktemp)"
+prompt_tmp="$(mktemp)"
+schema_tmp="$(mktemp)"
+printf '%s' "$prompt" >"$prompt_tmp"
+printf '%s' "$schema" >"$schema_tmp"
+max_attempts="${RDS_ZO_REGISTER_OUTER_ATTEMPTS:-3}"
+sleep_sec="${RDS_ZO_REGISTER_RETRY_SLEEP_SEC:-20}"
+attempt=1
+while (( attempt <= max_attempts )); do
+  : >"$tmp.err"
+  if call_zo_register "$prompt_tmp" "$schema_tmp" "$tmp" 2>"$tmp.err"; then
+    write_service_info "$tmp"
+    rm -f "$tmp" "$tmp.err" "$prompt_tmp" "$schema_tmp"
+    exit 0
+  fi
+
+  echo "WARN: zo registration command failed on attempt ${attempt}/${max_attempts}" >&2
+  cat "$tmp.err" >&2 || true
+  if grep -qiE 'HTTP 401|Status 401|Token has expired|ZO_CLIENT_IDENTITY_TOKEN environment variable is required' "$tmp.err"; then
+    echo "FATAL: Zo registration authentication failed; not retrying with the same token" >&2
+    rm -f "$tmp" "$tmp.err" "$prompt_tmp" "$schema_tmp"
+    exit 1
+  fi
+  if (( attempt < max_attempts )); then
+    echo "WARN: retrying Zo registration/adoption after ${sleep_sec}s" >&2
+    sleep "$sleep_sec"
+  fi
+  attempt=$((attempt + 1))
+done
+
+echo "FATAL: zo registration command failed after ${max_attempts} attempts" >&2
+rm -f "$tmp" "$tmp.err" "$prompt_tmp" "$schema_tmp"
+exit 1
+
+rm -f "$tmp" "$tmp.err" "$prompt_tmp" "$schema_tmp"

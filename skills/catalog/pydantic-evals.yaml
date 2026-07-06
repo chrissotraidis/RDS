@@ -1,0 +1,17 @@
+---
+slug: pydantic-evals
+name: Pydantic evals
+status: curated
+category: testing
+maturity: beta
+applies_to:
+- python-ai-service
+description: Pydantic AI eval fixture and scoring conventions.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: ai.pydantic.dev
+  url: https://ai.pydantic.dev/evals/
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

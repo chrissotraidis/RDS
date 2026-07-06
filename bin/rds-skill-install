@@ -1,0 +1,134 @@
+#!/usr/bin/env ruby
+# Install build-resolved skills. V1 built-ins are declarative/no-op hooks plus docs.
+
+require "json"
+require "yaml"
+require "fileutils"
+require "open3"
+
+args = {}
+ARGV.each_with_index do |arg, idx|
+  if arg.start_with?("--")
+    key, value = arg[2..].split("=", 2)
+    value ||= ARGV[idx + 1] unless ARGV[idx + 1]&.start_with?("--")
+    args[key] = value
+  end
+end
+
+root = File.expand_path("..", __dir__)
+build_dir = args.fetch("build-dir")
+app_dest = args.fetch("app-dest")
+resolved_path = File.join(build_dir, "skills", "resolved.json")
+
+unless File.exist?(resolved_path)
+  puts "No resolved skills found; skipping skill install."
+  exit 0
+end
+
+resolved = JSON.parse(File.read(resolved_path)).fetch("resolved")
+FileUtils.mkdir_p(File.join(app_dest, ".rds", "skills"))
+
+installed = []
+resolved.each do |skill|
+  slug = skill.fetch("slug")
+  install = skill["install"] || {}
+  mode = install["mode"] || install["phase"] || "metadata"
+  target = File.join(app_dest, ".rds", "skills", "#{slug}.json")
+  File.write(target, JSON.pretty_generate(skill) + "\n")
+
+  cmd = install["command"]
+  if cmd && !cmd.empty?
+    stdout, stderr, status = Open3.capture3({ "RDS_APP_DEST" => app_dest, "RDS_BUILD_DIR" => build_dir }, cmd, chdir: root)
+    puts stdout unless stdout.empty?
+    warn stderr unless stderr.empty?
+    unless status.success?
+      warn "FATAL: skill #{slug} install command failed with #{status.exitstatus}"
+      exit status.exitstatus || 1
+    end
+  else
+    puts "installed #{slug} (#{mode})"
+  end
+
+  verify = skill["verify"] || {}
+  verify_cmd = verify["command"]
+  if verify_cmd && !verify_cmd.empty?
+    stdout, stderr, status = Open3.capture3({ "RDS_APP_DEST" => app_dest, "RDS_BUILD_DIR" => build_dir }, verify_cmd, chdir: root)
+    puts stdout unless stdout.empty?
+    warn stderr unless stderr.empty?
+    unless status.success?
+      warn "FATAL: skill #{slug} verify command failed with #{status.exitstatus}"
+      exit status.exitstatus || 1
+    end
+  end
+  installed << slug
+end
+
+File.write(File.join(build_dir, "skills", "installed.json"), JSON.pretty_generate({ installed: installed }) + "\n")
+puts "skills installed: #{installed.empty? ? '(none)' : installed.join(', ')}"
+
+# Write a builder-readable SKILLS.md to the app root so both Codex and Claude
+# can discover the resolved skill set without depending on prompt-injected lists.
+# This is the single source of truth the builder is told to consult.
+skills_md_path = File.join(app_dest, "SKILLS.md")
+skills_md = +<<~HEADER
+  # Available Skills
+
+  This project was scaffolded with the following RDS skills resolved and installed.
+  **You must use these skills as your defaults.** Do not reinvent functionality these
+  skills provide. Full per-skill manifests live in `.rds/skills/<slug>.json`.
+
+  When a skill applies to your current task, follow its conventions instead of
+  improvising. Examples:
+  - If `shadcn-add` is present, use shadcn/ui components from `@/components/ui/*`
+    instead of writing raw HTML form controls or ad-hoc Tailwind components.
+  - If `auth-better-auth` is present, use Better Auth's session APIs instead of
+    rolling a custom auth flow.
+  - If `drizzle-introspect-skill` is present, use Drizzle ORM for schema and
+    queries instead of raw SQL or another ORM.
+  - If `playwright-mcp` is present, write UI verification with Playwright.
+
+  Skill usage is mandatory when relevant:
+  1. Read this file before choosing an implementation pattern for UI, auth,
+     data, testing, browser verification, canvas/game quality, secrets, or evals.
+  2. Apply any resolved skill whose purpose matches the task.
+  3. In each final task note, state `Skills used:` with the skill slug(s), or
+     `Skills not applicable:` with a short reason.
+  4. If an applicable skill cannot be used because required files, packages,
+     credentials, or tools are missing, report that blocker instead of inventing
+     an ad-hoc substitute.
+
+  ## Skills
+
+HEADER
+
+if resolved.empty?
+  skills_md << "_(no skills resolved for this build)_\n"
+else
+  resolved.each do |skill|
+    slug = skill.fetch("slug")
+    name = skill["name"] || slug
+    yaml_rel = skill["path"]
+    meta = {}
+    if yaml_rel
+      yaml_path = File.expand_path(yaml_rel, root)
+      meta = YAML.safe_load_file(yaml_path) rescue {}
+    end
+    description = meta["description"] || skill["description"] || ""
+    rationale = meta["rationale"] || ""
+    category = meta["category"] || "general"
+    install_mode = (skill.dig("install", "mode") || skill.dig("install", "phase") || (skill.dig("install", "command") ? "imperative" : "metadata")).to_s
+    sources = Array(meta["source_links"]).map { |s| "[#{s["label"]}](#{s["url"]})" }.join(", ")
+
+    skills_md << "### `#{slug}` — #{name}\n"
+    skills_md << "- **Category:** #{category}\n"
+    skills_md << "- **Install mode:** #{install_mode}\n"
+    skills_md << "- **Purpose:** #{description}\n" unless description.empty?
+    skills_md << "- **Why it's here:** #{rationale}\n" unless rationale.empty?
+    skills_md << "- **References:** #{sources}\n" unless sources.empty?
+    skills_md << "- **Manifest:** `.rds/skills/#{slug}.json`\n"
+    skills_md << "\n"
+  end
+end
+
+File.write(skills_md_path, skills_md)
+puts "wrote #{skills_md_path}"

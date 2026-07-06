@@ -1,0 +1,20 @@
+---
+slug: bpy-headless-runner
+name: bpy headless runner
+status: ready
+default: false
+applies_to:
+- game-asset-pipeline
+description: Subprocess-isolated Blender Python execution.
+install:
+  command: bin/rds-skill-materialize bpy-headless-runner
+verify:
+  command: bin/rds-skill-verify bpy-headless-runner
+maturity: beta
+category: asset-pipeline
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should
+  understand during stack selection, skill resolution, implementation guidance, or
+  verification.
+source_links:
+- label: docs.blender.org
+  url: https://docs.blender.org/api/current/

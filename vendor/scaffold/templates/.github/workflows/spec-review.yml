@@ -1,0 +1,62 @@
+name: Product Advocate - Spec Review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    paths:
+      - "spec.md"
+
+jobs:
+  review-spec:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Review spec.md
+        uses: anthropics/claude-code-action@v1
+        env:
+          ANTHROPIC_BASE_URL: https://openrouter.ai/api
+        with:
+          anthropic_api_key: ${{ secrets.OPENROUTER_API_KEY }}
+
+          # Prompt — tells Claude exactly what to review and how
+          prompt: |
+            You are a UX Product Advocate reviewing spec changes.
+
+            1. Read `.github/prompts/product-advocate.md` — this is your review methodology and persona.
+            2. Read `spec.md` — this is the product specification.
+            3. Run `gh pr diff` to see exactly which lines changed in this PR.
+            4. Perform your review following the methodology in the prompt file,
+               but focus ONLY on the lines and sections changed in this PR.
+
+            ## How to post feedback
+
+            Post each issue as a SEPARATE inline comment on the relevant line
+            using the mcp__github_inline_comment__create_inline_comment tool
+            with confirmed: true.
+
+            Each inline comment should follow this format:
+            **[SEVERITY]** Short descriptive title
+
+            **Observation:** What the spec commits to and what's missing or ambiguous.
+            **Risk:** What goes wrong if unaddressed.
+            **Question:** A specific question for the spec author.
+            **Suggested fix:** Minimum change to resolve the gap.
+
+            After posting all inline comments, post ONE top-level summary comment
+            using `gh pr comment` with:
+            - Total issue count by severity
+            - A 2-3 sentence overall assessment
+
+            Do NOT produce a single monolithic review document. Each issue = one inline comment.
+
+          # Claude Code CLI args — tools scoped to read-only + inline PR comments, model selection
+          claude_args: |
+            --model claude-sonnet-4-6 --allowedTools mcp__github_inline_comment__create_inline_comment,Read,Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr comment:*),Bash(git diff),Bash(cat)

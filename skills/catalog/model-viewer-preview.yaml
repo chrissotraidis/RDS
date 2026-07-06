@@ -1,0 +1,17 @@
+---
+slug: model-viewer-preview
+name: model-viewer preview
+status: curated
+category: preview
+maturity: stable
+applies_to:
+- game-asset-pipeline
+description: Browser preview surface for generated 3D assets.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: modelviewer.dev
+  url: https://modelviewer.dev/
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

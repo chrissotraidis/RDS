@@ -1,0 +1,20 @@
+---
+slug: litellm-gateway-skill
+name: LiteLLM gateway
+status: ready
+default: false
+applies_to:
+- python-ai-service
+description: Provider-key isolation through a LiteLLM gateway.
+install:
+  command: bin/rds-skill-materialize litellm-gateway-skill
+verify:
+  command: bin/rds-skill-verify litellm-gateway-skill
+maturity: stable
+category: llm
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should
+  understand during stack selection, skill resolution, implementation guidance, or
+  verification.
+source_links:
+- label: docs.litellm.ai
+  url: https://docs.litellm.ai/

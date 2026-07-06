@@ -1,0 +1,18 @@
+---
+slug: expo-skills-mount
+name: Expo skills mount
+status: ready
+default: false
+applies_to:
+- mobile-native
+description: Expo official skill/context mount for mobile-native builds.
+install:
+  command: bin/rds-skill-materialize expo-skills-mount
+verify:
+  command: bin/rds-skill-verify expo-skills-mount
+maturity: stable
+category: mobile
+rationale: Mobile-native builds need Expo-compatible project structure, device capability assumptions, and a browser-inspectable fallback preview. This skill keeps mobile behavior explicit instead of treating it like a web page.
+source_links:
+- label: docs.expo.dev
+  url: https://docs.expo.dev/

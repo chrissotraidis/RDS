@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+# bin/rds-cost <build-id> — recompute and persist cost telemetry (TD-032).
+#
+# Walks Claude Code's per-project session JSONL files
+# (~/.claude/projects/*/*.jsonl), keeps assistant messages whose timestamp
+# falls within the build window and whose `cwd` matches the build's
+# app_dest or RDS_ROOT, sums tokens by model, applies a pricing table,
+# and writes the result to:
+#   - builds/<id>/cost.json   (canonical artifact)
+#   - state.json.cost         (for the dashboard pill)
+#
+# Best-effort: missing logs / unknown models do not fail the run.
+# Prints a one-line summary to stdout. Emits a `cost_updated` event.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck disable=SC1091
+source "$ROOT/bin/lib/common.sh"
+# shellcheck disable=SC1091
+source "$ROOT/bin/lib/state.sh"
+
+BUILD_ID="${1:-}"
+if [[ -z "$BUILD_ID" ]]; then
+  echo "Usage: bin/rds-cost <build-id>" >&2
+  exit 1
+fi
+BUILD_DIR="$RDS_BUILDS_DIR/$BUILD_ID"
+STATE="$BUILD_DIR/state.json"
+if [[ ! -f "$STATE" ]]; then
+  echo "FATAL: no state.json at $STATE" >&2
+  exit 1
+fi
+
+started_at="$(jq -r '.started_at // ""' "$STATE")"
+updated_at="$(jq -r '.updated_at // ""' "$STATE")"
+app_dest="$(jq -r '.app_dest // ""'    "$STATE")"
+
+CLAUDE_DIR="${CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}"
+if [[ ! -d "$CLAUDE_DIR" ]]; then
+  echo "warn: no claude projects dir at $CLAUDE_DIR — writing zero cost" >&2
+fi
+
+# Aggregation runs in python because jq + flock in bash for ~1000 jsonl files
+# is fragile. Pricing table lives here (per 1M tokens, USD). Update as Anthropic
+# publishes new rates. Unknown models default to opus-tier pricing so we never
+# silently undercount.
+python3 - "$CLAUDE_DIR" "$started_at" "$updated_at" "$app_dest" "$ROOT" "$BUILD_DIR" <<'PY'
+import json, os, sys, glob, datetime
+
+claude_dir, started_at, updated_at, app_dest, rds_root, build_dir = sys.argv[1:7]
+
+# Per-1M-token rates. Cache creation = 1.25x input; cache read = 0.10x input.
+PRICES = {
+    "claude-opus-4-7":     {"in": 15.0,  "out": 75.0},
+    "claude-opus-4-6":     {"in": 15.0,  "out": 75.0},
+    "claude-opus-4":       {"in": 15.0,  "out": 75.0},
+    "claude-sonnet-4-6":   {"in":  3.0,  "out": 15.0},
+    "claude-sonnet-4":     {"in":  3.0,  "out": 15.0},
+    "claude-haiku-4-5":    {"in":  1.0,  "out":  5.0},
+    "claude-haiku-4":      {"in":  1.0,  "out":  5.0},
+}
+DEFAULT_PRICE = {"in": 15.0, "out": 75.0}  # opus-tier; never silently undercount
+
+def parse_ts(s):
+    if not s: return None
+    try:
+        return datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+start_dt = parse_ts(started_at)
+end_dt   = parse_ts(updated_at) or datetime.datetime.now(datetime.timezone.utc)
+
+totals = {"input": 0, "output": 0, "cache_creation": 0, "cache_read": 0}
+by_model = {}
+session_set = set()
+
+if os.path.isdir(claude_dir):
+    for jsonl in glob.glob(os.path.join(claude_dir, "*", "*.jsonl")):
+        try:
+            with open(jsonl, "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    if '"type":"assistant"' not in line:
+                        continue
+                    try:
+                        d = json.loads(line)
+                    except Exception:
+                        continue
+                    if d.get("type") != "assistant": continue
+                    cwd = d.get("cwd") or ""
+                    # Cost belongs to this build if the session's cwd is inside
+                    # the app_dest, the RDS root, or the build's workspace.
+                    if app_dest and cwd.startswith(app_dest):
+                        pass
+                    elif cwd.startswith(rds_root):
+                        pass
+                    else:
+                        continue
+                    ts = parse_ts(d.get("timestamp"))
+                    if start_dt and ts and ts < start_dt: continue
+                    if ts and ts > end_dt + datetime.timedelta(minutes=5):
+                        continue
+                    msg = d.get("message", {}) or {}
+                    usage = msg.get("usage") or {}
+                    model = msg.get("model") or "unknown"
+                    inp  = int(usage.get("input_tokens") or 0)
+                    out  = int(usage.get("output_tokens") or 0)
+                    cc   = int(usage.get("cache_creation_input_tokens") or 0)
+                    cr   = int(usage.get("cache_read_input_tokens") or 0)
+                    totals["input"]          += inp
+                    totals["output"]         += out
+                    totals["cache_creation"] += cc
+                    totals["cache_read"]     += cr
+                    m = by_model.setdefault(model, {"input":0,"output":0,"cache_creation":0,"cache_read":0,"usd":0.0})
+                    m["input"]          += inp
+                    m["output"]         += out
+                    m["cache_creation"] += cc
+                    m["cache_read"]     += cr
+                    sid = d.get("sessionId")
+                    if sid: session_set.add(sid)
+        except Exception:
+            continue
+
+def usd_for(model_key, m):
+    p = PRICES.get(model_key, DEFAULT_PRICE)
+    in_rate  = p["in"]
+    out_rate = p["out"]
+    cost  = m["input"] / 1_000_000 * in_rate
+    cost += m["output"] / 1_000_000 * out_rate
+    cost += m["cache_creation"] / 1_000_000 * (in_rate * 1.25)
+    cost += m["cache_read"]     / 1_000_000 * (in_rate * 0.10)
+    return round(cost, 6)
+
+total_usd = 0.0
+for model, m in by_model.items():
+    m["usd"] = usd_for(model, m)
+    total_usd += m["usd"]
+
+total_tokens = sum(totals.values())
+out = {
+    "build_id": os.path.basename(build_dir),
+    "computed_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "started_at": started_at or None,
+    "window_end": end_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "total_usd": round(total_usd, 4),
+    "total_tokens": total_tokens,
+    "tokens_by_kind": totals,
+    "by_model": by_model,
+    "session_count": len(session_set),
+    "source": "claude_projects_jsonl",
+    "pricing_note": "per-1M USD; cache_creation=1.25x input; cache_read=0.10x input",
+}
+with open(os.path.join(build_dir, "cost.json"), "w") as fh:
+    json.dump(out, fh, indent=2)
+
+# Print a one-line summary for the operator.
+print(f"cost: ${out['total_usd']:.4f}  tokens: {total_tokens:,}  sessions: {len(session_set)}  models: {','.join(sorted(by_model.keys())) or 'none'}")
+PY
+
+# Update state.json.cost from cost.json (so the dashboard pill reads it).
+COST_JSON="$BUILD_DIR/cost.json"
+if [[ -f "$COST_JSON" ]]; then
+  total_usd="$(jq    '.total_usd    // 0' "$COST_JSON")"
+  total_tok="$(jq    '.total_tokens // 0' "$COST_JSON")"
+  by_model="$(jq -c  '.by_model     // {}' "$COST_JSON")"
+  state_set_cost "$BUILD_DIR" "$total_usd" "$total_tok" "$by_model"
+  "$ROOT/bin/rds-event" cost_updated \
+    --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+    total_usd="$total_usd" total_tokens="$total_tok" \
+    >/dev/null 2>&1 || true
+fi
+
+exit 0

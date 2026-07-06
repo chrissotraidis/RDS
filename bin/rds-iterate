@@ -1,0 +1,1294 @@
+#!/usr/bin/env bash
+# bin/rds-iterate — apply a post-build operator change, verify it, and redeploy.
+#
+# Usage:
+#   printf '%s\n' "Make the paddle faster" | bin/rds-iterate <build-id>
+#   bin/rds-iterate <build-id> --prompt="Make the paddle faster" [--no-qa] [--no-deploy]
+#
+# Safety model:
+#   - Runs the selected provider from state.json inside app_dest only.
+#   - Records every phase under builds/<id>/iterate-<ts>.*
+#   - Runs project checks and RDS QA before any redeploy.
+#   - Leaves the existing public service untouched when checks fail.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck disable=SC1091
+source "$ROOT/bin/lib/common.sh"
+# shellcheck disable=SC1091
+source "$ROOT/bin/lib/state.sh"
+
+usage() {
+  sed -n '2,14p' "$0"
+}
+
+BUILD_ID="${1:-}"
+if [[ "$BUILD_ID" == "-h" || "$BUILD_ID" == "--help" ]]; then
+  usage
+  exit 0
+fi
+if [[ -z "$BUILD_ID" || "${BUILD_ID:0:2}" == "--" ]]; then
+  echo "Usage: bin/rds-iterate <build-id> [--prompt=TEXT] [--no-qa] [--no-deploy]" >&2
+  exit 2
+fi
+shift || true
+
+PROMPT=""
+BUDGET="${RDS_ITERATE_BUDGET_USD:-2.00}"
+NO_QA=0
+NO_DEPLOY=0
+YES=0
+QA_AUTOFIX="${RDS_ITERATE_QA_AUTOFIX:-1}"
+QA_AUTOFIX_DEPTH="${RDS_ITERATE_QA_AUTOFIX_DEPTH:-0}"
+QA_AUTOFIX_MAX="${RDS_ITERATE_QA_AUTOFIX_MAX:-2}"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --prompt=*) PROMPT="${1#*=}"; shift ;;
+    --prompt) PROMPT="${2:-}"; shift 2 ;;
+    --max-budget-usd=*) BUDGET="${1#*=}"; shift ;;
+    --max-budget-usd) BUDGET="${2:-}"; shift 2 ;;
+    --no-qa) NO_QA=1; shift ;;
+    --no-deploy) NO_DEPLOY=1; shift ;;
+    --yes) YES=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+  [[ $# -gt 0 ]] || break
+done
+
+if [[ -z "$PROMPT" ]]; then
+  PROMPT="$(cat)"
+fi
+PROMPT="$(printf '%s' "$PROMPT" | sed -e 's/[[:space:]]*$//')"
+[[ -n "$PROMPT" ]] || { echo "FATAL: no iteration request supplied on stdin or --prompt" >&2; exit 2; }
+
+BUILD_DIR="$RDS_BUILDS_DIR/$BUILD_ID"
+STATE="$BUILD_DIR/state.json"
+[[ -f "$STATE" ]] || { echo "FATAL: build not found: $BUILD_ID" >&2; exit 2; }
+
+app_dest="$(jq -r '.app_dest // empty' "$STATE" 2>/dev/null || true)"
+[[ -n "$app_dest" ]] || { echo "FATAL: state.json has no app_dest; cannot iterate" >&2; exit 2; }
+[[ -d "$app_dest" ]] || { echo "FATAL: app_dest does not exist: $app_dest" >&2; exit 2; }
+app_dest="$(realpath "$app_dest")"
+
+refresh_skill_scorecard() {
+  [[ -x "$ROOT/bin/rds-skill-scorecard" ]] || return 0
+  [[ -f "$BUILD_DIR/skills/resolved.json" ]] || return 0
+  [[ -d "$app_dest" ]] || return 0
+  "$ROOT/bin/rds-skill-scorecard" \
+    --build-dir "$BUILD_DIR" \
+    --app-dest "$app_dest" \
+    >/dev/null 2>&1 || true
+}
+
+refresh_evidence_ledgers() {
+  "$ROOT/bin/rds-quality-ledger" "$BUILD_ID" >/dev/null 2>&1 || true
+  "$ROOT/bin/rds-readiness" "$BUILD_ID" >/dev/null 2>&1 || true
+  refresh_skill_scorecard
+  "$ROOT/bin/rds-evidence-ledger" "$BUILD_ID" >/dev/null 2>&1 || true
+}
+
+run_mockup_fidelity() {
+  [[ "${RDS_MOCKUP_FIDELITY_ENABLED:-1}" == "1" ]] || return 0
+  [[ -x "$ROOT/bin/rds-mockup" ]] || return 0
+  local canonical_stack
+  canonical_stack="$(jq -r '.build_plan.stack // .stack // empty' "$STATE" 2>/dev/null || true)"
+  canonical_stack="${canonical_stack:-nextjs-fullstack}"
+  local mockup_log="$BUILD_DIR/iterate-$ts.mockup.log"
+  local preview_url
+  preview_url="$(cat "$BUILD_DIR/preview-url.txt" 2>/dev/null || jq -r '.preview_url // empty' "$STATE" 2>/dev/null || true)"
+  echo "[rds-iterate] running mockup fidelity"
+  if "$ROOT/bin/rds-mockup" verify \
+    --build-dir="$BUILD_DIR" \
+    --app-dir="$app_dest" \
+    --stack="$canonical_stack" \
+    ${preview_url:+--url="$preview_url"} \
+    > "$mockup_log" 2>&1; then
+    return 0
+  fi
+  local rc=$?
+  echo "[rds-iterate] mockup fidelity failed rc=$rc; see $mockup_log" >&2
+  return "$rc"
+}
+
+PROVIDER="$(rds_build_provider_from_state "$BUILD_DIR")"
+PROVIDER="${PROVIDER:-${RDS_INFERENCE_PROVIDER:-claude}}"
+build_claude_model="$(jq -r '.inference.claude_model // empty' "$STATE" 2>/dev/null || true)"
+build_codex_model="$(jq -r '.inference.codex_model // empty' "$STATE" 2>/dev/null || true)"
+export RDS_CLAUDE_MODEL="${build_claude_model:-${RDS_CLAUDE_MODEL:-claude-opus-4-6}}"
+export RDS_CODEX_MODEL="${build_codex_model:-${RDS_CODEX_MODEL:-}}"
+
+ts="$(date -u +%Y%m%d-%H%M%S)"
+request_file="$BUILD_DIR/iterate-$ts.md"
+apply_prompt_file="$BUILD_DIR/iterate-$ts.apply.prompt.md"
+apply_log="$BUILD_DIR/iterate-$ts.apply.log"
+checks_log="$BUILD_DIR/iterate-$ts.checks.log"
+qa_log="$BUILD_DIR/iterate-$ts.qa.log"
+deploy_log="$BUILD_DIR/iterate-$ts.deploy.log"
+summary_file="$BUILD_DIR/iterate-$ts.summary.json"
+repair_plan_file="$BUILD_DIR/iterate-$ts.repair-plan.json"
+repair_jobs_file="$BUILD_DIR/iterate-$ts.repair-jobs.json"
+repair_convergence_file="$BUILD_DIR/iterate-$ts.repair-convergence.json"
+file_snapshot_before="$BUILD_DIR/iterate-$ts.files-before.json"
+action_run_file="${RDS_ACTION_RUN_FILE:-}"
+
+action_run_update() {
+  [[ -n "$action_run_file" && -f "$action_run_file" ]] || return 0
+  local patch="$1"
+  local tmp
+  tmp="$(mktemp)"
+  if jq --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '. + '"$patch"' + {updated_at:$now}' "$action_run_file" > "$tmp"; then
+    mv "$tmp" "$action_run_file"
+  else
+    rm -f "$tmp"
+  fi
+}
+
+finish_failed() {
+  local phase="$1"
+  local rc="$2"
+  local output_file="${3:-}"
+  local error="${4:-}"
+  local summary_rel="builds/$BUILD_ID/$(basename "$summary_file")"
+  local output_rel=""
+  terminal_recorded=1
+  [[ -n "$output_file" ]] && output_rel="builds/$BUILD_ID/$(basename "$output_file")"
+
+  update_repair_jobs_trace "$phase" "$rc" "failed" || true
+
+  jq -n \
+    --arg status "failed" \
+    --arg phase "$phase" \
+    --arg output "$output_rel" \
+    --arg error "$error" \
+    --argjson rc "$rc" \
+    '{ok:false,status:$status,failed_phase:$phase,exit_code:$rc}
+      + (if $output != "" then {output_file:$output} else {} end)
+      + (if $error != "" then {error:$error} else {} end)' > "$summary_file"
+
+  action_run_update '{"ok":false,"status":"failed","phase":"'"$phase"'","failed_phase":"'"$phase"'","exit_code":'"$rc"',"summary_file":"'"$summary_rel"'"}'
+
+  "$ROOT/bin/rds-event" iterate_failed \
+    --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" --app-dest "$app_dest" \
+    failed_phase="$phase" exit_code="$rc" summary="$summary_rel" output_file="$output_rel" \
+    >/dev/null 2>&1 || true
+}
+
+finish_needs_review() {
+  local phase="$1"
+  local rc="$2"
+  local output_file="${3:-}"
+  local reason="${4:-QA gaps remain after autonomous iteration cap.}"
+  local summary_rel="builds/$BUILD_ID/$(basename "$summary_file")"
+  local output_rel=""
+  terminal_recorded=1
+  [[ -n "$output_file" ]] && output_rel="builds/$BUILD_ID/$(basename "$output_file")"
+
+  update_repair_jobs_trace "$phase" "$rc" "needs_review" || true
+
+  jq -n \
+    --arg status "needs_review" \
+    --arg phase "$phase" \
+    --arg output "$output_rel" \
+    --arg reason "$reason" \
+    --argjson rc "$rc" \
+    '{ok:false,status:$status,phase:$phase,exit_code:$rc,reason:$reason}
+      + (if $output != "" then {output_file:$output} else {} end)' > "$summary_file"
+
+  action_run_update '{"ok":false,"status":"needs_review","phase":"'"$phase"'","exit_code":'"$rc"',"summary_file":"'"$summary_rel"'","error":'"$(jq -Rn --arg v "$reason" '$v')"'}'
+
+  "$ROOT/bin/rds-event" iterate_needs_review \
+    --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" --app-dest "$app_dest" \
+    phase="$phase" exit_code="$rc" summary="$summary_rel" output_file="$output_rel" reason="$reason" \
+    >/dev/null 2>&1 || true
+
+  state_set_stage "$BUILD_DIR" qa failed || true
+  state_set_error "$BUILD_DIR" "$reason" || true
+  state_set_review "$BUILD_DIR" pending "rds-iterate" "$reason" || true
+}
+
+finish_completed() {
+  local status="${1:-passed}"
+  local summary_rel="builds/$BUILD_ID/$(basename "$summary_file")"
+  local preview_arg="${preview:-}"
+  terminal_recorded=1
+  update_repair_jobs_trace "complete" 0 "$status" || true
+  jq -n \
+    --arg status "$status" \
+    --arg request "builds/$BUILD_ID/$(basename "$request_file")" \
+    --arg apply "builds/$BUILD_ID/$(basename "$apply_log")" \
+    --arg checks "builds/$BUILD_ID/$(basename "$checks_log")" \
+    --arg qa "builds/$BUILD_ID/$(basename "$qa_log")" \
+    --arg deploy "builds/$BUILD_ID/$(basename "$deploy_log")" \
+    --arg repair_plan "builds/$BUILD_ID/$(basename "$repair_plan_file")" \
+    --arg repair_jobs "builds/$BUILD_ID/$(basename "$repair_jobs_file")" \
+    --arg repair_convergence "builds/$BUILD_ID/$(basename "$repair_convergence_file")" \
+    --arg preview "$preview_arg" \
+    --argjson qa_skipped "$NO_QA" \
+    --argjson deploy_skipped "$NO_DEPLOY" \
+    '{ok:true,status:$status,request:$request,apply_log:$apply,checks_log:$checks,qa_log:$qa,deploy_log:$deploy,repair_plan:$repair_plan,repair_jobs:$repair_jobs,repair_convergence:$repair_convergence,preview_url:$preview,qa_skipped:($qa_skipped==1),deploy_skipped:($deploy_skipped==1)}' \
+    > "$summary_file"
+
+  "$ROOT/bin/rds-event" iterate_completed \
+    --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" --app-dest "$app_dest" \
+    summary="$summary_rel" preview_url="$preview_arg" \
+    >/dev/null 2>&1 || true
+  action_run_update '{"ok":true,"status":"'"$status"'","phase":"complete","summary_file":"'"$summary_rel"'","preview_url":'"$(jq -Rn --arg v "$preview_arg" '$v')"'}'
+}
+
+terminal_recorded=0
+current_phase="starting"
+current_log="$request_file"
+
+record_unexpected_exit() {
+  local rc="$1"
+  [[ "$terminal_recorded" == "0" ]] || return 0
+  (( rc == 0 )) && return 0
+  terminal_recorded=1
+  finish_failed "${current_phase:-unknown}" "$rc" "${current_log:-}" "rds-iterate exited before recording a terminal result"
+}
+
+handle_interrupt() {
+  local rc="$1"
+  [[ "$terminal_recorded" == "0" ]] || exit "$rc"
+  terminal_recorded=1
+  finish_failed "${current_phase:-unknown}" "$rc" "${current_log:-}" "rds-iterate interrupted before completion"
+  exit "$rc"
+}
+
+trap 'handle_interrupt 143' TERM
+trap 'handle_interrupt 130' INT
+trap 'handle_interrupt 129' HUP
+trap 'record_unexpected_exit $?' EXIT
+
+cat > "$request_file" <<EOF
+# RDS iteration request — $ts
+
+Build ID: $BUILD_ID
+App dest: $app_dest
+Provider: $PROVIDER
+Budget: $BUDGET
+
+## Operator request
+
+$PROMPT
+EOF
+
+"$ROOT/bin/rds-event" iterate_started \
+  --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" --app-dest "$app_dest" \
+  provider="$PROVIDER" budget_usd="$BUDGET" request="builds/$BUILD_ID/$(basename "$request_file")" \
+  >/dev/null 2>&1 || true
+action_run_update '{"status":"running","phase":"apply","ok":null}'
+
+spec_path="$BUILD_DIR/spec.md"
+state_json="$(cat "$STATE" 2>/dev/null || echo '{}')"
+recent_events="$(tail -n 80 "$BUILD_DIR/events.jsonl" 2>/dev/null || true)"
+qa_scenarios="$(cat "$BUILD_DIR/qa-scenarios.md" 2>/dev/null || true)"
+# PRD-only spec excerpt for the iteration prompt. We strip RDS-generated addenda
+# (taste brief, appended QA scenarios — those are supplied separately below) and
+# cap by characters rather than truncating to a fixed line count, so the model
+# iterates against the whole user PRD instead of an arbitrary first-N-lines slice.
+spec_excerpt="$(python3 - "$spec_path" <<'PY' || true
+import sys
+from pathlib import Path
+try:
+    text = Path(sys.argv[1]).read_text(encoding="utf-8", errors="ignore")
+except Exception:
+    text = ""
+cut = len(text)
+for marker in ("<!-- RDS_TASTE_BRIEF_V1 -->", "## RDS Taste Brief", "## RDS QA Scenarios"):
+    i = text.find(marker)
+    if i >= 0:
+        cut = min(cut, i)
+text = text[:cut].rstrip()
+limit = 24000
+if len(text) > limit:
+    text = text[:limit] + "\n\n[...spec truncated for length; open " + sys.argv[1] + " for the full document...]"
+sys.stdout.write(text)
+PY
+)"
+latest_qa_dir="$(find "$BUILD_DIR/playwright" -maxdepth 1 -type d -name 'iter-*' 2>/dev/null | sort | tail -n 1 || true)"
+
+qa_repair_context=""
+if [[ -n "$latest_qa_dir" && -d "$latest_qa_dir" ]]; then
+  qa_repair_context="$(python3 - "$latest_qa_dir" <<'PY' || true
+import json
+import sys
+from pathlib import Path
+
+qa_dir = Path(sys.argv[1])
+files = [
+    ("workflow", "workflow-verdict.json"),
+    ("truthfulness", "truthfulness-verdict.json"),
+    ("persona", "persona-verdict.json"),
+    ("prd_coverage", "prd-coverage-verdict.json"),
+    ("scenario", "scenario-verdict.json"),
+    ("website", "website-verdict.json"),
+    ("game", "game-verdict.json"),
+    ("visual", "visual-verdict.json"),
+    ("design", "design-review.json"),
+]
+
+def read(name):
+    try:
+        return json.loads((qa_dir / name).read_text())
+    except Exception:
+        return None
+
+items = []
+for label, name in files:
+    data = read(name)
+    if not isinstance(data, dict):
+        continue
+    status = data.get("status") or data.get("overall") or "unknown"
+    if str(status).lower() in {"pass", "passed", "ok"}:
+        continue
+    failed = data.get("failedRequiredCriteria")
+    criteria = []
+    if isinstance(failed, list):
+        for item in failed[:8]:
+            if isinstance(item, dict):
+                criteria.append({
+                    "name": item.get("name") or item.get("code") or "criterion",
+                    "evidence": item.get("evidence") or item.get("detail") or item.get("message") or "",
+                })
+            else:
+                criteria.append({"name": str(item), "evidence": ""})
+    checks = data.get("checks")
+    if isinstance(checks, list):
+        for item in checks[:10]:
+            if not isinstance(item, dict) or item.get("status") in {"pass", "passed", "ok"}:
+                continue
+            screenshots = item.get("screenshots") if isinstance(item.get("screenshots"), list) else []
+            criteria.append({
+                "name": item.get("id") or item.get("title") or "scenario",
+                "evidence": item.get("evidence") or "",
+                "assertionType": item.get("assertionType"),
+                "failureKind": item.get("failureKind"),
+                "recoveryHint": item.get("recoveryHint"),
+                "screenshots": screenshots[:4],
+                "urlBefore": item.get("urlBefore"),
+                "urlAfter": item.get("urlAfter"),
+            })
+    for key in ("missingRouteFamilies", "missingActions", "scenarioIssues", "broken", "thin"):
+        val = data.get(key)
+        if isinstance(val, list) and val:
+            criteria.append({"name": key, "evidence": ", ".join(map(str, val[:8]))})
+    if label == "prd_coverage":
+        promise_rows = data.get("promiseLedger")
+        if isinstance(promise_rows, list):
+            for row in promise_rows:
+                if not isinstance(row, dict) or str(row.get("status") or "").lower() in {"verified", "pass", "passed", "ok"}:
+                    continue
+                criteria.append({
+                    "name": row.get("id") or row.get("kind") or "prd promise",
+                    "evidence": row.get("promise") or row.get("evidence") or "",
+                    "promise": row.get("promise"),
+                    "kind": row.get("kind"),
+                    "routeFamily": row.get("routeFamily"),
+                    "action": row.get("action"),
+                    "persona": row.get("persona"),
+                    "repairHint": row.get("repairHint"),
+                })
+    if not criteria and isinstance(data.get("criteria"), list):
+        for item in data["criteria"]:
+            if isinstance(item, dict) and item.get("ok") is False:
+                criteria.append({
+                    "name": item.get("name") or "criterion",
+                    "evidence": item.get("evidence") or "",
+                })
+    items.append({
+        "gate": label,
+        "status": status,
+        "score": data.get("score"),
+        "blocking": criteria[:10],
+    })
+
+if items:
+    print(json.dumps({
+        "source": str(qa_dir),
+        "instruction": "Treat these as mandatory repair targets before cosmetic polish. Fix the underlying app behavior and UI truthfulness, then make the verifier evidence pass.",
+        "failing_gates": items,
+    }, indent=2))
+PY
+)"
+fi
+
+build_repair_plan() {
+  python3 - "$BUILD_ID" "$BUILD_DIR" "$latest_qa_dir" "$repair_plan_file" <<'PY' || true
+import json
+import sys
+from pathlib import Path
+
+build_id = sys.argv[1]
+build_dir = Path(sys.argv[2])
+qa_dir = Path(sys.argv[3]) if sys.argv[3] else None
+out = Path(sys.argv[4])
+
+def read_json(path):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8", errors="ignore"))
+    except Exception:
+        return None
+
+def rel(path):
+    try:
+        return str(Path(path).relative_to(build_dir))
+    except Exception:
+        return str(path)
+
+def compact(value, limit=220):
+    text = " ".join(str(value or "").split())
+    return text[:limit]
+
+targets = []
+sources = []
+
+quality = read_json(build_dir / "quality-ledger.json")
+if isinstance(quality, dict):
+    sources.append(rel(build_dir / "quality-ledger.json"))
+    for gate in quality.get("blocking") or []:
+        targets.append({
+            "id": f"quality:{gate}",
+            "gate": "quality-ledger",
+            "status": "blocking",
+            "requirement": f"Clear blocking quality gate: {gate}",
+            "evidence": compact(gate),
+            "path": rel(build_dir / "quality-ledger.json"),
+        })
+    skill_impact = quality.get("skillImpact") if isinstance(quality.get("skillImpact"), dict) else {}
+    for skill in (skill_impact.get("blockingSkills") or [])[:8]:
+        if not isinstance(skill, dict):
+            continue
+        targets.append({
+            "id": f"skill:{skill.get('slug') or 'unknown'}",
+            "gate": "skill-impact",
+            "status": skill.get("verdict") or skill_impact.get("status") or "blocking",
+            "requirement": f"Make selected skill visibly shape the app: {skill.get('slug') or 'unknown'}",
+            "evidence": compact(skill.get("note") or skill.get("shape") or skill.get("verify")),
+            "path": rel(build_dir / "skills" / "scorecard.json"),
+        })
+    prd_coverage = quality.get("prdCoverage") if isinstance(quality.get("prdCoverage"), dict) else {}
+    for row in (prd_coverage.get("blockingRows") or [])[:20]:
+        if not isinstance(row, dict):
+            continue
+        target = {
+            "id": f"prd-promise:{row.get('id') or row.get('kind') or 'missing'}",
+            "gate": "prd-coverage",
+            "status": row.get("status") or prd_coverage.get("status") or "missing",
+            "requirement": compact(row.get("promise") or row.get("id") or "Implement missing PRD promise"),
+            "evidence": compact(row.get("evidence") or row.get("promise") or ""),
+            "path": rel(build_dir / "quality-ledger.json"),
+            "repairHint": compact(row.get("repairHint") or ""),
+            "promiseKind": row.get("kind"),
+        }
+        for key in ("routeFamily", "action", "persona"):
+            if row.get(key):
+                target[key] = row.get(key)
+        targets.append(target)
+
+taste = read_json(build_dir / "taste-review.json")
+if isinstance(taste, dict) and str(taste.get("status") or "").lower() not in {"", "pass", "passed", "ok"}:
+    sources.append(rel(build_dir / "taste-review.json"))
+    missing = taste.get("missing") or taste.get("issues") or taste.get("blockers") or []
+    if not isinstance(missing, list):
+        missing = [missing]
+    for idx, item in enumerate(missing[:8]):
+        targets.append({
+            "id": f"taste:{idx + 1}",
+            "gate": "taste-review",
+            "status": taste.get("status"),
+            "requirement": compact(item if not isinstance(item, dict) else item.get("message") or item.get("name") or item),
+            "evidence": compact(item),
+            "path": rel(build_dir / "taste-review.json"),
+        })
+
+mockup = read_json(build_dir / "mockup-diff" / "report.json")
+if isinstance(mockup, dict) and str(mockup.get("status") or "").lower() not in {"", "pass", "passed", "ok"}:
+    path = build_dir / "mockup-diff" / "report.json"
+    sources.append(rel(path))
+    checks = mockup.get("checks") if isinstance(mockup.get("checks"), list) else []
+    if not checks:
+        checks = [{"name": "mockup_fidelity", "details": mockup}]
+    for idx, check in enumerate(checks[:8]):
+        if not isinstance(check, dict):
+            continue
+        details = check.get("details") if isinstance(check.get("details"), dict) else {}
+        visual_compare = details.get("visual_compare") if isinstance(details.get("visual_compare"), dict) else {}
+        best = visual_compare.get("best") if isinstance(visual_compare.get("best"), dict) else {}
+        evidence = visual_compare.get("reason") or details or check
+        targets.append({
+            "id": f"mockup:{check.get('name') or idx + 1}",
+            "gate": "mockup",
+            "status": mockup.get("status") or "failed",
+            "requirement": "Live UI must match the provided mockup/reference screenshots.",
+            "evidence": compact(evidence),
+            "path": rel(path),
+            "repairHint": "Use the provided reference screenshots/mockups as binding UI constraints before rerunning mockup fidelity.",
+            "reference": best.get("reference"),
+            "liveScreenshot": visual_compare.get("live_screenshot"),
+        })
+
+verdict_files = [
+    ("workflow", "workflow-verdict.json"),
+    ("truthfulness", "truthfulness-verdict.json"),
+    ("persona", "persona-verdict.json"),
+    ("prd-coverage", "prd-coverage-verdict.json"),
+    ("scenario", "scenario-verdict.json"),
+    ("website", "website-verdict.json"),
+    ("game", "game-verdict.json"),
+    ("visual", "visual-verdict.json"),
+    ("design", "design-review.json"),
+]
+if qa_dir and qa_dir.exists():
+    for gate, name in verdict_files:
+        path = qa_dir / name
+        data = read_json(path)
+        if not isinstance(data, dict):
+            continue
+        sources.append(rel(path))
+        status = str(data.get("status") or data.get("overall") or "unknown").lower()
+        if status in {"pass", "passed", "ok"}:
+            continue
+        entries = []
+        for key in ("failedRequiredCriteria", "issues", "blocking", "missingRouteFamilies", "missingActions", "scenarioIssues", "broken", "thin"):
+            value = data.get(key)
+            if isinstance(value, list):
+                entries.extend(value[:8])
+        checks = data.get("checks")
+        if isinstance(checks, list):
+            entries.extend([c for c in checks if isinstance(c, dict) and c.get("status") not in {"pass", "passed", "ok"}][:10])
+        if gate == "prd-coverage" and isinstance(data.get("promiseLedger"), list):
+            entries.extend([
+                c for c in data["promiseLedger"]
+                if isinstance(c, dict) and str(c.get("status") or "").lower() not in {"verified", "pass", "passed", "ok"}
+            ][:20])
+        if not entries and isinstance(data.get("criteria"), list):
+            entries.extend([c for c in data["criteria"] if isinstance(c, dict) and c.get("ok") is False][:8])
+        if not entries:
+            entries = [{"name": gate, "evidence": f"{gate} status={status}"}]
+        for idx, item in enumerate(entries[:12]):
+            if isinstance(item, dict):
+                name_value = item.get("name") or item.get("id") or item.get("title") or item.get("code") or f"{gate} blocker"
+                evidence = item.get("evidence") or item.get("detail") or item.get("message") or item.get("reason") or item
+                screenshots = item.get("screenshots") if isinstance(item.get("screenshots"), list) else []
+                target = {
+                    "id": f"{gate}:{name_value}",
+                    "gate": gate,
+                    "status": item.get("status") or status,
+                    "requirement": compact(name_value),
+                    "evidence": compact(evidence),
+                    "path": rel(path),
+                }
+                if item.get("assertionType"):
+                    target["assertionType"] = item.get("assertionType")
+                if item.get("failureKind"):
+                    target["failureKind"] = item.get("failureKind")
+                if item.get("recoveryHint"):
+                    target["recoveryHint"] = compact(item.get("recoveryHint"))
+                if item.get("repairHint"):
+                    target["repairHint"] = compact(item.get("repairHint"))
+                if item.get("promise"):
+                    target["promise"] = compact(item.get("promise"))
+                if item.get("kind"):
+                    target["promiseKind"] = item.get("kind")
+                for key in ("routeFamily", "action", "persona"):
+                    if item.get(key):
+                        target[key] = item.get(key)
+                if screenshots:
+                    target["screenshots"] = screenshots[:4]
+                if item.get("urlBefore"):
+                    target["urlBefore"] = item.get("urlBefore")
+                if item.get("urlAfter"):
+                    target["urlAfter"] = item.get("urlAfter")
+            else:
+                target = {
+                    "id": f"{gate}:{idx + 1}",
+                    "gate": gate,
+                    "status": status,
+                    "requirement": compact(item),
+                    "evidence": compact(item),
+                    "path": rel(path),
+                }
+            targets.append(target)
+
+deduped = []
+seen = set()
+for target in targets:
+    key = (target.get("id"), target.get("path"), target.get("evidence"))
+    if key in seen:
+        continue
+    seen.add(key)
+    deduped.append(target)
+
+payload = {
+    "schema": "rds.iteration.repair-plan.v1",
+    "buildId": build_id,
+    "status": "ready" if deduped else "empty",
+    "sourceQaIteration": qa_dir.name if qa_dir and qa_dir.exists() else None,
+    "sources": sorted(set(sources)),
+    "targetCount": len(deduped),
+    "targets": deduped[:40],
+    "instruction": "Repair these targets before cosmetic polish. A later convergence report must show which gates closed and which remain.",
+}
+out.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+PY
+}
+
+build_repair_jobs() {
+  python3 - "$BUILD_ID" "$BUILD_DIR" "$repair_plan_file" "$repair_jobs_file" <<'PY' || true
+import json
+import sys
+from pathlib import Path
+
+build_id, build_dir_s, plan_s, out_s = sys.argv[1:]
+build_dir = Path(build_dir_s)
+plan_path = Path(plan_s)
+out = Path(out_s)
+
+def read_json(path):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8", errors="ignore"))
+    except Exception:
+        return None
+
+def compact(value, limit=260):
+    text = " ".join(str(value or "").split())
+    return text[:limit]
+
+def classify(target):
+    gate = str(target.get("gate") or "")
+    failure_kind = str(target.get("failureKind") or "")
+    assertion_type = str(target.get("assertionType") or "")
+    promise_kind = str(target.get("promiseKind") or target.get("kind") or "")
+    status = str(target.get("status") or "").lower()
+    evidence = str(target.get("evidence") or "").lower()
+    requirement = " ".join([
+        str(target.get("requirement") or ""),
+        str(target.get("promise") or ""),
+        str(target.get("repairHint") or ""),
+    ]).lower()
+    action = str(target.get("action") or "").lower()
+
+    if gate == "truthfulness" or any(token in requirement for token in ("seeded", "stub", "fake", "placeholder", "disclosure", "what is real")):
+        return ("truth_disclosure", 20)
+    if gate == "persona" or "login" in requirement or "auth" in requirement:
+        return ("persona_path_repair", 30)
+    if gate == "prd-coverage" and (promise_kind == "route" or target.get("routeFamily")):
+        return ("prd_route_implementation", 40)
+    if gate == "prd-coverage" and (promise_kind == "action" or target.get("action") or action):
+        return ("prd_action_implementation", 45)
+    if gate == "prd-coverage" or promise_kind:
+        return ("prd_promise_implementation", 50)
+    if gate == "workflow" or gate == "scenario" or "product_behavior" in failure_kind or "business" in assertion_type:
+        return ("workflow_behavior_repair", 60)
+    if gate == "skill-impact":
+        return ("skill_adoption_repair", 70)
+    if gate == "mockup" or "mockup" in gate or "mockup" in requirement:
+        return ("design_fidelity", 74)
+    if gate == "design" and status in {"missing", "skipped", "unknown"}:
+        return ("design_fidelity", 75)
+    if gate == "design" and any(token in requirement or token in evidence for token in ("reference", "screenshot", "stitch", "figma", "mockup")):
+        return ("design_fidelity", 75)
+    if gate in {"taste-review", "design", "visual", "website"}:
+        return ("design_taste_repair", 80)
+    if "missing_evidence" in failure_kind or "screenshot" in requirement:
+        return ("evidence_regeneration", 90)
+    return ("general_product_repair", 100)
+
+def title_for(job_type):
+    return {
+        "truth_disclosure": "Make app truthfulness explicit",
+        "persona_path_repair": "Repair persona golden path",
+        "prd_route_implementation": "Implement missing PRD route",
+        "prd_action_implementation": "Implement missing PRD action",
+        "prd_promise_implementation": "Implement missing PRD promise",
+        "workflow_behavior_repair": "Repair workflow behavior",
+        "skill_adoption_repair": "Make selected skill visibly useful",
+        "design_fidelity": "Match the provided design references",
+        "design_taste_repair": "Repair design and taste blockers",
+        "evidence_regeneration": "Regenerate missing evidence",
+        "general_product_repair": "Repair product blocker",
+    }.get(job_type, "Repair product blocker")
+
+def action_for(job_type):
+    return {
+        "truth_disclosure": "Add or fix in-app readiness/provenance/cost disclosure before implying production capability.",
+        "persona_path_repair": "Make the named persona path usable end-to-end, including login/onboarding credentials when in review mode.",
+        "prd_route_implementation": "Create or expose the missing route and connect it from primary navigation.",
+        "prd_action_implementation": "Implement the action so it changes visible or durable business state, not just button text.",
+        "prd_promise_implementation": "Implement the promised product behavior and add visible evidence that it works.",
+        "workflow_behavior_repair": "Fix the broken workflow and ensure before/after state proves the behavior changed.",
+        "skill_adoption_repair": "Use the selected skill's concrete pattern in visible app code and rerun the scorecard.",
+        "design_fidelity": "Use the reference screenshots, mockups, or design brief as binding UI requirements; align route structure, hierarchy, spacing, color, typography, and key visible content before rerunning mockup/design evidence.",
+        "design_taste_repair": "Improve the app's information architecture, hierarchy, responsive layout, and visual quality.",
+        "evidence_regeneration": "Rerun the relevant QA/design/taste evidence after product changes.",
+        "general_product_repair": "Resolve the blocker in the smallest coherent product change.",
+    }.get(job_type, "Resolve the blocker in the smallest coherent product change.")
+
+plan = read_json(plan_path) or {}
+targets = [t for t in (plan.get("targets") or []) if isinstance(t, dict)]
+
+groups = {}
+for target in targets:
+    job_type, priority = classify(target)
+    groups.setdefault(job_type, {"priority": priority, "targets": []})["targets"].append(target)
+
+jobs = []
+for index, (job_type, group) in enumerate(sorted(groups.items(), key=lambda item: item[1]["priority"]), start=1):
+    rows = group["targets"][:10]
+    gates = sorted({str(row.get("gate")) for row in rows if row.get("gate")})
+    job = {
+        "id": f"job-{index:02d}-{job_type}",
+        "type": job_type,
+        "priority": group["priority"],
+        "status": "pending",
+        "title": title_for(job_type),
+        "instruction": action_for(job_type),
+        "gates": gates,
+        "targetCount": len(group["targets"]),
+        "targets": [
+            {
+                key: row.get(key)
+                for key in ("id", "gate", "requirement", "evidence", "repairHint", "promise", "promiseKind", "routeFamily", "action", "persona", "path", "failureKind", "assertionType", "reference", "liveScreenshot")
+                if row.get(key) is not None
+            }
+            for row in rows
+        ],
+        "filesTouched": [],
+        "checksRun": [],
+        "remainingBlockers": [],
+    }
+    jobs.append(job)
+
+payload = {
+    "schema": "rds.iteration.repair-jobs.v1",
+    "buildId": build_id,
+    "status": "ready" if jobs else "empty",
+    "sourcePlan": f"builds/{build_id}/{plan_path.name}",
+    "jobCount": len(jobs),
+    "jobs": jobs,
+    "instruction": "Execute jobs in priority order. Do not polish around a pending truth, persona, PRD, workflow, skill, design, or evidence job.",
+}
+out.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+PY
+}
+
+write_repair_convergence() {
+  local label="${1:-qa}"
+  local rc="${2:-0}"
+  local latest_after
+  latest_after="$(find "$BUILD_DIR/playwright" -maxdepth 1 -type d -name 'iter-*' 2>/dev/null | sort | tail -n 1 || true)"
+  python3 - "$BUILD_ID" "$BUILD_DIR" "$repair_plan_file" "$latest_after" "$repair_convergence_file" "$label" "$rc" <<'PY' || true
+import json
+import sys
+from pathlib import Path
+
+build_id, build_dir_s, plan_s, qa_dir_s, out_s, phase, rc_s = sys.argv[1:]
+build_dir = Path(build_dir_s)
+plan_path = Path(plan_s)
+qa_dir = Path(qa_dir_s) if qa_dir_s else None
+out = Path(out_s)
+
+def read_json(path):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8", errors="ignore"))
+    except Exception:
+        return None
+
+def status_for_gate(gate):
+    if gate in {"quality-ledger", "skill-impact"}:
+        data = read_json(build_dir / "quality-ledger.json")
+        if not isinstance(data, dict):
+            return "missing"
+        if gate == "skill-impact":
+            return ((data.get("skillImpact") or {}).get("status") or "missing") if isinstance(data.get("skillImpact"), dict) else "missing"
+        return "pass" if not data.get("blocking") else "blocked"
+    if gate == "taste-review":
+        data = read_json(build_dir / "taste-review.json")
+        return data.get("status") if isinstance(data, dict) else "missing"
+    file_map = {
+        "workflow": "workflow-verdict.json",
+        "truthfulness": "truthfulness-verdict.json",
+        "persona": "persona-verdict.json",
+        "prd-coverage": "prd-coverage-verdict.json",
+        "scenario": "scenario-verdict.json",
+        "website": "website-verdict.json",
+        "game": "game-verdict.json",
+        "visual": "visual-verdict.json",
+        "design": "design-review.json",
+    }
+    name = file_map.get(gate)
+    if not qa_dir or not name:
+        return "unknown"
+    data = read_json(qa_dir / name)
+    if not isinstance(data, dict):
+        return "missing"
+    return data.get("status") or data.get("overall") or "unknown"
+
+def passing(status):
+    return str(status).lower() in {"pass", "passed", "ok", "true"}
+
+plan = read_json(plan_path) or {}
+targets = plan.get("targets") if isinstance(plan.get("targets"), list) else []
+gate_statuses = {}
+for target in targets:
+    if isinstance(target, dict) and target.get("gate"):
+        gate_statuses[target["gate"]] = status_for_gate(target["gate"])
+
+remaining = []
+closed = []
+for target in targets:
+    if not isinstance(target, dict):
+        continue
+    gate = target.get("gate")
+    status = gate_statuses.get(gate, "unknown")
+    row = {k: target.get(k) for k in ("id", "gate", "requirement", "path") if target.get(k) is not None}
+    row["currentStatus"] = status
+    if passing(status):
+        closed.append(row)
+    else:
+        remaining.append(row)
+
+payload = {
+    "schema": "rds.iteration.repair-convergence.v1",
+    "buildId": build_id,
+    "phase": phase,
+    "exitCode": int(rc_s or 0),
+    "sourcePlan": f"builds/{build_id}/{plan_path.name}",
+    "sourceQaIteration": qa_dir.name if qa_dir and qa_dir.exists() else None,
+    "targetCount": len(targets),
+    "closedCount": len(closed),
+    "remainingCount": len(remaining),
+    "status": "pass" if targets and not remaining and int(rc_s or 0) == 0 else ("no-targets" if not targets else "needs_iteration"),
+    "gateStatuses": gate_statuses,
+    "remainingTargets": remaining[:20],
+    "closedTargets": closed[:20],
+}
+out.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+PY
+}
+
+snapshot_app_files() {
+  python3 - "$app_dest" "$file_snapshot_before" <<'PY' || true
+import hashlib
+import json
+import os
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+out = Path(sys.argv[2])
+skip_dirs = {
+    ".git", ".next", ".nuxt", ".output", ".turbo", ".vite", "coverage",
+    "dist", "build", "node_modules", "tmp", "log", ".cache",
+}
+max_bytes = 512 * 1024
+files = {}
+for dirpath, dirnames, filenames in os.walk(root):
+    dirnames[:] = [name for name in dirnames if name not in skip_dirs]
+    for name in filenames:
+        path = Path(dirpath) / name
+        try:
+            rel = str(path.relative_to(root))
+            stat = path.stat()
+            h = hashlib.sha1()
+            with path.open("rb") as fh:
+                h.update(fh.read(max_bytes))
+            files[rel] = {"size": stat.st_size, "mtime": int(stat.st_mtime), "sha1": h.hexdigest()}
+        except Exception:
+            continue
+out.write_text(json.dumps({"root": str(root), "files": files}, indent=2) + "\n", encoding="utf-8")
+PY
+}
+
+update_repair_jobs_trace() {
+  local phase="${1:-unknown}"
+  local rc="${2:-0}"
+  local outcome="${3:-unknown}"
+  [[ -f "$repair_jobs_file" ]] || return 0
+  python3 - "$BUILD_ID" "$app_dest" "$file_snapshot_before" "$repair_jobs_file" "$repair_convergence_file" "$phase" "$rc" "$outcome" "$checks_log" "$qa_log" "$deploy_log" <<'PY' || true
+import hashlib
+import json
+import os
+import sys
+from pathlib import Path
+
+build_id, app_s, before_s, jobs_s, conv_s, phase, rc_s, outcome, checks_s, qa_s, deploy_s = sys.argv[1:]
+app = Path(app_s)
+before_path = Path(before_s)
+jobs_path = Path(jobs_s)
+conv_path = Path(conv_s)
+
+skip_dirs = {
+    ".git", ".next", ".nuxt", ".output", ".turbo", ".vite", "coverage",
+    "dist", "build", "node_modules", "tmp", "log", ".cache",
+}
+max_bytes = 512 * 1024
+
+def read_json(path):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8", errors="ignore"))
+    except Exception:
+        return None
+
+def snapshot(root):
+    files = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [name for name in dirnames if name not in skip_dirs]
+        for name in filenames:
+            path = Path(dirpath) / name
+            try:
+                rel = str(path.relative_to(root))
+                stat = path.stat()
+                h = hashlib.sha1()
+                with path.open("rb") as fh:
+                    h.update(fh.read(max_bytes))
+                files[rel] = {"size": stat.st_size, "mtime": int(stat.st_mtime), "sha1": h.hexdigest()}
+            except Exception:
+                continue
+    return files
+
+def rel_artifact(path_s):
+    path = Path(path_s)
+    if not path.exists():
+        return None
+    try:
+        idx = path.parts.index("builds")
+        return str(Path(*path.parts[idx:]))
+    except ValueError:
+        return str(path)
+
+def log_status(path_s):
+    path = Path(path_s)
+    if not path.exists():
+        return None
+    text = path.read_text(encoding="utf-8", errors="ignore")[-12000:]
+    failed = " failed rc=" in text or "FATAL:" in text or "error Command failed" in text
+    return {
+        "artifact": rel_artifact(path_s),
+        "status": "fail" if failed else "pass",
+    }
+
+jobs_payload = read_json(jobs_path)
+if not isinstance(jobs_payload, dict):
+    raise SystemExit(0)
+
+before = (read_json(before_path) or {}).get("files") if before_path.exists() else {}
+before = before if isinstance(before, dict) else {}
+after = snapshot(app)
+touched = []
+for rel, meta in sorted(after.items()):
+    old = before.get(rel)
+    if old != meta:
+        touched.append({"path": rel, "change": "added" if old is None else "modified"})
+for rel in sorted(set(before) - set(after)):
+    touched.append({"path": rel, "change": "deleted"})
+
+checks = []
+for label, path_s in (("project_checks", checks_s), ("qa", qa_s), ("deploy", deploy_s)):
+    item = log_status(path_s)
+    if item:
+        item["name"] = label
+        checks.append(item)
+
+convergence = read_json(conv_path)
+remaining = convergence.get("remainingTargets") if isinstance(convergence, dict) and isinstance(convergence.get("remainingTargets"), list) else []
+closed = convergence.get("closedTargets") if isinstance(convergence, dict) and isinstance(convergence.get("closedTargets"), list) else []
+remaining_keys = {(row.get("id"), row.get("gate")) for row in remaining if isinstance(row, dict)}
+closed_keys = {(row.get("id"), row.get("gate")) for row in closed if isinstance(row, dict)}
+
+def matching(rows, targets):
+    target_keys = {(row.get("id"), row.get("gate")) for row in targets if isinstance(row, dict)}
+    return [row for row in rows if isinstance(row, dict) and (row.get("id"), row.get("gate")) in target_keys]
+
+for job in jobs_payload.get("jobs") or []:
+    if not isinstance(job, dict):
+        continue
+    targets = job.get("targets") if isinstance(job.get("targets"), list) else []
+    job_remaining = matching(remaining, targets)
+    job_closed = matching(closed, targets)
+    target_keys = {(row.get("id"), row.get("gate")) for row in targets if isinstance(row, dict)}
+    has_convergence = bool(remaining_keys or closed_keys)
+    if outcome in {"failed"}:
+        status = "failed"
+    elif has_convergence and target_keys and not any(key in remaining_keys for key in target_keys):
+        status = "passed"
+    elif has_convergence and job_closed:
+        status = "partially_closed"
+    elif outcome in {"needs_review", "delegated"}:
+        status = "needs_iteration"
+    elif phase == "complete" and not has_convergence:
+        status = "applied_unverified"
+    else:
+        status = outcome or "updated"
+    job["status"] = status
+    job["lastPhase"] = phase
+    job["exitCode"] = int(rc_s or 0)
+    job["filesTouched"] = touched[:80]
+    job["checksRun"] = checks
+    if has_convergence:
+        job["closedTargets"] = job_closed[:20]
+        job["remainingBlockers"] = job_remaining[:20]
+    elif outcome == "passed":
+        job["remainingBlockers"] = []
+
+jobs_payload["status"] = "passed" if (outcome == "passed" and not remaining) else ("needs_iteration" if remaining or outcome == "needs_review" else outcome)
+jobs_payload["lastPhase"] = phase
+jobs_payload["exitCode"] = int(rc_s or 0)
+jobs_payload["filesTouched"] = touched[:100]
+jobs_payload["checksRun"] = checks
+if isinstance(convergence, dict):
+    jobs_payload["convergence"] = {
+        "artifact": rel_artifact(str(conv_path)),
+        "status": convergence.get("status"),
+        "closedCount": convergence.get("closedCount"),
+        "remainingCount": convergence.get("remainingCount"),
+    }
+
+jobs_path.write_text(json.dumps(jobs_payload, indent=2) + "\n", encoding="utf-8")
+PY
+}
+
+build_repair_plan
+build_repair_jobs
+snapshot_app_files
+repair_plan_json="$(cat "$repair_plan_file" 2>/dev/null || true)"
+repair_jobs_json="$(cat "$repair_jobs_file" 2>/dev/null || true)"
+
+iterate_prompt=$(cat <<EOF
+You are applying a post-build operator iteration to a generated RDS app.
+
+Scope and method:
+- Work only inside this app directory: $app_dest
+- Do not modify RDS itself, files outside the app directory, secrets, or service configuration.
+- Preserve the existing app's stack, design direction, and working behavior. Improve it; do not rewrite from scratch.
+- Targeted-iteration method, in order: (1) read the original spec and the binding QA scenarios below; (2) compare them against the actual code in this directory by opening the relevant files — do not assume what exists; (3) determine what the spec promises that is implemented vs. missing or faked (placeholder copy, dead buttons, stubbed data, routes that 404); (4) implement the real gaps that block the operator request and the QA scenarios — not cosmetic smoke changes.
+- Scope discipline: for a narrow operator tweak, make the smallest coherent change. When the request is to make the build review-ready, keep building until the spec's promised workflows actually work end-to-end; partial or placeholder implementations are failures, not progress.
+- The app must build and boot after your changes. A deployed, navigable app is required because automated Playwright QA then clicks through the QA scenarios below to verify them — do not leave the app in a non-building or non-booting state.
+- After editing, run available local verification (build/tests) and report what changed and what you verified.
+
+Build ID: $BUILD_ID
+
+state.json:
+\`\`\`json
+$state_json
+\`\`\`
+
+Original spec path (read the full file if you need detail beyond this excerpt): $spec_path
+$(if [[ -n "$spec_excerpt" ]]; then printf 'Original spec (PRD, RDS addenda stripped):\n```markdown\n%s\n```\n' "$spec_excerpt"; fi)
+
+$(if [[ -n "$qa_scenarios" ]]; then printf 'Binding QA scenarios:\n```markdown\n%s\n```\n' "$qa_scenarios"; fi)
+
+$(if [[ -n "$qa_repair_context" ]]; then printf 'Latest failing QA repair context:\n```json\n%s\n```\n' "$qa_repair_context"; fi)
+
+$(if [[ -n "$repair_plan_json" ]]; then printf 'Autonomous repair plan:\n```json\n%s\n```\n' "$repair_plan_json"; fi)
+
+$(if [[ -n "$repair_jobs_json" ]]; then printf 'Ordered autonomous repair jobs:\n```json\n%s\n```\n' "$repair_jobs_json"; fi)
+
+Recent RDS events:
+\`\`\`jsonl
+$recent_events
+\`\`\`
+
+Operator request:
+$PROMPT
+
+Apply the request now, following the targeted-iteration method above and the scope discipline it describes. End with a concise summary of what you changed, which spec promises / QA scenarios you closed, and any local commands you ran.
+EOF
+)
+
+echo "[rds-iterate] applying request in $app_dest with provider=$PROVIDER"
+current_phase="apply"
+current_log="$apply_log"
+printf '%s\n' "$iterate_prompt" > "$apply_prompt_file"
+if [[ "${RDS_ITERATE_SKIP_APPLY:-${RDS_ITERATE_TEST_SKIP_APPLY:-0}}" == "1" ]]; then
+  printf '%s\n' "[rds-iterate] skipped provider apply; continuing verification against current app state" > "$apply_log"
+  apply_rc=0
+elif ( cd "$app_dest" && rds_infer "$PROVIDER" "$app_dest" 80 "$BUDGET" "" < "$apply_prompt_file" > "$apply_log" 2>&1 ); then
+  apply_rc=0
+else
+  apply_rc=$?
+fi
+
+"$ROOT/bin/rds-event" iterate_apply_completed \
+  --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" --app-dest "$app_dest" \
+  output_file="builds/$BUILD_ID/$(basename "$apply_log")" exit_code="$apply_rc" \
+  >/dev/null 2>&1 || true
+
+if (( apply_rc != 0 )); then
+  finish_failed "apply" "$apply_rc" "$apply_log"
+  echo "FATAL: provider apply failed (rc=$apply_rc); see $apply_log" >&2
+  exit "$apply_rc"
+fi
+refresh_skill_scorecard
+
+run_step() {
+  local name="$1"; shift
+  {
+    echo
+    echo "===== $name ====="
+    echo "+ $*"
+  } >> "$checks_log"
+  if "$@" >> "$checks_log" 2>&1; then
+    echo "[rds-iterate] $name ok" | tee -a "$checks_log"
+    return 0
+  fi
+  local rc=$?
+  echo "[rds-iterate] $name failed rc=$rc" | tee -a "$checks_log"
+  return "$rc"
+}
+
+checks_rc=0
+touch "$checks_log"
+current_phase="checks"
+current_log="$checks_log"
+action_run_update '{"status":"running","phase":"checks"}'
+if [[ -f "$app_dest/package.json" ]]; then
+  if [[ ! -d "$app_dest/node_modules" ]]; then
+    if [[ -f "$app_dest/bun.lock" || -f "$app_dest/bun.lockb" ]]; then
+      run_step "install dependencies" timeout 300 bun install --frozen-lockfile || checks_rc=$?
+    else
+      run_step "install dependencies" timeout 300 bun install || checks_rc=$?
+    fi
+  fi
+
+  if (( checks_rc == 0 )) && jq -e '.scripts.test? and (.scripts.test | type == "string")' "$app_dest/package.json" >/dev/null 2>&1; then
+    run_step "project tests" timeout "${RDS_ITERATE_TEST_TIMEOUT_SEC:-300}" bash -lc "cd '$app_dest' && bun run test" || checks_rc=$?
+  fi
+  if (( checks_rc == 0 )) && jq -e '.scripts.build? and (.scripts.build | type == "string")' "$app_dest/package.json" >/dev/null 2>&1; then
+    run_step "project build" timeout "${RDS_ITERATE_BUILD_TIMEOUT_SEC:-300}" bash -lc "cd '$app_dest' && bun run build" || checks_rc=$?
+  fi
+fi
+
+"$ROOT/bin/rds-event" iterate_checks_completed \
+  --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" --app-dest "$app_dest" \
+  output_file="builds/$BUILD_ID/$(basename "$checks_log")" exit_code="$checks_rc" \
+  >/dev/null 2>&1 || true
+
+if (( checks_rc != 0 )); then
+  finish_failed "checks" "$checks_rc" "$checks_log"
+  echo "FATAL: checks failed (rc=$checks_rc); leaving deployed service untouched" >&2
+  exit "$checks_rc"
+fi
+
+deploy_rc=0
+preview=""
+if (( NO_DEPLOY == 0 )); then
+  if (( YES != 1 )); then
+    finish_failed "deploy" 2 "" "redeploy requires --yes confirmation"
+    echo "FATAL: redeploy requires --yes confirmation" >&2
+    exit 2
+  fi
+  action_run_update '{"status":"running","phase":"deploy"}'
+  echo "[rds-iterate] redeploying Zo service"
+  current_phase="deploy"
+  current_log="$deploy_log"
+  if "$ROOT/bin/rds-deploy" --build-id="$BUILD_ID" --app-dir="$app_dest" --target=zo > "$deploy_log" 2>&1; then
+    deploy_rc=0
+  else
+    deploy_rc=$?
+  fi
+  "$ROOT/bin/rds-event" iterate_deploy_completed \
+    --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" --app-dest "$app_dest" \
+    output_file="builds/$BUILD_ID/$(basename "$deploy_log")" exit_code="$deploy_rc" \
+    >/dev/null 2>&1 || true
+  if (( deploy_rc != 0 )); then
+    finish_failed "deploy" "$deploy_rc" "$deploy_log"
+    echo "FATAL: deploy failed (rc=$deploy_rc); see $deploy_log" >&2
+    exit "$deploy_rc"
+  fi
+  preview="$(cat "$BUILD_DIR/preview-url.txt" 2>/dev/null || true)"
+  state_set_preview "$BUILD_DIR" "$preview" || true
+  state_set_review "$BUILD_DIR" pending "rds-iterate" "Post-build iteration requires operator review." || true
+  if run_mockup_fidelity; then
+    :
+  else
+    mockup_rc=$?
+    refresh_evidence_ledgers
+    finish_failed "mockup" "$mockup_rc" "$BUILD_DIR/iterate-$ts.mockup.log"
+    echo "FATAL: mockup fidelity failed (rc=$mockup_rc); deployed service remains available for inspection" >&2
+    exit "$mockup_rc"
+  fi
+fi
+
+qa_rc=0
+if (( NO_QA == 0 )); then
+  action_run_update '{"status":"running","phase":"qa"}'
+  echo "[rds-iterate] running RDS QA"
+  current_phase="qa"
+  current_log="$qa_log"
+  if "$ROOT/bin/rds-qa" "$BUILD_ID" > "$qa_log" 2>&1; then
+    qa_rc=0
+  else
+    qa_rc=$?
+  fi
+  "$ROOT/bin/rds-event" iterate_qa_completed \
+    --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" --app-dest "$app_dest" \
+    output_file="builds/$BUILD_ID/$(basename "$qa_log")" exit_code="$qa_rc" \
+    >/dev/null 2>&1 || true
+  refresh_evidence_ledgers
+  write_repair_convergence "qa" "$qa_rc"
+  if (( qa_rc != 0 )); then
+    if (( qa_rc == 1 && QA_AUTOFIX == 1 )); then
+      taste_after_qa_log="$BUILD_DIR/iterate-$ts.taste-review.log"
+      current_phase="taste_review_after_qa"
+      current_log="$taste_after_qa_log"
+      action_run_update '{"status":"running","phase":"taste_review_after_qa"}'
+      set +e
+      "$ROOT/bin/rds-taste-review" "$BUILD_ID" > "$taste_after_qa_log" 2>&1
+      taste_after_qa_rc=$?
+      set -e
+      refresh_evidence_ledgers
+
+      if (( taste_after_qa_rc == 0 )); then
+        reason="QA still reports crawler/spec gaps, but the typed/taste review now passes. Holding for review instead of burning more iterations."
+        finish_needs_review "qa" "$qa_rc" "$qa_log" "$reason"
+        echo "[rds-iterate] $reason" >&2
+        exit 0
+      fi
+
+      if (( QA_AUTOFIX_DEPTH < QA_AUTOFIX_MAX )) && [[ -s "$BUILD_DIR/taste-iteration-prompt.md" ]]; then
+        next_depth=$((QA_AUTOFIX_DEPTH + 1))
+        nested_prompt_file="$BUILD_DIR/iterate-$ts.nested-repair.prompt.md"
+        {
+          cat "$BUILD_DIR/taste-iteration-prompt.md"
+          printf '\n\nLatest autonomous repair convergence:\n```json\n'
+          cat "$repair_convergence_file" 2>/dev/null || true
+          printf '\n```\n'
+          printf '\nContinue from the remainingTargets first. Do not rework closed targets unless needed by the remaining blocker.\n'
+        } > "$nested_prompt_file"
+        current_phase="auto_iterate"
+        current_log="$taste_after_qa_log"
+        action_run_update '{"status":"running","phase":"auto_iterate","error":"QA gaps remain; running targeted autonomous iteration '"$next_depth"'/'"$QA_AUTOFIX_MAX"'"}'
+        echo "[rds-iterate] QA gaps remain; running autonomous targeted iteration $next_depth/$QA_AUTOFIX_MAX" >&2
+        if RDS_ITERATE_QA_AUTOFIX="$QA_AUTOFIX" RDS_ITERATE_QA_AUTOFIX_DEPTH="$next_depth" RDS_ITERATE_QA_AUTOFIX_MAX="$QA_AUTOFIX_MAX" \
+          "$0" "$BUILD_ID" --prompt="$(cat "$nested_prompt_file")" --yes; then
+          refresh_evidence_ledgers
+          finish_completed "delegated"
+          exit 0
+        fi
+        nested_rc=$?
+        refresh_evidence_ledgers
+        finish_needs_review "auto_iterate" "$nested_rc" "$taste_after_qa_log" "Autonomous QA recovery stopped after nested iteration rc=$nested_rc. Review the latest QA/taste evidence before another pass."
+        echo "[rds-iterate] autonomous iteration stopped for review (rc=$nested_rc); see $taste_after_qa_log" >&2
+        exit 0
+      fi
+
+      reason="QA gaps remain after ${QA_AUTOFIX_DEPTH}/${QA_AUTOFIX_MAX} autonomous recovery iterations. Needs operator/product review, not another blind QA retry."
+      finish_needs_review "qa" "$qa_rc" "$qa_log" "$reason"
+      echo "[rds-iterate] $reason" >&2
+      exit 0
+    fi
+
+    finish_failed "qa" "$qa_rc" "$qa_log"
+    echo "FATAL: QA failed (rc=$qa_rc); deployed service remains available for inspection" >&2
+    exit "$qa_rc"
+  fi
+  refresh_evidence_ledgers
+fi
+
+finish_completed "passed"
+refresh_evidence_ledgers
+
+cat "$summary_file"

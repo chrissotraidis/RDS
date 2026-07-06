@@ -1,0 +1,22 @@
+# Project instructions (generated/customized per-user)
+CLAUDE.md
+
+# Scaffold output directories
+/tmp/
+
+# macOS
+.DS_Store
+
+# Editor/IDE
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Claude Code
+.claude/
+# But templates/.claude/ is scaffold's own template content — must stay tracked
+# so launch-build.sh, bin/task, and generated projects get the hooks/commands.
+!templates/.claude/
+!templates/.claude/**

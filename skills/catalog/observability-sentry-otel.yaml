@@ -1,0 +1,25 @@
+---
+slug: observability-sentry-otel
+name: Sentry and OpenTelemetry
+status: curated
+category: observability
+maturity: stable
+applies_to:
+- rails-web
+- nextjs-fullstack
+- python-ai-service
+- astro-thin-web
+- web-3d
+- game-engine
+- game-asset-pipeline
+- mobile-native
+- browser-extension
+description: Sentry SDK and OpenTelemetry instrumentation contract.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: docs.sentry.io
+  url: https://docs.sentry.io/
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

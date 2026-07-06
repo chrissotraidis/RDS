@@ -1,0 +1,18 @@
+---
+slug: rds-context7-mount
+name: Context7 documentation mount
+status: curated
+scope: universal
+description: Mount current framework documentation into build-agent context before implementation.
+install:
+  phase: resolve-only
+verify:
+  command:
+maturity: curated-reference
+category: ai-context
+source_links:
+- label: context7.com
+  url: https://context7.com/
+- label: github.com
+  url: https://github.com/upstash/context7
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

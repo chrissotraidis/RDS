@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# bin/rds-rails-init — seeds builds/<id>/app/ from the generic Rails starter and
+# runs bin/template-setup non-interactively. Green-field only.
+#
+# Usage:
+#   ./bin/rds-rails-init <app_name> <target_app_dir>
+#
+# app_name must be snake_case (Rails convention).
+# The starter template-setup accepts --app-name= and --yes.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck disable=SC1091
+source "$ROOT/bin/lib/common.sh"
+# shellcheck disable=SC1091
+source "$ROOT/bin/lib/logging.sh"
+
+APP_NAME="${1:?app_name (snake_case)}"
+APP_DIR="${2:?target app directory}"
+
+[[ "$APP_NAME" =~ ^[a-z][a-z0-9_]*$ ]] || {
+  echo "FATAL: APP_NAME '$APP_NAME' is not valid snake_case" >&2
+  exit 1
+}
+
+TEMPLATE="$ROOT/vendor/rails-starter"
+[[ -d "$TEMPLATE" ]] || { echo "FATAL: missing $TEMPLATE" >&2; exit 1; }
+[[ -f "$TEMPLATE/bin/template-setup" ]] || {
+  echo "FATAL: $TEMPLATE/bin/template-setup not found" >&2; exit 1;
+}
+
+log "seeding $APP_DIR from Rails starter"
+mkdir -p "$APP_DIR"
+
+# Tolerate an existing target dir: typical case is a project folder that
+# already contains a .git/ and a PRD .md (cloned from a brief-only repo).
+# rsync layers the template on top without nuking pre-existing files.
+rsync -a --exclude='.git' "$TEMPLATE/" "$APP_DIR/"
+
+cd "$APP_DIR"
+
+export GIT_AUTHOR_NAME="${GIT_AUTHOR_NAME:-RDS}"
+export GIT_AUTHOR_EMAIL="${GIT_AUTHOR_EMAIL:-rds@local}"
+export GIT_COMMITTER_NAME="${GIT_COMMITTER_NAME:-$GIT_AUTHOR_NAME}"
+export GIT_COMMITTER_EMAIL="${GIT_COMMITTER_EMAIL:-$GIT_AUTHOR_EMAIL}"
+
+# Init only if no existing .git — preserve client repo history when present.
+if [[ ! -d .git ]]; then
+  git init -q
+fi
+
+git add -A
+git -c commit.gpgsign=false commit -q --allow-empty -m "chore: seed from Rails starter"
+
+log "running template-setup --app-name=$APP_NAME --yes"
+bin/template-setup --app-name="$APP_NAME" --yes
+rm -f bin/template-setup
+
+# Configure HOST_PORT for local dev.
+if [[ -f .env.example ]]; then
+  cp .env.example .env
+else
+  : > .env
+fi
+PORT="$(next_free_port "${RDS_LOCAL_PORT_RANGE_START:-4000}" "${RDS_LOCAL_PORT_RANGE_END:-4099}")"
+if grep -q '^HOST_PORT=' .env 2>/dev/null; then
+  # Portable in-place edit (BSD + GNU sed).
+  sed -i.bak "s/^HOST_PORT=.*/HOST_PORT=$PORT/" .env && rm -f .env.bak
+else
+  printf 'HOST_PORT=%s\n' "$PORT" >> .env
+fi
+log "HOST_PORT=$PORT"
+
+git add -A
+git -c commit.gpgsign=false commit -q -m "chore: template-setup + env"
+log "rails-init complete for $APP_NAME in $APP_DIR"

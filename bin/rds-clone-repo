@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# bin/rds-clone-repo — clones a client repo into builds/<id>/app/.
+# Brown-field only. Called by bin/rds-build in stage 1.
+#
+# Usage:
+#   ./bin/rds-clone-repo --repo=<git-url> [--branch=<name>] --dest=<path>
+#
+# For private repos, Zo must have SSH keys or PAT configured at the OS level.
+# RDS does not manage git credentials.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck disable=SC1091
+source "$ROOT/bin/lib/common.sh"
+# shellcheck disable=SC1091
+source "$ROOT/bin/lib/logging.sh"
+
+REPO="$(parse_flag --repo   "$@")"
+BRANCH="$(parse_flag --branch "$@" || echo "")"
+DEST="$(parse_flag --dest   "$@")"
+
+[[ -n "$REPO" ]] || { echo "FATAL: --repo is required" >&2; exit 1; }
+[[ -n "$DEST" ]] || { echo "FATAL: --dest is required" >&2; exit 1; }
+
+if [[ -d "$DEST" && -n "$(ls -A "$DEST" 2>/dev/null)" ]]; then
+  echo "FATAL: $DEST already exists and is non-empty" >&2
+  exit 1
+fi
+
+REPO="$(normalize_repo_url "$REPO")"
+
+mkdir -p "$(dirname "$DEST")"
+
+if [[ -n "$BRANCH" ]]; then
+  log "git clone --branch $BRANCH $REPO → $DEST"
+  git clone --branch "$BRANCH" --single-branch "$REPO" "$DEST"
+else
+  log "git clone $REPO → $DEST"
+  git clone "$REPO" "$DEST"
+fi
+
+cd "$DEST"
+short="$(git rev-parse --short HEAD)"
+current_branch="$(git rev-parse --abbrev-ref HEAD)"
+log "cloned $REPO @ $short ($current_branch) into $DEST"
+
+# Sanity-check: looks like a Rails app? Warn but continue.
+if [[ ! -f "Gemfile" ]] || ! grep -q "^gem ['\"]rails['\"]" Gemfile 2>/dev/null; then
+  log "WARN: cloned repo does not look like a Rails app — Scaffold may fail. Continuing."
+fi
+
+# Provenance record — read back by bin/rds-status when the operator asks
+# "what was that client's repo?"
+mkdir -p .rds
+cat > .rds/provenance.json <<EOF
+{
+  "repo_url":   "$REPO",
+  "branch":     "$current_branch",
+  "commit":     "$(git rev-parse HEAD)",
+  "cloned_at":  "$(date -u +%FT%TZ)"
+}
+EOF
+# Local-only ignore so .rds/ doesn't appear as dirty in the client's repo.
+if [[ -f .git/info/exclude ]] && ! grep -qx '/.rds/' .git/info/exclude; then
+  printf '/.rds/\n' >> .git/info/exclude
+fi
+log "wrote provenance → $DEST/.rds/provenance.json"

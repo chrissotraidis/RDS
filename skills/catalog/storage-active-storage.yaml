@@ -1,0 +1,17 @@
+---
+slug: storage-active-storage
+name: Active Storage
+status: curated
+category: storage
+maturity: stable
+applies_to:
+- rails-web
+description: Rails Active Storage file upload capability.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: guides.rubyonrails.org
+  url: https://guides.rubyonrails.org/active_storage_overview.html
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

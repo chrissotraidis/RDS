@@ -1,0 +1,21 @@
+[
+  {
+    "id": "source-search",
+    "title": "Visitor searches sources",
+    "actions": [{ "type": "click", "target": "Search sources" }],
+    "expectations": [{ "type": "text", "value": "History Imagined" }]
+  },
+  {
+    "id": "operator-approve",
+    "title": "Operator approves episode",
+    "actions": [{ "type": "click", "target": "Approve episode" }],
+    "expectations": [{ "type": "text", "value": "Dashboard" }]
+  },
+  {
+    "id": "sources-route",
+    "title": "Sources route exists",
+    "actions": [{ "type": "click", "target": "Sources" }],
+    "expectations": [{ "type": "url", "value": "/sources" }]
+  }
+]
+

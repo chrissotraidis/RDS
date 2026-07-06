@@ -1,0 +1,22 @@
+---
+slug: payments-stripe-mcp
+name: Stripe payments
+status: ready
+default: false
+applies_to:
+- rails-web
+- nextjs-fullstack
+- mobile-native
+description: Adds the Stripe payments and webhook implementation contract.
+install:
+  command: bin/rds-skill-materialize payments-stripe-mcp
+verify:
+  command: bin/rds-skill-verify payments-stripe-mcp
+maturity: operational
+category: payments
+rationale: Payment builds are high-risk. This skill requires explicit product/payment objects, webhook verification, environment-backed secrets, and clear test/live mode separation.
+source_links:
+- label: Stripe Docs
+  url: https://docs.stripe.com/
+- label: Stripe Webhooks
+  url: https://docs.stripe.com/webhooks

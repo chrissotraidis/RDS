@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+RDS_ROOT="$ROOT"
+source "$ROOT/bin/lib/common.sh"
+source "$ROOT/bin/lib/agents.sh"
+
+ID="${1:-}"
+PROVIDER="$(agent_normalize_provider "$(parse_flag --provider "$@" || echo codex)")"
+[[ -n "$ID" ]] || { echo "usage: bin/rds-agent-review <session-id> --provider=codex|claude-code" >&2; exit 2; }
+JSON_PATH="$(agent_find_session_json "$ID")" || { echo "No agent session named $ID" >&2; exit 1; }
+WORKTREE="$(agent_json_get "$JSON_PATH" '.worktree_path')"
+SESSION_DIR="$(dirname "$JSON_PATH")"
+OUT="$SESSION_DIR/$ID.review.$PROVIDER.md"
+provider_file="$(agent_provider_file "$PROVIDER")"
+source "$provider_file"
+rds_agent_provider_detect >/dev/null || { echo "FATAL: provider '$PROVIDER' unavailable" >&2; exit 2; }
+cmd="$(rds_agent_provider_print_command)"
+diff_file="$SESSION_DIR/$ID.review-input.diff"
+git -C "$WORKTREE" diff >"$diff_file" || true
+prompt="$(cat <<EOF
+You are reviewing an RDS Agent Session.
+
+Session metadata:
+\`\`\`json
+$(cat "$JSON_PATH")
+\`\`\`
+
+Git status:
+\`\`\`
+$(git -C "$WORKTREE" status --short || true)
+\`\`\`
+
+Diff:
+\`\`\`diff
+$(sed -n '1,2200p' "$diff_file")
+\`\`\`
+
+Recent log:
+\`\`\`
+$(tail -n 160 "$SESSION_DIR/$ID.log" 2>/dev/null || true)
+\`\`\`
+
+Review for correctness risks, missing tests, likely regressions, suspicious files, and whether to merge, continue, or discard. Be direct.
+EOF
+)"
+printf '%s\n' "$prompt" | bash -lc "cd $(printf '%q' "$WORKTREE") && $cmd" >"$OUT"
+echo "review=$OUT"
+

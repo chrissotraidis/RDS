@@ -1,0 +1,17 @@
+---
+slug: expo-skills-mount
+name: Expo skills mount
+status: curated
+category: mobile
+maturity: stable
+applies_to:
+- mobile-native
+description: Expo official skill/context mount for mobile-native builds.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: docs.expo.dev
+  url: https://docs.expo.dev/
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

@@ -1,0 +1,866 @@
+#!/usr/bin/env python3
+"""Fold RDS build artifacts into one operator-facing evidence ledger."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+from collections import deque
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+BLOCKING_VALUES = {False, "fail", "failed", "needs_iteration", "partial", "missing", "unknown", "skipped"}
+PRODUCT_CODES = {
+    "scenario_verdict_blocking",
+    "typed_uat_blocking",
+    "truthfulness_verdict_blocking",
+    "persona_verdict_blocking",
+    "prd_coverage_blocking",
+    "design_review_blocking",
+    "taste_review_blocking",
+    "quality_ledger_blocking",
+    "spec_verdict_blocking",
+    "visual_verdict_blocking",
+    "mockup_fidelity_blocking",
+}
+EVIDENCE_CODES = {
+    "preview_missing",
+    "preview_pending",
+    "qa_iteration_missing",
+    "qa_summary_missing",
+    "scenario_verdict_missing",
+    "typed_uat_missing",
+    "truthfulness_verdict_missing",
+    "persona_verdict_missing",
+    "prd_coverage_missing",
+    "spec_verdict_missing",
+    "visual_verdict_missing",
+    "taste_review_missing",
+    "qa_scenario_gate_blocking",
+    "taste_gate_blocking",
+    "quality_ledger_missing",
+    "qa_evidence_stale",
+    "taste_review_stale",
+    "quality_ledger_stale",
+    "deploy_fingerprint_mismatch",
+    "service_runtime_missing",
+    "service_runtime_failed",
+    "service_runtime_stale",
+    "incomplete_iterate_session",
+    "stage_not_complete",
+    "required_quality_stage_skipped",
+    "orphaned_running_state",
+}
+STAGE_ORDER = [
+    "intake",
+    "spec",
+    "taste",
+    "skill-resolve",
+    "skill-install",
+    "scaffold",
+    "local-run",
+    "deploy",
+    "qa",
+    "taste-review",
+    "quality-ledger",
+    "readiness",
+    "operator-review",
+]
+STAGE_EVIDENCE_FILES = {
+    "intake": ["state.json", "source.txt"],
+    "spec": ["spec.md", "spec.json"],
+    "taste": ["taste-brief.json", "taste-brief.md", "taste-gate.json"],
+    "skill-resolve": ["skills/resolved.json", "skills/scorecard.json"],
+    "skill-install": ["skills/installed.json", "skills/scorecard.json"],
+    "scaffold": ["scaffold.log", "launch-build.log", "deploy-snapshot/"],
+    "local-run": ["local-run.json", "preview-url.txt"],
+    "deploy": ["preview-url.txt", "service.json", "deploy-fingerprint.json", "service-runtime.json"],
+    "qa": ["playwright/", "qa-scenario-gate.json"],
+    "taste-review": ["taste-review.json", "taste-iteration-prompt.md"],
+    "quality-ledger": ["quality-ledger.json"],
+    "readiness": ["readiness.json", "evidence-ledger.json", "truth.json"],
+    "operator-review": ["state.json"],
+}
+BLOCKER_STAGE = {
+    "preview_missing": "deploy",
+    "preview_pending": "deploy",
+    "deploy_fingerprint_mismatch": "deploy",
+    "service_runtime_missing": "deploy",
+    "service_runtime_failed": "deploy",
+    "service_runtime_stale": "deploy",
+    "incomplete_iterate_session": "qa",
+    "qa_iteration_missing": "qa",
+    "qa_summary_missing": "qa",
+    "scenario_verdict_missing": "qa",
+    "scenario_verdict_blocking": "qa",
+    "typed_uat_missing": "qa",
+    "typed_uat_blocking": "qa",
+    "truthfulness_verdict_missing": "qa",
+    "truthfulness_verdict_blocking": "qa",
+    "persona_verdict_missing": "qa",
+    "persona_verdict_blocking": "qa",
+    "prd_coverage_missing": "qa",
+    "prd_coverage_blocking": "qa",
+    "spec_verdict_missing": "qa",
+    "spec_verdict_blocking": "qa",
+    "visual_verdict_missing": "qa",
+    "visual_verdict_blocking": "qa",
+    "mockup_fidelity_blocking": "qa",
+    "qa_scenario_gate_blocking": "taste",
+    "taste_gate_blocking": "taste",
+    "taste_review_missing": "taste-review",
+    "taste_review_blocking": "taste-review",
+    "taste_review_stale": "taste-review",
+    "quality_ledger_missing": "quality-ledger",
+    "quality_ledger_blocking": "quality-ledger",
+    "quality_ledger_stale": "quality-ledger",
+    "readiness_missing": "readiness",
+    "required_quality_stage_skipped": "readiness",
+    "qa_evidence_stale": "readiness",
+    "skill_scorecard_missing": "skill-resolve",
+    "skill_impact_failed": "skill-resolve",
+    "skill_impact_partial": "skill-resolve",
+    "orphaned_running_state": "readiness",
+}
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def parse_ts(value: Any) -> float:
+    if not isinstance(value, str) or not value:
+        return 0.0
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0.0
+
+
+def file_ts(path: Path | None) -> float:
+    if not path:
+        return 0.0
+    try:
+        return path.stat().st_mtime
+    except Exception:
+        return 0.0
+
+
+def read_text(path: Path, limit: int = 1_000_000) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="ignore")[:limit]
+    except Exception:
+        return ""
+
+
+def read_json(path: Path) -> Any:
+    try:
+        return json.loads(read_text(path))
+    except Exception:
+        return None
+
+
+def rel(root: Path, path: Path | None) -> str | None:
+    if not path:
+        return None
+    try:
+        return str(path.resolve().relative_to(root.resolve()))
+    except Exception:
+        return str(path)
+
+
+def latest_iter(build_dir: Path) -> Path | None:
+    root = build_dir / "playwright"
+    if not root.exists():
+        return None
+    iters = sorted(path for path in root.glob("iter-*") if path.is_dir())
+    return iters[-1] if iters else None
+
+
+def pid_alive(pid: int | None) -> bool:
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def cmdline_process_alive(build_id: str, tokens: tuple[str, ...]) -> bool:
+    proc_root = Path("/proc")
+    current_pid = os.getpid()
+    try:
+        entries = list(proc_root.iterdir())
+    except Exception:
+        return False
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            pid = int(entry.name)
+        except Exception:
+            continue
+        if pid == current_pid:
+            continue
+        try:
+            raw = (entry / "cmdline").read_bytes()
+        except Exception:
+            continue
+        cmd = raw.replace(b"\x00", b" ").decode("utf-8", errors="ignore")
+        if build_id in cmd and any(token in cmd for token in tokens):
+            return True
+    return False
+
+
+def read_events(build_dir: Path) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    try:
+        lines = deque(maxlen=1200)
+        with (build_dir / "events.jsonl").open("r", encoding="utf-8", errors="ignore") as handle:
+            for line in handle:
+                lines.append(line)
+    except Exception:
+        lines = deque(read_text(build_dir / "events.jsonl").splitlines()[-1200:], maxlen=1200)
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+    return events
+
+
+def latest_event_ts(events: list[dict[str, Any]], names: set[str]) -> float:
+    latest = 0.0
+    for event in events:
+        if event.get("event") in names:
+            latest = max(latest, parse_ts(event.get("ts")))
+    return latest
+
+
+def latest_event_after_ts(events: list[dict[str, Any]], names: set[str], after: float) -> float:
+    latest = 0.0
+    for event in events:
+        if event.get("event") not in names:
+            continue
+        ts = parse_ts(event.get("ts"))
+        if ts >= after:
+            latest = max(latest, ts)
+    return latest
+
+
+def latest_app_changing_fixer_ts(events: list[dict[str, Any]]) -> float:
+    latest = 0.0
+    for event in events:
+        if event.get("event") != "fixer_apply_completed":
+            continue
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        if str(payload.get("deterministic") or "") == "1":
+            continue
+        latest = max(latest, parse_ts(event.get("ts")))
+    return latest
+
+
+def latest_stage_completed_ts(events: list[dict[str, Any]], stages: set[str]) -> float:
+    latest = 0.0
+    for event in events:
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        if event.get("event") == "stage_completed" and payload.get("stage") in stages:
+            latest = max(latest, parse_ts(event.get("ts")))
+    return latest
+
+
+def latest_verification_closure_after_ts(events: list[dict[str, Any]], after: float) -> float:
+    latest = 0.0
+    for event in events:
+        ts = parse_ts(event.get("ts"))
+        if ts < after:
+            continue
+        name = event_name(event)
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        if name == "qa_iteration_completed" and str(payload.get("rc") or "") == "0":
+            latest = max(latest, ts)
+        elif name == "stage_completed" and payload.get("stage") in {"qa", "taste-review"}:
+            latest = max(latest, ts)
+        elif name in {"build_pending_review", "build_completed"}:
+            latest = max(latest, ts)
+    return latest
+
+
+def read_run_pid(build_dir: Path) -> int | None:
+    text = read_text(build_dir / "run.pid", 512).strip()
+    if re.match(r"^\d+$", text):
+        return int(text)
+    match = re.search(r"(?m)^pid=(\d+)\s*$", text)
+    return int(match.group(1)) if match else None
+
+
+def status_bad(value: Any) -> bool:
+    return value in BLOCKING_VALUES
+
+
+def event_name(event: dict[str, Any]) -> str:
+    return str(event.get("event") or event.get("type") or event.get("name") or "")
+
+
+def add_blocker(blockers: list[dict[str, Any]], code: str, message: str, *, source: str | None = None, recovery: str | None = None, severity: str = "blocker") -> None:
+    blockers.append({
+        "code": code,
+        "severity": severity,
+        "message": message,
+        "source": source,
+        "recovery": recovery,
+    })
+
+
+def summarize_next_action(blockers: list[dict[str, Any]], review_status: str | None, running: bool, recovering: bool) -> str:
+    codes = {str(b.get("code") or "") for b in blockers}
+    if running:
+        return "Watch the active stage and only intervene if output goes stale."
+    if recovering:
+        return "Watch the active recovery action; do not spawn another fixer."
+    if not blockers and review_status == "pending":
+        return "Open the preview, inspect the app, then approve or reject."
+    if codes & {"preview_missing", "preview_pending"}:
+        return "Rerun deploy, then regenerate QA/readiness evidence."
+    if codes & {"deploy_fingerprint_mismatch"}:
+        return "Rerun QA and taste review against the currently deployed artifact."
+    if codes & {"taste_review_stale", "quality_ledger_stale"}:
+        return "Rerun taste review and regenerate quality/readiness evidence before another app iteration."
+    if codes & {"service_runtime_missing", "service_runtime_failed", "service_runtime_stale"}:
+        return "Redeploy or restart the service until the live runtime marker matches the deploy fingerprint."
+    if codes & {"required_quality_stage_skipped", "qa_evidence_stale", "qa_iteration_missing", "scenario_verdict_missing", "typed_uat_missing", "spec_verdict_missing", "visual_verdict_missing"}:
+        return "Rerun QA and taste review to regenerate missing evidence."
+    if codes & {"scenario_verdict_blocking", "typed_uat_blocking", "truthfulness_verdict_blocking", "persona_verdict_blocking", "prd_coverage_blocking", "design_review_blocking", "taste_review_blocking", "quality_ledger_blocking"}:
+        return "Run or continue RDS Goal so it re-reads the PRD/spec/evidence, repairs product/design blockers, and reruns QA/readiness."
+    if codes & {"skill_scorecard_missing", "skill_impact_failed", "skill_impact_partial"}:
+        return "Fix skill adoption before treating the stack selection as successful."
+    if blockers:
+        return "Inspect the highest-severity blocker source and route it through the matching recovery path."
+    return "Continue the pipeline."
+
+
+def derive_verdict(state: dict[str, Any], blockers: list[dict[str, Any]], running: bool, recovering: bool) -> str:
+    review = state.get("review") if isinstance(state.get("review"), dict) else {}
+    review_status = review.get("status") if isinstance(review, dict) else None
+    if review_status == "approved":
+        return "approved"
+    if review_status == "rejected":
+        return "failed"
+    if recovering:
+        return "recovering"
+    if running:
+        return "building"
+    if blockers:
+        return "blocked"
+    if review_status == "pending":
+        return "pending_review"
+    if state.get("status") in {"failed", "error"}:
+        return "failed"
+    return "pending_review" if state.get("status") in {"done", "passed", "complete"} else str(state.get("status") or "unknown")
+
+
+def confidence(readiness: dict[str, Any] | None, quality: dict[str, Any] | None, latest: Path | None, state: dict[str, Any]) -> str:
+    if isinstance(readiness, dict) and isinstance(quality, dict) and latest:
+        return "high"
+    if isinstance(quality, dict) or latest or isinstance(readiness, dict):
+        return "medium"
+    if state:
+        return "low"
+    return "unknown"
+
+
+def existing_stage_paths(root: Path, build_dir: Path, stage: str, iter_dir: Path | None) -> list[str]:
+    paths: list[str] = []
+    for name in STAGE_EVIDENCE_FILES.get(stage, []):
+        path = build_dir / name
+        if path.exists():
+            paths.append(rel(root, path) or str(path))
+    if stage == "qa" and iter_dir:
+        for name in [
+            "summary.json",
+            "spec-verdict.json",
+            "scenario-verdict.json",
+            "game-verdict.json",
+            "website-verdict.json",
+            "workflow-verdict.json",
+            "visual-verdict.json",
+            "truthfulness-verdict.json",
+            "persona-verdict.json",
+            "prd-coverage-verdict.json",
+            "design-review.json",
+            "qa-target.json",
+            "deploy-fingerprint.json",
+            "service-runtime.json",
+        ]:
+            path = iter_dir / name
+            if path.exists():
+                paths.append(rel(root, path) or str(path))
+    return paths
+
+
+def build_stage_evidence(
+    root: Path,
+    build_dir: Path,
+    state: dict[str, Any],
+    blockers: list[dict[str, Any]],
+    iter_dir: Path | None,
+    verdict: str,
+    conf: str,
+    next_action: str,
+) -> dict[str, Any]:
+    stages = state.get("stages") if isinstance(state.get("stages"), dict) else {}
+    blocker_map: dict[str, list[dict[str, Any]]] = {stage: [] for stage in STAGE_ORDER}
+    for blocker in blockers:
+        code = str(blocker.get("code") or "")
+        stage = BLOCKER_STAGE.get(code, "readiness")
+        blocker_map.setdefault(stage, []).append(blocker)
+
+    records: list[dict[str, Any]] = []
+    for stage in STAGE_ORDER:
+        state_stage = stages.get(stage) if isinstance(stages.get(stage), dict) else {}
+        status = state_stage.get("status") if isinstance(state_stage, dict) else None
+        stage_blockers = blocker_map.get(stage, [])
+        paths = existing_stage_paths(root, build_dir, stage, iter_dir)
+        if stage == "quality-ledger" and not status:
+            status = "done" if (build_dir / "quality-ledger.json").exists() else "missing"
+        elif stage == "readiness" and not status:
+            status = "done" if (build_dir / "readiness.json").exists() else "missing"
+        elif stage == "operator-review" and not status:
+            review = state.get("review") if isinstance(state.get("review"), dict) else {}
+            status = review.get("status") if isinstance(review, dict) and review.get("status") else "pending"
+        elif stage_blockers:
+            status = "blocked"
+        elif not status and paths:
+            status = "observed"
+        elif not status:
+            status = "unknown"
+
+        if stage_blockers:
+            stage_status = "blocked"
+        elif status in {"failed", "fail", "needs_iteration", "blocked"}:
+            stage_status = "blocked"
+        else:
+            stage_status = str(status)
+
+        records.append({
+            "stage": stage,
+            "status": stage_status,
+            "confidence": "high" if paths and stage_status in {"done", "passed", "pass", "pending", "approved", "observed"} else ("medium" if paths else "low"),
+            "evidencePaths": paths,
+            "blockers": stage_blockers,
+            "nextActions": [str(b.get("recovery") or next_action) for b in stage_blockers[:3]] or ([] if stage_status in {"done", "passed", "pass", "approved"} else [next_action]),
+            "updatedAt": now_iso(),
+        })
+
+    return {
+        "schema": "rds.autonomy.evidence.v1",
+        "buildId": build_dir.name,
+        "updatedAt": now_iso(),
+        "verdict": verdict,
+        "confidence": conf,
+        "stages": records,
+    }
+
+
+def build_payload(root: Path, build_id: str) -> dict[str, Any]:
+    build_dir = root / "builds" / build_id
+    state = read_json(build_dir / "state.json") or {}
+    if not isinstance(state, dict):
+        state = {}
+    quality = read_json(build_dir / "quality-ledger.json")
+    quality = quality if isinstance(quality, dict) else None
+    scenario_gate = read_json(build_dir / "qa-scenario-gate.json")
+    scenario_gate = scenario_gate if isinstance(scenario_gate, dict) else None
+    taste_gate = read_json(build_dir / "taste-gate.json")
+    taste_gate = taste_gate if isinstance(taste_gate, dict) else None
+    readiness = read_json(build_dir / "readiness.json")
+    readiness = readiness if isinstance(readiness, dict) else None
+    scorecard = read_json(build_dir / "skills" / "scorecard.json")
+    scorecard = scorecard if isinstance(scorecard, dict) else None
+    resolved_skills = read_json(build_dir / "skills" / "resolved.json")
+    resolved_count = 0
+    if isinstance(resolved_skills, dict) and isinstance(resolved_skills.get("resolved"), list):
+        resolved_count = len(resolved_skills.get("resolved") or [])
+    service = read_json(build_dir / "service.json")
+    service = service if isinstance(service, dict) else None
+    deploy_fingerprint = read_json(build_dir / "deploy-fingerprint.json")
+    deploy_fingerprint = deploy_fingerprint if isinstance(deploy_fingerprint, dict) else None
+    service_runtime = read_json(build_dir / "service-runtime.json")
+    service_runtime = service_runtime if isinstance(service_runtime, dict) else None
+    events = read_events(build_dir)
+    iter_dir = latest_iter(build_dir)
+    review = state.get("review") if isinstance(state.get("review"), dict) else {}
+    review_status = review.get("status") if isinstance(review, dict) else None
+    preview = read_text(build_dir / "preview-url.txt", 4096).strip() or str(state.get("preview_url") or "").strip()
+    run_pid = read_run_pid(build_dir)
+    state_running = state.get("status") == "running"
+    if isinstance(state.get("stages"), dict):
+        state_running = state_running or any(
+            isinstance(stage, dict) and stage.get("status") == "running"
+            for stage in (state.get("stages") or {}).values()
+        )
+    process_running = pid_alive(run_pid)
+    action_process_running = cmdline_process_alive(build_id, ("rds-goal", "rds-iterate", "rds-fix"))
+    running = process_running or action_process_running
+    last_events = [str(e.get("event") or "") for e in events[-30:]]
+    latest_iterate_start = latest_event_ts(events, {"iterate_started"})
+    latest_iterate_terminal = latest_event_after_ts(events, {"iterate_completed", "iterate_failed", "iterate_needs_review"}, latest_iterate_start)
+    latest_verification_closure = latest_verification_closure_after_ts(events, latest_iterate_start)
+    stale_after = float(os.environ.get("RDS_STALE_AFTER_SEC", "600"))
+    incomplete_iterate_stale = (
+        latest_iterate_start > 0
+        and latest_iterate_terminal <= 0
+        and latest_verification_closure <= 0
+        and not action_process_running
+        and datetime.now(timezone.utc).timestamp() - latest_iterate_start >= stale_after
+    )
+    recovering = (not incomplete_iterate_stale) and any(name.endswith("_started") and name.startswith(("fixer", "iterate")) for name in last_events) and not any(
+        name.endswith("_completed") or name.endswith("_failed") or name == "iterate_needs_review"
+        for name in last_events[-8:]
+    )
+
+    blockers: list[dict[str, Any]] = []
+    if state_running and not process_running:
+        add_blocker(
+            blockers,
+            "orphaned_running_state",
+            "state.json says a stage is running, but no live build process is attached",
+            source=rel(root, build_dir / "state.json"),
+            recovery="Mark the stale stage failed or resume the build from the last incomplete stage.",
+        )
+    if incomplete_iterate_stale:
+        add_blocker(
+            blockers,
+            "incomplete_iterate_session",
+            "iterate_started has no terminal iterate_completed/iterate_failed/iterate_needs_review event and no live goal/iterate/fix process",
+            source=rel(root, build_dir / "events.jsonl"),
+            recovery="Continue verification from the current app state: run checks, deploy, QA, taste review, and refresh ledgers without another provider edit.",
+        )
+    if readiness and readiness.get("status") == "fail":
+        for issue in readiness.get("issues") or []:
+            if not isinstance(issue, dict):
+                continue
+            add_blocker(
+                blockers,
+                str(issue.get("code") or "readiness_issue"),
+                str(issue.get("detail") or issue.get("code") or "readiness failed"),
+                source=rel(root, Path(str(issue.get("path")))) if issue.get("path") else rel(root, build_dir / "readiness.json"),
+                recovery=str(issue.get("recovery") or ""),
+            )
+    elif not readiness and state.get("status") in {"done", "passed", "failed"}:
+        add_blocker(blockers, "readiness_missing", "readiness.json is missing for a terminal-looking build", source=rel(root, build_dir / "readiness.json"), recovery="Run bin/rds-readiness and regenerate the evidence ledger.")
+
+    if quality:
+        blocking_gates = [str(gate) for gate in (quality.get("blocking") or []) if str(gate)]
+        has_quality_readiness_blocker = any(
+            blocker.get("code") == "quality_ledger_blocking"
+            and blocker.get("source") == rel(root, build_dir / "quality-ledger.json")
+            for blocker in blockers
+        )
+        if blocking_gates and not has_quality_readiness_blocker:
+            add_blocker(
+                blockers,
+                "quality_ledger_blocking",
+                f"quality ledger blocks on {len(blocking_gates)} gate(s): {', '.join(blocking_gates)}",
+                source=rel(root, build_dir / "quality-ledger.json"),
+                recovery="Inspect quality-ledger.json blockers and repair the highest-severity gate.",
+            )
+    elif state.get("status") in {"done", "passed", "failed"}:
+        add_blocker(blockers, "quality_ledger_missing", "quality-ledger.json is missing", source=rel(root, build_dir / "quality-ledger.json"), recovery="Run bin/rds-quality-ledger.")
+
+    if scenario_gate and scenario_gate.get("status") == "fail":
+        codes = [
+            str(issue.get("code"))
+            for issue in (scenario_gate.get("issues") or [])
+            if isinstance(issue, dict) and issue.get("code")
+        ]
+        add_blocker(
+            blockers,
+            "qa_scenario_gate_blocking",
+            f"pre-scaffold QA scenario gate failed: {', '.join(codes) if codes else 'unknown'}",
+            source=rel(root, build_dir / "qa-scenario-gate.json"),
+            recovery="Regenerate product-specific QA scenarios before scaffold; do not let generic smoke tests guide implementation.",
+        )
+    if taste_gate and taste_gate.get("status") == "fail":
+        codes = [
+            str(issue.get("code"))
+            for issue in (taste_gate.get("issues") or [])
+            if isinstance(issue, dict) and issue.get("code")
+        ]
+        add_blocker(
+            blockers,
+            "taste_gate_blocking",
+            f"pre-scaffold taste gate failed: {', '.join(codes) if codes else 'unknown'}",
+            source=rel(root, build_dir / "taste-gate.json"),
+            recovery="Strengthen the product/taste brief before scaffold; rerun taste, QA scenario generation, and build planning.",
+        )
+
+    stages = state.get("stages") if isinstance(state.get("stages"), dict) else {}
+    latest_app_change_ts = max(
+        latest_stage_completed_ts(events, {"deploy"}),
+        latest_event_ts(events, {"iterate_apply_completed", "iterate_deploy_completed"}),
+        latest_app_changing_fixer_ts(events),
+        parse_ts(((stages.get("deploy") or {}).get("ended_at") if isinstance(stages.get("deploy"), dict) else None)),
+    )
+    latest_qa_ts = latest_event_ts(events, {"qa_iteration_completed", "iterate_qa_completed"})
+
+    if not preview or not re.match(r"^https?://", preview):
+        add_blocker(blockers, "preview_missing", "No usable HTTP preview URL is recorded", source=rel(root, build_dir / "preview-url.txt"), recovery="Rerun deploy.")
+    elif preview.startswith("pending-zo-registration://"):
+        add_blocker(blockers, "preview_pending", "Deploy left a pending Zo registration sentinel", source=rel(root, build_dir / "preview-url.txt"), recovery="Retry Zo deploy registration.")
+    runtime_marker_required = bool(deploy_fingerprint and deploy_fingerprint.get("runtimeMarkerPath"))
+    if runtime_marker_required:
+        if not service_runtime:
+            add_blocker(
+                blockers,
+                "service_runtime_missing",
+                "service-runtime.json is missing for a marker-enabled deploy",
+                source=rel(root, build_dir / "service-runtime.json"),
+                recovery="Redeploy so RDS can verify the live preview marker.",
+            )
+        elif service_runtime.get("status") != "pass":
+            add_blocker(
+                blockers,
+                "service_runtime_failed",
+                f"runtime marker status={service_runtime.get('status')} error={service_runtime.get('error')}",
+                source=rel(root, build_dir / "service-runtime.json"),
+                recovery="Restart or redeploy the service until the runtime marker matches.",
+            )
+        elif service_runtime.get("expectedHash") != deploy_fingerprint.get("hash") or service_runtime.get("servedHash") != deploy_fingerprint.get("hash"):
+            add_blocker(
+                blockers,
+                "service_runtime_failed",
+                "live runtime marker does not match deploy-fingerprint.json",
+                source=rel(root, build_dir / "service-runtime.json"),
+                recovery="Redeploy the current snapshot and rerun QA.",
+            )
+        elif file_ts(build_dir / "deploy-fingerprint.json") > file_ts(build_dir / "service-runtime.json") + 1:
+            add_blocker(
+                blockers,
+                "service_runtime_stale",
+                "service-runtime.json predates deploy-fingerprint.json",
+                source=rel(root, build_dir / "service-runtime.json"),
+                recovery="Rerun deploy so service-runtime.json is regenerated.",
+            )
+
+    skill_totals = scorecard.get("totals") if isinstance(scorecard, dict) and isinstance(scorecard.get("totals"), dict) else {}
+    terminalish = state.get("status") in {"done", "passed", "failed", "pending_review"} or review_status == "pending"
+    if resolved_count > 0 and not scorecard and terminalish:
+        add_blocker(
+            blockers,
+            "skill_scorecard_missing",
+            f"{resolved_count} selected skill(s) have no skill-impact scorecard",
+            source=rel(root, build_dir / "skills" / "resolved.json"),
+            recovery="Run bin/rds-skill-scorecard so selected skills prove adoption before review.",
+        )
+    if skill_totals:
+        if int(skill_totals.get("fail") or 0) > 0:
+            add_blocker(blockers, "skill_impact_failed", f"{skill_totals.get('fail')} selected skill(s) failed impact probes", source=rel(root, build_dir / "skills" / "scorecard.json"), recovery="Fix skill adoption or change skill selection.")
+        elif int(skill_totals.get("partial") or 0) > 0:
+            add_blocker(blockers, "skill_impact_partial", f"{skill_totals.get('partial')} selected skill(s) only partially shaped the app", source=rel(root, build_dir / "skills" / "scorecard.json"), recovery="Decide whether partial skill adoption is acceptable before approval.", severity="warning")
+
+    typed: dict[str, Any] = {}
+    if iter_dir:
+        for name in ["summary", "spec-verdict", "scenario-verdict", "game-verdict", "website-verdict", "workflow-verdict", "visual-verdict", "truthfulness-verdict", "persona-verdict", "prd-coverage-verdict", "design-review"]:
+            data = read_json(iter_dir / f"{name}.json")
+            if isinstance(data, dict):
+                typed[name] = data
+        qa_evidence_ts = max(latest_qa_ts, file_ts(iter_dir / "summary.json"), file_ts(iter_dir / "scenario-verdict.json"))
+        if latest_app_change_ts and qa_evidence_ts and latest_app_change_ts > qa_evidence_ts + 1:
+            add_blocker(
+                blockers,
+                "qa_evidence_stale",
+                "app-changing work happened after the latest QA evidence",
+                source=rel(root, iter_dir / "summary.json"),
+                recovery="Reset QA and taste-review so browser evidence is regenerated against the current app.",
+            )
+        qa_deploy_fingerprint = read_json(iter_dir / "deploy-fingerprint.json")
+        qa_deploy_fingerprint = qa_deploy_fingerprint if isinstance(qa_deploy_fingerprint, dict) else None
+        current_hash = deploy_fingerprint.get("hash") if deploy_fingerprint else None
+        qa_hash = qa_deploy_fingerprint.get("hash") if qa_deploy_fingerprint else None
+        if current_hash and qa_hash and current_hash != qa_hash:
+            add_blocker(
+                blockers,
+                "deploy_fingerprint_mismatch",
+                "latest QA evidence was captured against a different deployed artifact",
+                source=rel(root, iter_dir / "deploy-fingerprint.json"),
+                recovery="Rerun QA against the currently deployed artifact before review.",
+            )
+        qa_service_runtime = read_json(iter_dir / "service-runtime.json")
+        qa_service_runtime = qa_service_runtime if isinstance(qa_service_runtime, dict) else None
+        current_runtime_hash = service_runtime.get("servedHash") if service_runtime else None
+        qa_runtime_hash = qa_service_runtime.get("servedHash") if qa_service_runtime else None
+        if current_runtime_hash and qa_runtime_hash and current_runtime_hash != qa_runtime_hash:
+            add_blocker(
+                blockers,
+                "service_runtime_failed",
+                "latest QA evidence was captured against a different live runtime marker",
+                source=rel(root, iter_dir / "service-runtime.json"),
+                recovery="Rerun QA and taste review against the current live service.",
+            )
+    if latest_qa_ts and file_ts(build_dir / "taste-review.json") and latest_qa_ts > file_ts(build_dir / "taste-review.json") + 1:
+        add_blocker(
+            blockers,
+            "taste_review_stale",
+            "taste-review.json predates the latest QA run",
+            source=rel(root, build_dir / "taste-review.json"),
+            recovery="Rerun taste-review against the latest QA evidence.",
+        )
+    latest_quality_input_ts = max(latest_qa_ts, file_ts(build_dir / "taste-review.json"))
+    if latest_quality_input_ts and file_ts(build_dir / "quality-ledger.json") and latest_quality_input_ts > file_ts(build_dir / "quality-ledger.json") + 1:
+        add_blocker(
+            blockers,
+            "quality_ledger_stale",
+            "quality-ledger.json predates the latest QA/taste evidence",
+            source=rel(root, build_dir / "quality-ledger.json"),
+            recovery="Regenerate quality-ledger.json after the latest QA/taste evidence.",
+        )
+
+    # Deduplicate by code/message/source while preserving first occurrence.
+    seen: set[tuple[str, str, str]] = set()
+    deduped: list[dict[str, Any]] = []
+    for blocker in blockers:
+        key = (str(blocker.get("code") or ""), str(blocker.get("message") or ""), str(blocker.get("source") or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(blocker)
+    blockers = deduped
+
+    verdict = derive_verdict(state, blockers, running, recovering)
+    conf = confidence(readiness, quality, iter_dir, state)
+    blocker_codes = {str(b.get("code") or "") for b in blockers}
+    hard_evidence_codes = (blocker_codes & EVIDENCE_CODES) - {"preview_missing", "preview_pending", "stage_not_complete"}
+    stale_review_codes = blocker_codes & {"taste_review_stale", "quality_ledger_stale"}
+    if stale_review_codes:
+        blocker_class = "missing_or_stale_evidence"
+    elif blocker_codes & PRODUCT_CODES:
+        blocker_class = "product_quality"
+    elif hard_evidence_codes or "readiness_missing" in blocker_codes:
+        blocker_class = "missing_or_stale_evidence"
+    elif blocker_codes & {"skill_scorecard_missing", "skill_impact_failed", "skill_impact_partial"}:
+        blocker_class = "skill_impact"
+    elif blocker_codes & {"preview_missing", "preview_pending"}:
+        blocker_class = "deploy_truth"
+    elif blockers:
+        blocker_class = "mixed"
+    else:
+        blocker_class = "none"
+
+    recovery_attempts = {
+        "fixerStarted": sum(1 for e in events if event_name(e) == "fixer_started"),
+        "fixerCompleted": sum(1 for e in events if event_name(e) == "fixer_completed"),
+        "iterateStarted": sum(1 for e in events if event_name(e) == "iterate_started"),
+        "iterateCompleted": sum(1 for e in events if event_name(e) in {"iterate_completed", "iterate_qa_completed"}),
+        "needsReview": sum(1 for e in events if event_name(e) == "iterate_needs_review"),
+    }
+    gates = {
+        "readiness": {"status": readiness.get("status") if readiness else "missing", "path": rel(root, build_dir / "readiness.json")},
+        "quality": {"blocking": quality.get("blocking") if quality else None, "path": rel(root, build_dir / "quality-ledger.json")},
+        "scenarioGate": {"status": scenario_gate.get("status") if scenario_gate else "missing", "path": rel(root, build_dir / "qa-scenario-gate.json")},
+        "tasteGate": {"status": taste_gate.get("status") if taste_gate else "missing", "path": rel(root, build_dir / "taste-gate.json")},
+        "skills": {"totals": skill_totals or None, "path": rel(root, build_dir / "skills" / "scorecard.json")},
+        "latestQa": {"iteration": iter_dir.name if iter_dir else None, "path": rel(root, iter_dir) if iter_dir else None},
+        "preview": {"url": preview or None, "serviceStatus": service.get("status") if service else None, "serviceId": service.get("service_id") if service else None},
+        "deployFingerprint": {
+            "hash": deploy_fingerprint.get("hash") if deploy_fingerprint else None,
+            "path": rel(root, build_dir / "deploy-fingerprint.json"),
+        },
+        "serviceRuntime": {
+            "status": service_runtime.get("status") if service_runtime else "missing",
+            "servedHash": service_runtime.get("servedHash") if service_runtime else None,
+            "path": rel(root, build_dir / "service-runtime.json"),
+        },
+    }
+    next_action = summarize_next_action(blockers, str(review_status) if review_status else None, running, recovering)
+    truth = {
+        "schema": "rds.truth.v1",
+        "buildId": build_id,
+        "updatedAt": now_iso(),
+        "verdict": verdict,
+        "confidence": conf,
+        "blockerClass": blocker_class,
+        "nextAction": next_action,
+        "operatorReviewStatus": review_status,
+        "running": running,
+        "recovering": recovering,
+        "blockerCount": len(blockers),
+        "topBlockers": blockers[:5],
+    }
+    stage_evidence = build_stage_evidence(root, build_dir, state, blockers, iter_dir, verdict, conf, next_action)
+    return {
+        "schema": "rds.evidence.ledger.v1",
+        "buildId": build_id,
+        "updatedAt": now_iso(),
+        "verdict": verdict,
+        "confidence": conf,
+        "truth": truth,
+        "summary": {
+            "currentTruth": verdict,
+            "blockerClass": blocker_class,
+            "nextAction": next_action,
+            "operatorReviewStatus": review_status,
+            "running": running,
+            "recovering": recovering,
+        },
+        "state": {
+            "status": state.get("status"),
+            "stage": state.get("current_stage") or state.get("stage"),
+            "stack": state.get("stack"),
+            "appType": state.get("app_type"),
+        },
+        "blockers": blockers,
+        "gates": gates,
+        "recoveryAttempts": recovery_attempts,
+        "sources": {
+            "state": rel(root, build_dir / "state.json"),
+            "events": rel(root, build_dir / "events.jsonl"),
+            "readiness": rel(root, build_dir / "readiness.json"),
+            "qualityLedger": rel(root, build_dir / "quality-ledger.json"),
+            "scenarioGate": rel(root, build_dir / "qa-scenario-gate.json"),
+            "tasteGate": rel(root, build_dir / "taste-gate.json"),
+            "skillScorecard": rel(root, build_dir / "skills" / "scorecard.json"),
+            "service": rel(root, build_dir / "service.json"),
+            "deployFingerprint": rel(root, build_dir / "deploy-fingerprint.json"),
+            "serviceRuntime": rel(root, build_dir / "service-runtime.json"),
+        },
+        "latestEvidence": {
+            "qa": typed,
+        },
+        "stageEvidence": stage_evidence,
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("build_id")
+    parser.add_argument("--root", default=str(Path(__file__).resolve().parents[1]))
+    parser.add_argument("--out", default=None)
+    args = parser.parse_args()
+
+    root = Path(args.root).resolve()
+    build_dir = root / "builds" / args.build_id
+    if not build_dir.exists():
+        print(json.dumps({"ok": False, "error": f"build not found: {args.build_id}"}))
+        return 2
+    payload = build_payload(root, args.build_id)
+    out = Path(args.out) if args.out else build_dir / "evidence-ledger.json"
+    out.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    if args.out is None:
+        (build_dir / "truth.json").write_text(json.dumps(payload["truth"], indent=2) + "\n", encoding="utf-8")
+        autonomy_dir = build_dir / "autonomy"
+        autonomy_dir.mkdir(parents=True, exist_ok=True)
+        (autonomy_dir / "evidence.json").write_text(json.dumps(payload["stageEvidence"], indent=2) + "\n", encoding="utf-8")
+    print(json.dumps({"ok": True, "path": str(out), "verdict": payload["verdict"], "blockers": len(payload["blockers"])}))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

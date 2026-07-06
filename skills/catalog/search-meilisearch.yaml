@@ -1,0 +1,18 @@
+---
+slug: search-meilisearch
+name: Meilisearch
+status: curated
+category: search
+maturity: stable
+applies_to:
+- rails-web
+- nextjs-fullstack
+description: Full-text search through Meilisearch.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: meilisearch.com
+  url: https://www.meilisearch.com/docs
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

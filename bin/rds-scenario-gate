@@ -1,0 +1,325 @@
+#!/usr/bin/env python3
+"""Validate that generated QA scenarios are concrete enough to guide scaffold."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def read_text(path: Path, limit: int = 500_000) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="ignore")[:limit]
+    except Exception:
+        return ""
+
+
+def read_json(path: Path) -> Any:
+    try:
+        return json.loads(read_text(path))
+    except Exception:
+        return None
+
+
+def source_prd_only(spec: str) -> str:
+    """Strip RDS-generated addenda so the gate validates against the user's PRD.
+
+    rds-qa-scenarios appends the generated scenarios (and rds-taste appends a
+    brief) to spec.md. If we derive spec_terms from the whole file, those
+    addenda contaminate the term set and the mismatch check can pass a contract
+    whose domain nouns only exist because the scenarios themselves were appended.
+    """
+    markers = [
+        "<!-- RDS_TASTE_BRIEF_V1 -->",
+        "## RDS Taste Brief",
+        "## RDS QA Scenarios",
+    ]
+    cut = len(spec)
+    for marker in markers:
+        idx = spec.find(marker)
+        if idx >= 0:
+            cut = min(cut, idx)
+    return spec[:cut]
+
+
+def add_issue(issues: list[dict[str, str]], code: str, detail: str, recovery: str) -> None:
+    issues.append({"code": code, "severity": "blocker", "detail": detail, "recovery": recovery})
+
+
+def scenario_text(scenarios: list[Any]) -> str:
+    chunks: list[str] = []
+    for row in scenarios:
+        if not isinstance(row, dict):
+            continue
+        chunks.append(str(row.get("id") or ""))
+        chunks.append(str(row.get("title") or ""))
+        for key in ("mustVerify", "actions", "expectations"):
+            value = row.get(key)
+            chunks.append(json.dumps(value, sort_keys=True) if value is not None else "")
+    return "\n".join(chunks).lower()
+
+
+def count_terms(text: str, terms: set[str]) -> int:
+    return sum(1 for term in terms if re.search(rf"\b{re.escape(term)}\b", text))
+
+
+NEG_PATTERN = re.compile(
+    r"\b(no|not|never|without|cannot|can't|won't|isn't|aren't|don't|doesn't|"
+    r"there\s+is\s+no|there\s+are\s+no|must\s+not|must\s+never|no\s+longer|"
+    r"read[\s-]?only|disallow\w*|prohibit\w*|forbid\w*|removed)\b"
+)
+
+
+def classify_noun(noun: str, spec_lower: str) -> str:
+    """Classify how a domain noun appears in the PRD.
+
+    Returns "supported" if it appears at least once in an affirmative clause,
+    "forbidden" if every occurrence is inside a negating/forbidding clause
+    (e.g. "there is no order"), or "absent" if it never appears. A scenario
+    that exercises a forbidden capability is as wrong as one that invents an
+    unrelated noun, so the gate must distinguish presence-in-negation from
+    real support.
+    """
+    occurrences = [m.start() for m in re.finditer(rf"\b{re.escape(noun)}\b", spec_lower)]
+    if not occurrences:
+        return "absent"
+    for start in occurrences:
+        window = spec_lower[max(0, start - 60):start]
+        window = re.split(r"[.;!?\n]", window)[-1]
+        if not NEG_PATTERN.search(window):
+            return "supported"
+    return "forbidden"
+
+
+def infer_app_type(payload: dict[str, Any], state: dict[str, Any] | None) -> str:
+    explicit = str(payload.get("appType") or "").strip().lower().replace("_", "-")
+    if explicit and explicit not in {"auto", "unknown"}:
+        return explicit
+    if isinstance(state, dict):
+        state_type = str(state.get("app_type") or "").strip().lower().replace("_", "-")
+        if state_type and state_type not in {"auto", "unknown"}:
+            return state_type
+    return "web-app"
+
+
+def validate(build_dir: Path) -> dict[str, Any]:
+    path = build_dir / "qa-scenarios.json"
+    state = read_json(build_dir / "state.json")
+    spec = source_prd_only(read_text(build_dir / "spec.md"))
+    spec_terms = set(re.findall(r"[a-z][a-z0-9-]{2,}", spec.lower()))
+    payload = read_json(path)
+    issues: list[dict[str, str]] = []
+
+    if not isinstance(payload, dict):
+        add_issue(
+            issues,
+            "qa_scenarios_missing",
+            "qa-scenarios.json is missing or invalid",
+            "Run bin/rds-qa-scenarios before taste gate and scaffold.",
+        )
+        return {
+            "schema": "rds.qa.scenario-gate.v1",
+            "status": "fail",
+            "updatedAt": now_iso(),
+            "issues": issues,
+            "sources": {"scenarios": str(path)},
+        }
+
+    scenarios = payload.get("scenarios")
+    if not isinstance(scenarios, list):
+        scenarios = []
+    app_type = infer_app_type(payload, state if isinstance(state, dict) else None)
+
+    if len(scenarios) < 3:
+        add_issue(
+            issues,
+            "qa_scenarios_too_few",
+            f"only {len(scenarios)} scenario(s) were generated",
+            "Generate at least three domain-specific scenarios before scaffold.",
+        )
+
+    spec_lower = spec.lower()
+    weak_rows = 0
+    non_blocking = 0
+    missing_actions_or_expectations = 0
+    generic_action_targets = 0
+    mismatched_action_targets = 0
+    forbidden_action_targets = 0
+    text_only_promises = 0
+    for idx, row in enumerate(scenarios, start=1):
+        if not isinstance(row, dict):
+            weak_rows += 1
+            continue
+        must = row.get("mustVerify") if isinstance(row.get("mustVerify"), list) else []
+        actions = row.get("actions") if isinstance(row.get("actions"), list) else []
+        expectations = row.get("expectations") if isinstance(row.get("expectations"), list) else []
+        title = str(row.get("title") or "").strip()
+        if len(title) < 12 or len(must) < 2:
+            weak_rows += 1
+        if row.get("blockingIfMissing") is not True:
+            non_blocking += 1
+        if not actions and not expectations:
+            missing_actions_or_expectations += 1
+        elif app_type == "game" and idx <= 3 and not actions:
+            missing_actions_or_expectations += 1
+        for action in actions:
+            if not isinstance(action, dict):
+                continue
+            target = str(action.get("target") or action.get("value") or "")
+            alternatives = [part.strip() for part in target.split("|") if part.strip()]
+            generic_terms = {"save", "submit", "create", "approve", "apply", "export", "filter", "search", "settings", "start", "contact", "demo", "get started"}
+            if len(alternatives) >= 4 and sum(1 for part in alternatives if part.lower() in generic_terms) >= 3:
+                generic_action_targets += 1
+            target_terms = {
+                term
+                for term in re.findall(r"[a-z][a-z0-9-]{2,}", target.lower())
+                if term not in generic_terms and term not in {"new", "selected"}
+            }
+            if target_terms and spec:
+                statuses = {classify_noun(term, spec_lower) for term in target_terms}
+                if "supported" not in statuses:
+                    if "forbidden" in statuses:
+                        forbidden_action_targets += 1
+                    else:
+                        mismatched_action_targets += 1
+        if str(row.get("id") or "").startswith("prd-") and not actions:
+            expectation_types = {
+                str(item.get("type") or "")
+                for item in expectations
+                if isinstance(item, dict)
+            }
+            if expectation_types <= {"text"}:
+                text_only_promises += 1
+
+    if weak_rows:
+        add_issue(
+            issues,
+            "qa_scenarios_too_vague",
+            f"{weak_rows} scenario(s) lack a specific title or enough mustVerify criteria",
+            "Regenerate scenarios with concrete user-facing assertions, not generic smoke checks.",
+        )
+    if non_blocking:
+        add_issue(
+            issues,
+            "qa_scenarios_not_binding",
+            f"{non_blocking} scenario(s) are not marked blockingIfMissing=true",
+            "Make generated scenarios binding implementation and QA requirements.",
+        )
+    if missing_actions_or_expectations:
+        add_issue(
+            issues,
+            "qa_scenarios_not_executable",
+            f"{missing_actions_or_expectations} scenario(s) lack executable actions and/or expectations",
+            "Add browser actions and observable expectations so QA can execute the scenario.",
+        )
+    if generic_action_targets:
+        add_issue(
+            issues,
+            "qa_scenarios_generic_actions",
+            f"{generic_action_targets} scenario(s) use broad generic button alternatives instead of a product-specific target",
+            "Replace generic Save|Submit|Create-style targets with the actual PRD workflow affordances and route-specific expectations.",
+        )
+    if mismatched_action_targets:
+        add_issue(
+            issues,
+            "qa_scenarios_mismatched_actions",
+            f"{mismatched_action_targets} scenario action target(s) use domain nouns not present in the PRD/spec",
+            "Regenerate scenarios from first-party requirements instead of carrying over unrelated workflow nouns.",
+        )
+    if forbidden_action_targets:
+        add_issue(
+            issues,
+            "qa_scenarios_forbidden_actions",
+            f"{forbidden_action_targets} scenario action target(s) exercise a capability the PRD explicitly forbids (domain noun appears only in a negating clause)",
+            "Regenerate scenarios from the current PRD; do not test write/order/mutation affordances when the spec says the app is read-only or that capability must not exist.",
+        )
+    if text_only_promises:
+        add_issue(
+            issues,
+            "qa_scenarios_text_only_promises",
+            f"{text_only_promises} PRD promise scenario(s) can pass by finding marketing copy only",
+            "Add actions, URLs, durable-state checks, or domain-specific runtime evidence so PRD promises cannot pass as placeholder text.",
+        )
+
+    text = scenario_text(scenarios)
+    if app_type == "game":
+        game_terms = {"start", "play", "turn", "state", "score", "restart", "feedback"}
+        if count_terms(text, game_terms) < 5:
+            add_issue(
+                issues,
+                "game_scenarios_missing_core_loop",
+                "game scenarios do not cover enough start/play/turn/state/score/restart/feedback loop criteria",
+                "Regenerate game scenarios around the playable loop rather than page-load smoke checks.",
+            )
+        board_terms = {"board", "cell", "piece", "legal", "move", "capture", "victory", "mobile"}
+        if count_terms(text, board_terms) < 5:
+            add_issue(
+                issues,
+                "board_game_scenarios_weak",
+                "board-game scenarios do not cover enough board/cell/piece/legal-move/capture/victory/mobile criteria",
+                "For POLIS-like games, generate board-specific scenarios before scaffold.",
+            )
+    elif app_type == "website":
+        website_terms = {"first", "viewport", "offer", "headline", "cta", "navigation", "responsive", "mobile"}
+        if count_terms(text, website_terms) < 5:
+            add_issue(
+                issues,
+                "website_scenarios_weak",
+                "website scenarios do not cover enough first-viewport offer, CTA/navigation, or responsive criteria",
+                "Regenerate website scenarios around visitor comprehension and click-through.",
+            )
+    else:
+        app_terms = {"workflow", "action", "state", "success", "error", "empty", "filter", "search", "status"}
+        if count_terms(text, app_terms) < 4:
+            add_issue(
+                issues,
+                "app_scenarios_weak",
+                "app scenarios do not cover enough workflow/state/control feedback criteria",
+                "Regenerate app scenarios around the primary workflow and operator confidence.",
+            )
+
+    return {
+        "schema": "rds.qa.scenario-gate.v1",
+        "status": "fail" if issues else "pass",
+        "updatedAt": now_iso(),
+        "appType": app_type,
+        "metrics": {
+            "scenarios": len(scenarios),
+            "weakRows": weak_rows,
+            "nonBlocking": non_blocking,
+            "missingActionsOrExpectations": missing_actions_or_expectations,
+            "genericActionTargets": generic_action_targets,
+            "mismatchedActionTargets": mismatched_action_targets,
+            "forbiddenActionTargets": forbidden_action_targets,
+            "textOnlyPromises": text_only_promises,
+        },
+        "issues": issues,
+        "sources": {"scenarios": str(path)},
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("build_id")
+    parser.add_argument("--root", default=str(Path(__file__).resolve().parents[1]))
+    args = parser.parse_args()
+
+    root = Path(args.root).resolve()
+    build_dir = root / "builds" / args.build_id
+    payload = validate(build_dir)
+    out = build_dir / "qa-scenario-gate.json"
+    out.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps({"status": payload["status"], "path": str(out), "issues": len(payload["issues"])}))
+    return 0 if payload["status"] == "pass" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

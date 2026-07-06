@@ -1,0 +1,55 @@
+#!/usr/bin/env python3
+"""Run stack/skill analyzer regression fixtures."""
+
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+FIXTURE_DIR = ROOT / "fixtures" / "analyzer"
+EXPECTED = json.loads((FIXTURE_DIR / "expected.json").read_text())
+ANALYZER = ROOT / "bin" / "rds-analyze-source"
+
+
+def analyze(path: Path) -> dict:
+    proc = subprocess.run(
+        [str(ANALYZER), str(path), "--app-type", "auto"],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=10,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"{path.name}: analyzer exited {proc.returncode}: {proc.stderr.strip()}")
+    return json.loads(proc.stdout)
+
+
+def main() -> int:
+    failures: list[str] = []
+    for name, expected in sorted(EXPECTED.items()):
+        result = analyze(FIXTURE_DIR / name)
+        if result.get("stack") != expected["stack"]:
+            failures.append(f"{name}: stack expected {expected['stack']} got {result.get('stack')}")
+        if result.get("appType") != expected["appType"]:
+            failures.append(f"{name}: appType expected {expected['appType']} got {result.get('appType')}")
+        skills = set(result.get("skills") or [])
+        for skill in expected.get("skills", []):
+            if skill not in skills:
+                failures.append(f"{name}: missing skill {skill}")
+        print(f"{name}: {result.get('stack')} / {result.get('appType')} / {result.get('confidence')}%")
+    if failures:
+        print("\nFAILURES:", file=sys.stderr)
+        for failure in failures:
+            print(f"- {failure}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,19 @@
+---
+slug: email-resend
+name: Resend email
+status: curated
+category: email
+maturity: stable
+applies_to:
+- nextjs-fullstack
+- python-ai-service
+- astro-thin-web
+description: Transactional email via Resend.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: resend.com
+  url: https://resend.com/docs
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

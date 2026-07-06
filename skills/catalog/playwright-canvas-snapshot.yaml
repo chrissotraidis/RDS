@@ -1,0 +1,17 @@
+---
+slug: playwright-canvas-snapshot
+name: Playwright canvas snapshot
+status: curated
+category: testing
+maturity: stable
+applies_to:
+- web-3d
+description: Canvas pixel snapshot checks for WebGL output.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: playwright.dev
+  url: https://playwright.dev/docs/screenshots
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

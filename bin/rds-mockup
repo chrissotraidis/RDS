@@ -1,0 +1,374 @@
+#!/usr/bin/env ruby
+
+require "json"
+require "yaml"
+require "fileutils"
+require "net/http"
+require "uri"
+require "open3"
+require "tmpdir"
+require "socket"
+
+ROOT = File.expand_path("..", __dir__)
+MOCKUP_ENUM = %w[
+  ui-kit-styleguide single-html-mockup reference-image-plus-scene-spec gameplay-spec
+  screens-folder popup-html-preview asset-target-spec
+].freeze
+
+def usage
+  warn <<~TXT
+    Usage:
+      bin/rds-mockup verify --build-dir=<dir> --app-dir=<dir> --stack=<slug> [--url=<preview-url>]
+      bin/rds-mockup --self-test
+  TXT
+  exit 2
+end
+
+def parse_args(argv)
+  args = { command: nil }
+  rest = argv.dup
+  args[:command] = rest.shift if rest.first && !rest.first.start_with?("--")
+  rest.each_with_index do |arg, idx|
+    next unless arg.start_with?("--")
+    key, value = arg[2..].split("=", 2)
+    value ||= rest[idx + 1] unless rest[idx + 1]&.start_with?("--")
+    args[key.tr("-", "_").to_sym] = value || true
+  end
+  args
+end
+
+def stack_runtime_id(slug)
+  case slug
+  when "rails-web" then "rails"
+  when "nextjs-fullstack" then "nextjs"
+  when "mobile-native" then "react-native"
+  when "react-spa" then "react"
+  else slug
+  end
+end
+
+def stack_contract(slug)
+  runtime = stack_runtime_id(slug)
+  path = File.join(ROOT, "stacks", runtime, "stack.yaml")
+  raise "missing stack contract for #{slug}: #{path}" unless File.exist?(path)
+  YAML.load_file(path) || {}
+end
+
+def http_ok?(url)
+  uri = URI.parse(url)
+  response = Net::HTTP.start(uri.host, uri.port, use_ssl: uri.scheme == "https", open_timeout: 3, read_timeout: 5) do |http|
+    http.get(uri.request_uri.empty? ? "/" : uri.request_uri)
+  end
+  response.code.to_i.between?(200, 399)
+rescue StandardError
+  false
+end
+
+def command_available?(name)
+  system("sh", "-c", "command -v \"$1\" >/dev/null 2>&1", "sh", name)
+end
+
+def free_tcp_port
+  server = TCPServer.new("127.0.0.1", 0)
+  server.addr[1]
+ensure
+  server&.close
+end
+
+def capture_page_screenshot(url, out_path)
+  script = <<~JS
+    const { chromium } = require("#{ROOT}/dashboard/node_modules/playwright");
+    (async () => {
+      const browser = await chromium.launch({ headless: true });
+      const page = await browser.newPage({ viewport: { width: 1440, height: 1200 }, deviceScaleFactor: 1 });
+      await page.goto(process.argv[2], { waitUntil: "networkidle", timeout: 20000 });
+      await page.waitForTimeout(1200);
+      await page.screenshot({ path: process.argv[3], fullPage: true });
+      await browser.close();
+    })().catch((error) => {
+      console.error(error && error.stack ? error.stack : String(error));
+      process.exit(1);
+    });
+  JS
+  Dir.mktmpdir("rds-mockup-capture.", "/tmp") do |dir|
+    path = File.join(dir, "capture.js")
+    File.write(path, script)
+    stdout, stderr, status = Open3.capture3("node", path, url, out_path)
+    raise "screenshot capture failed: #{stderr}#{stdout}" unless status.success?
+  end
+  out_path
+end
+
+def image_dimensions(path)
+  stdout, _stderr, status = Open3.capture3("identify", "-format", "%w %h", path)
+  return nil unless status.success?
+  width, height = stdout.split.map(&:to_i)
+  return nil if width.to_i <= 0 || height.to_i <= 0
+  [width, height]
+end
+
+def normalized_rmse(reference_path, live_path)
+  dims = image_dimensions(reference_path)
+  return nil unless dims
+  width, height = dims
+  Dir.mktmpdir("rds-mockup-compare.", "/tmp") do |dir|
+    normalized_live = File.join(dir, "live-normalized.png")
+    _stdout, stderr, status = Open3.capture3(
+      "convert",
+      live_path,
+      "-resize", "#{width}x#{height}^",
+      "-gravity", "North",
+      "-extent", "#{width}x#{height}",
+      normalized_live,
+    )
+    raise "image normalize failed: #{stderr}" unless status.success?
+    _stdout, stderr, _status = Open3.capture3("compare", "-metric", "RMSE", reference_path, normalized_live, "null:")
+    match = stderr.match(/\(([\d.]+)\)/)
+    match ? match[1].to_f : nil
+  end
+end
+
+def compare_live_to_mockup_screens(url, screens, out_dir)
+  return { ok: false, reason: "no url for visual comparison", comparisons: [] } unless url
+  return { ok: false, reason: "no mockup screens to compare", comparisons: [] } if screens.empty?
+  return { ok: false, reason: "imagemagick unavailable", comparisons: [] } unless command_available?("compare") && command_available?("convert") && command_available?("identify")
+
+  live_path = File.join(out_dir, "live-screenshot.png")
+  capture_page_screenshot(url, live_path)
+  threshold = Float(ENV.fetch("RDS_MOCKUP_RMSE_THRESHOLD", "0.52"))
+  comparisons = screens.map do |screen|
+    rmse = normalized_rmse(screen, live_path)
+    {
+      reference: screen,
+      normalized_rmse: rmse,
+      threshold: threshold,
+      ok: !rmse.nil? && rmse <= threshold,
+    }
+  end
+  best = comparisons.compact.min_by { |item| item[:normalized_rmse] || 99 }
+  {
+    ok: comparisons.any? { |item| item[:ok] },
+    reason: comparisons.any? { |item| item[:ok] } ? "live screenshot resembles at least one reference screen" : "live screenshot does not resemble provided reference screens",
+    live_screenshot: live_path,
+    best: best,
+    comparisons: comparisons,
+  }
+rescue StandardError => e
+  { ok: false, reason: e.message, comparisons: [] }
+end
+
+def reference_screen_paths(build_dir, app_dir)
+  patterns = [
+    File.join(app_dir, "mockup-screens", "*.{png,jpg,jpeg}"),
+    File.join(build_dir, "mockup-screens", "*.{png,jpg,jpeg}"),
+    File.join(build_dir, "references", "mockup-screens", "*.{png,jpg,jpeg}"),
+    File.join(build_dir, "references", "*.{png,jpg,jpeg}"),
+    File.join(build_dir, "attachments", "**", "screen.{png,jpg,jpeg}"),
+    File.join(build_dir, "attachments", "**", "*.{png,jpg,jpeg}"),
+  ]
+  patterns.flat_map { |pattern| Dir[pattern] }.uniq.sort
+end
+
+def source_references_mockups?(build_dir)
+  paths = [
+    File.join(build_dir, "source.txt"),
+    File.join(build_dir, "research.md"),
+    File.join(build_dir, "spec.md"),
+  ]
+  text = paths.select { |path| File.exist?(path) }.map { |path| File.read(path, encoding: "UTF-8", invalid: :replace, undef: :replace) }.join("\n")
+  text.match?(/\b(stitch|mockup|screenshot|screen\.png|figma|visual reference|design reference)\b/i)
+rescue StandardError
+  false
+end
+
+def canvas_pixels(url)
+  script = <<~JS
+    const { chromium } = require("#{ROOT}/dashboard/node_modules/playwright");
+    (async () => {
+      const browser = await chromium.launch({ headless: true });
+      const page = await browser.newPage();
+      await page.goto(process.argv[2], { waitUntil: "networkidle", timeout: 15000 });
+      await page.waitForTimeout(1000);
+      const result = await page.evaluate(() => {
+        const canvas = document.querySelector("canvas");
+        if (!canvas) return { ok: false, reason: "missing canvas", pixels: 0 };
+        const ctx = canvas.getContext("2d") || canvas.getContext("webgl") || canvas.getContext("webgl2");
+        if (!ctx) return { ok: false, reason: "missing canvas context", pixels: 0 };
+        if (ctx.readPixels) {
+          const w = Math.min(canvas.width || 1, 64);
+          const h = Math.min(canvas.height || 1, 64);
+          const data = new Uint8Array(w * h * 4);
+          ctx.readPixels(0, 0, w, h, ctx.RGBA, ctx.UNSIGNED_BYTE, data);
+          let nonblank = 0;
+          for (let i = 0; i < data.length; i += 4) {
+            if (data[i] || data[i + 1] || data[i + 2] || data[i + 3]) nonblank++;
+          }
+          return { ok: nonblank > 0, reason: nonblank > 0 ? "canvas nonblank" : "canvas blank", pixels: nonblank };
+        }
+        const data = ctx.getImageData(0, 0, Math.min(canvas.width || 1, 64), Math.min(canvas.height || 1, 64)).data;
+        let nonblank = 0;
+        for (let i = 0; i < data.length; i += 4) {
+          if (data[i] || data[i + 1] || data[i + 2] || data[i + 3]) nonblank++;
+        }
+        return { ok: nonblank > 0, reason: nonblank > 0 ? "canvas nonblank" : "canvas blank", pixels: nonblank };
+      });
+      await browser.close();
+      console.log(JSON.stringify(result));
+    })().catch((error) => {
+      console.error(error && error.stack ? error.stack : String(error));
+      process.exit(1);
+    });
+  JS
+  Dir.mktmpdir("rds-mockup.", "/tmp") do |dir|
+    path = File.join(dir, "canvas-check.js")
+    File.write(path, script)
+    stdout, stderr, status = Open3.capture3("node", path, url)
+    raise "canvas check failed: #{stderr}" unless status.success?
+    JSON.parse(stdout)
+  end
+end
+
+def write_report(build_dir, report)
+  out_dir = File.join(build_dir, "mockup-diff")
+  FileUtils.mkdir_p(out_dir)
+  File.write(File.join(out_dir, "report.json"), JSON.pretty_generate(report) + "\n")
+  File.write(File.join(out_dir, "summary.md"), <<~MD)
+    # RDS Mockup Fidelity
+
+    - status: #{report[:status]}
+    - stack: #{report[:stack]}
+    - analog: #{report[:analog]}
+    - checked: #{report[:checks].map { |c| c[:name] }.join(", ")}
+  MD
+end
+
+def verify(args)
+  build_dir = args[:build_dir] || usage
+  app_dir = args[:app_dir] || usage
+  stack = args[:stack] || usage
+  url = args[:url]
+  contract = stack_contract(stack)
+  analog = contract.dig("mockup_analog", "primary")
+  raise "invalid mockup analog for #{stack}: #{analog.inspect}" unless MOCKUP_ENUM.include?(analog)
+  mockup_expected = source_references_mockups?(build_dir)
+  out_dir = File.join(build_dir, "mockup-diff")
+  FileUtils.mkdir_p(out_dir)
+
+  checks = []
+  case analog
+  when "ui-kit-styleguide"
+    has_ui_kit = File.directory?(File.join(app_dir, "lib", "ui_kit"))
+    styleguide_ok = url ? http_ok?(URI.join(url.end_with?("/") ? url : "#{url}/", "styleguide").to_s) : false
+    checks << { name: "ui-kit-styleguide", ok: has_ui_kit || styleguide_ok, details: { has_ui_kit: has_ui_kit, styleguide_ok: styleguide_ok } }
+  when "single-html-mockup", "popup-html-preview"
+    mockup = File.join(app_dir, "mockup.html")
+    screen_paths = reference_screen_paths(build_dir, app_dir)
+    screens = screen_paths.any?
+    target_ok = url ? http_ok?(url) : File.exist?(File.join(app_dir, "index.html"))
+    mockup_present = File.exist?(mockup) || screens
+    visual_compare = screens && url ? compare_live_to_mockup_screens(url, screen_paths, out_dir) : nil
+    checks << {
+      name: analog,
+      ok: target_ok && (!mockup_expected || mockup_present) && (!visual_compare || visual_compare[:ok]),
+      details: {
+        mockup_expected: mockup_expected,
+        mockup_present: mockup_present,
+        mockup_html_present: File.exist?(mockup),
+        mockup_screens_present: screens,
+        target_ok: target_ok,
+        visual_compare: visual_compare,
+      },
+    }
+  when "reference-image-plus-scene-spec"
+    scene_spec = File.exist?(File.join(app_dir, "src", "assets", "reference", "scene-spec.md")) || File.exist?(File.join(app_dir, "scene-spec.md"))
+    if url
+      pixels = canvas_pixels(url)
+      checks << { name: "canvas-nonblank", ok: pixels["ok"], details: pixels.merge(scene_spec: scene_spec) }
+    else
+      checks << { name: "scene-spec", ok: scene_spec, details: { scene_spec: scene_spec, url: nil } }
+    end
+  when "gameplay-spec"
+    spec = File.exist?(File.join(app_dir, "docs", "GAMEPLAY_SPEC.md")) || File.exist?(File.join(app_dir, "GAMEPLAY_SPEC.md"))
+    target_ok = url ? http_ok?(url) : true
+    checks << { name: "gameplay-spec", ok: spec && target_ok, details: { gameplay_spec: spec, target_ok: target_ok } }
+  when "screens-folder"
+    screen_paths = reference_screen_paths(build_dir, app_dir)
+    screens = screen_paths.any?
+    target_ok = url ? http_ok?(url) : true
+    visual_compare = screens && url ? compare_live_to_mockup_screens(url, screen_paths, out_dir) : nil
+    checks << {
+      name: "screens-folder",
+      ok: screens && target_ok && (!visual_compare || visual_compare[:ok]),
+      details: { screens_present: screens, target_ok: target_ok, visual_compare: visual_compare },
+    }
+  when "asset-target-spec"
+    target = File.exist?(File.join(app_dir, "spec", "target_spec.yaml"))
+    preview = url ? http_ok?(url) : File.exist?(File.join(app_dir, "web", "index.html"))
+    checks << { name: "asset-target-spec", ok: target || preview, details: { target_spec: target, preview: preview } }
+  end
+
+  report = {
+    status: checks.all? { |check| check[:ok] } ? "passed" : "failed",
+    stack: stack,
+    analog: analog,
+    mockup_expected: mockup_expected,
+    build_dir: build_dir,
+    app_dir: app_dir,
+    url: url,
+    checks: checks,
+  }
+  write_report(build_dir, report)
+  puts JSON.pretty_generate(report)
+  report[:status] == "passed" ? 0 : 1
+end
+
+def self_test
+  Dir.mktmpdir("rds-mockup-self.", "/tmp") do |dir|
+    app = File.join(dir, "app")
+    build = File.join(dir, "build")
+    FileUtils.mkdir_p(File.join(app, "lib", "ui_kit"))
+    FileUtils.mkdir_p(build)
+    args = { build_dir: build, app_dir: app, stack: "rails-web" }
+    status = verify(args)
+    exit(status) unless status.zero?
+
+    next unless command_available?("convert")
+
+    web = File.join(dir, "web")
+    screen_dir = File.join(build, "mockup-screens")
+    FileUtils.mkdir_p(web)
+    FileUtils.mkdir_p(screen_dir)
+    File.write(File.join(build, "spec.md"), "Use the provided Stitch screenshot as the design reference.\n")
+    File.write(File.join(web, "index.html"), <<~HTML)
+      <!doctype html>
+      <html><head><style>html,body{margin:0;min-height:100%;background:#ff0000;}main{height:1200px;background:#ff0000;}</style></head><body><main></main></body></html>
+    HTML
+    system("convert", "-size", "1440x1200", "xc:#ff0000", File.join(screen_dir, "home.png"), out: File::NULL, err: File::NULL)
+    port = free_tcp_port
+    pid = spawn("python3", "-m", "http.server", port.to_s, "--bind", "127.0.0.1", "--directory", web, out: File::NULL, err: File::NULL)
+    begin
+      50.times do
+        break if http_ok?("http://127.0.0.1:#{port}/")
+        sleep 0.1
+      end
+      pass_status = verify(build_dir: build, app_dir: web, stack: "react-spa", url: "http://127.0.0.1:#{port}/")
+      exit(pass_status) unless pass_status.zero?
+
+      File.write(File.join(web, "index.html"), <<~HTML)
+        <!doctype html>
+        <html><head><style>html,body{margin:0;min-height:100%;background:#0044ff;}main{height:1200px;background:#0044ff;}</style></head><body><main></main></body></html>
+      HTML
+      fail_status = verify(build_dir: build, app_dir: web, stack: "react-spa", url: "http://127.0.0.1:#{port}/")
+      exit 1 if fail_status.zero?
+    ensure
+      Process.kill("TERM", pid) rescue nil
+      Process.wait(pid) rescue nil
+    end
+  end
+  exit 0
+end
+
+args = parse_args(ARGV)
+self_test if args[:self_test]
+usage unless args[:command] == "verify"
+exit verify(args)

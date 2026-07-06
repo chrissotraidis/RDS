@@ -1,0 +1,17 @@
+---
+slug: sse-streaming-helper
+name: SSE streaming helper
+status: curated
+category: api
+maturity: stable
+applies_to:
+- python-ai-service
+description: Server-sent event streaming conventions for Python services.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: developer.mozilla.org
+  url: https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

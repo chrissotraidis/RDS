@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Fixture Studio</title>
+  <style>
+    :root { color-scheme: light; font-family: Inter, system-ui, sans-serif; color: #16201d; background: #f7faf8; }
+    body { margin: 0; }
+    header { display: flex; justify-content: space-between; align-items: center; padding: 20px 32px; border-bottom: 1px solid #dce5df; }
+    nav { display: flex; gap: 16px; flex-wrap: wrap; }
+    a { color: #12624f; font-weight: 700; text-decoration: none; }
+    main { padding: 56px 32px; max-width: 1040px; margin: 0 auto; }
+    h1 { font-size: clamp(2rem, 6vw, 4.5rem); line-height: 1.02; margin: 0 0 20px; }
+    p { font-size: 1.12rem; line-height: 1.65; max-width: 760px; }
+    .actions { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 28px; }
+    .button { display: inline-flex; min-height: 44px; align-items: center; padding: 0 18px; border-radius: 8px; background: #164f43; color: white; }
+    section { padding: 36px 0; border-top: 1px solid #dce5df; }
+    @media (max-width: 560px) { header, main { padding-left: 18px; padding-right: 18px; } header { align-items: flex-start; flex-direction: column; gap: 12px; } }
+  </style>
+</head>
+<body>
+  <header>
+    <strong>Fixture Studio</strong>
+    <nav aria-label="Main">
+      <a href="/work.html">Work</a>
+      <a href="/pricing.html">Pricing</a>
+      <a href="/contact.html">Contact</a>
+    </nav>
+  </header>
+  <main>
+    <h1>Design systems for focused product teams</h1>
+    <p>Fixture Studio helps teams ship cleaner pages, sharper navigation, and reliable launch surfaces. This page is intentionally simple, responsive, and link-complete so RDS has a known-good website baseline.</p>
+    <div class="actions">
+      <a class="button" href="/contact.html">Contact the team</a>
+      <a href="/work.html">View work</a>
+    </div>
+    <section id="proof">
+      <h2>What changes</h2>
+      <p>Teams get a compact component system, tested responsive templates, and clear conversion paths that work on desktop and mobile.</p>
+    </section>
+  </main>
+</body>
+</html>

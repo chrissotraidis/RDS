@@ -1,0 +1,255 @@
+#!/usr/bin/env bash
+# bin/rds-notify — out-of-band lifecycle notifications (TD-011).
+#
+# Sends a Telegram message to the operator via Zo's /zo/ask endpoint, using
+# the ambient ZO_CLIENT_IDENTITY_TOKEN. Also emits the same payload to the
+# events.jsonl stream (TD-014) so the dashboard (TD-001) can show what was
+# pushed without scraping Telegram.
+#
+# Usage:
+#   bin/rds-notify <event> [--message=<text>] [--build-id=<id>] [--build-dir=<path>]
+#                  [--preview-url=<url>] [--task=<n>] [--dry-run] [--no-event]
+#
+# Recognized events (with templated default messages):
+#   build_started, site_live, uat_passed, uat_failed,
+#   build_blocked, build_completed, awaiting_review, qa_iteration
+#
+# A custom --message overrides the template. Unknown event names are allowed
+# but require --message.
+#
+# Required env:
+#   ZO_CLIENT_IDENTITY_TOKEN  (set automatically inside Zo agents)
+#
+# Optional env:
+#   RDS_NOTIFY_DISABLED=1     skip the actual Telegram send (event still logged)
+#   RDS_NOTIFY_TIMEOUT=10     curl timeout in seconds (default 10)
+#   RDS_NOTIFY_DEDUPE_DISABLED=1  disable per-build duplicate suppression
+set -euo pipefail
+
+RDS_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+# --- Argument parsing ------------------------------------------------------
+EVENT=""
+MESSAGE=""
+BUILD_ID=""
+BUILD_DIR=""
+PREVIEW_URL=""
+TASK=""
+DRY_RUN=0
+EMIT_EVENT=1
+
+usage() { sed -n '2,28p' "$0"; }
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --message=*)     MESSAGE="${1#--message=}"; shift ;;
+    --message)       MESSAGE="$2"; shift 2 ;;
+    --build-id=*)    BUILD_ID="${1#--build-id=}"; shift ;;
+    --build-id)      BUILD_ID="$2"; shift 2 ;;
+    --build-dir=*)   BUILD_DIR="${1#--build-dir=}"; shift ;;
+    --build-dir)     BUILD_DIR="$2"; shift 2 ;;
+    --preview-url=*) PREVIEW_URL="${1#--preview-url=}"; shift ;;
+    --preview-url)   PREVIEW_URL="$2"; shift 2 ;;
+    --task=*)        TASK="${1#--task=}"; shift ;;
+    --task)          TASK="$2"; shift 2 ;;
+    --dry-run)       DRY_RUN=1; shift ;;
+    --no-event)      EMIT_EVENT=0; shift ;;
+    -h|--help)       usage; exit 0 ;;
+    -*)              echo "ERROR: unknown flag '$1'" >&2; usage; exit 2 ;;
+    *)
+      if [[ -z "$EVENT" ]]; then EVENT="$1"
+      else echo "ERROR: unexpected positional '$1'" >&2; exit 2; fi
+      shift ;;
+  esac
+done
+
+if [[ -z "$EVENT" ]]; then
+  echo "ERROR: rds-notify requires an event name." >&2
+  usage; exit 2
+fi
+
+# --- Resolve build context -------------------------------------------------
+[[ -z "$BUILD_DIR" && -n "${RDS_BUILD_DIR:-}" ]] && BUILD_DIR="$RDS_BUILD_DIR"
+if [[ -z "$BUILD_ID" && -n "$BUILD_DIR" ]]; then
+  BUILD_ID="$(basename "$BUILD_DIR")"
+fi
+BUILD_ID="${BUILD_ID:-unknown}"
+
+if [[ -z "$PREVIEW_URL" && -n "$BUILD_DIR" && -f "$BUILD_DIR/preview-url.txt" ]]; then
+  PREVIEW_URL="$(head -n1 "$BUILD_DIR/preview-url.txt" 2>/dev/null || true)"
+fi
+
+short_build_id() {
+  local id="$1"
+  if [[ ${#id} -le 44 ]]; then
+    printf '%s\n' "$id"
+  else
+    printf '%s…%s\n' "${id:0:28}" "${id: -10}"
+  fi
+}
+
+event_ttl_seconds() {
+  case "$1" in
+    watchdog_triggered) printf '%s\n' "${RDS_NOTIFY_WATCHDOG_TTL:-1200}" ;;
+    build_pending_review|awaiting_review) printf '%s\n' "${RDS_NOTIFY_REVIEW_TTL:-21600}" ;;
+    build_started) printf '%s\n' "${RDS_NOTIFY_STARTED_TTL:-300}" ;;
+    build_approved|build_rejected|build_completed|build_blocked) printf '%s\n' "${RDS_NOTIFY_TERMINAL_TTL:-300}" ;;
+    *) printf '%s\n' "${RDS_NOTIFY_DEFAULT_TTL:-0}" ;;
+  esac
+}
+
+dedupe_key_material() {
+  case "$1" in
+    watchdog_triggered|build_pending_review|awaiting_review|build_started|build_approved|build_rejected|build_completed|build_blocked)
+      printf '%s|%s\n' "$1" "$BUILD_ID" ;;
+    *)
+      printf '%s|%s|%s\n' "$1" "$BUILD_ID" "$MESSAGE" ;;
+  esac
+}
+
+notify_cache_dir() {
+  if [[ -n "$BUILD_DIR" && -d "$BUILD_DIR" ]]; then
+    printf '%s/.notify-cache\n' "$BUILD_DIR"
+  else
+    printf '%s/.notify-cache\n' "$RDS_ROOT"
+  fi
+}
+
+display_id="$(short_build_id "$BUILD_ID")"
+
+# --- Compose default message per event -------------------------------------
+# Use real newlines via printf so the operator-facing Telegram is readable.
+NL=$'\n'
+preview_tail=""
+[[ -n "$PREVIEW_URL" ]] && preview_tail="${NL}Preview: $PREVIEW_URL"
+task_tail=""
+[[ -n "$TASK" ]] && task_tail="${NL}Task: $TASK"
+
+if [[ -z "$MESSAGE" ]]; then
+  case "$EVENT" in
+    build_started)
+      MESSAGE="RDS started: $display_id${task_tail}" ;;
+    site_live)
+      MESSAGE="RDS site live: $display_id${preview_tail}" ;;
+    uat_passed)
+      MESSAGE="RDS QA passed: $display_id${preview_tail}" ;;
+    uat_failed)
+      MESSAGE="RDS QA failed: $display_id${preview_tail}${NL}Autofix/watchdog will continue if enabled." ;;
+    build_blocked)
+      MESSAGE="RDS blocked: $display_id${task_tail}${NL}Retries exhausted; operator review needed." ;;
+    build_completed)
+      MESSAGE="RDS complete: $display_id${preview_tail}" ;;
+    awaiting_review|build_pending_review)
+      MESSAGE="RDS review ready: $display_id${preview_tail}${NL}Approve/reject from the RDS dashboard." ;;
+    build_approved)
+      MESSAGE="RDS approved: $display_id${preview_tail}" ;;
+    build_rejected)
+      MESSAGE="RDS rejected: $display_id${preview_tail}${NL}See dashboard for reason." ;;
+    qa_iteration)
+      MESSAGE="RDS QA iteration ${TASK:-?}: $display_id${preview_tail}" ;;
+    watchdog_triggered)
+      MESSAGE="RDS autofix running: $display_id${task_tail}${NL}I will only ping again if the build changes state or remains stuck." ;;
+    *)
+      echo "ERROR: unknown event '$EVENT' requires --message=<text>" >&2
+      exit 2
+      ;;
+  esac
+fi
+
+# --- Suppress duplicate Telegram noise -------------------------------------
+# The event stream remains append-only, but Telegram should only page on
+# meaningful state transitions. Repeated watchdog cycles and duplicate review
+# resumes are logged as notify_suppressed instead of waking the operator.
+ttl="$(event_ttl_seconds "$EVENT")"
+if [[ -z "${RDS_NOTIFY_DEDUPE_DISABLED:-}" && "$ttl" =~ ^[0-9]+$ && "$ttl" -gt 0 ]]; then
+  cache_dir="$(notify_cache_dir)"
+  mkdir -p "$cache_dir"
+  key="$(dedupe_key_material "$EVENT" | sha1sum | awk '{print $1}')"
+  cache_file="$cache_dir/$key.last"
+  now_epoch="$(date +%s)"
+  last_epoch=""
+  [[ -f "$cache_file" ]] && last_epoch="$(head -n1 "$cache_file" 2>/dev/null || true)"
+  if [[ "$last_epoch" =~ ^[0-9]+$ ]] && (( now_epoch - last_epoch < ttl )); then
+    if [[ "$EMIT_EVENT" -eq 1 ]]; then
+      "$RDS_ROOT/bin/rds-event" "notify_suppressed" \
+        --build-id "$BUILD_ID" ${BUILD_DIR:+--build-dir "$BUILD_DIR"} \
+        --json "$(jq -nc --arg event "$EVENT" --arg reason "duplicate_within_ttl" --argjson ttl "$ttl" --arg msg "$MESSAGE" \
+          '{suppressed_event: $event, reason: $reason, ttl_seconds: $ttl, message: $msg}')" \
+        || true
+    fi
+    printf '[rds-notify suppressed] event=%s build=%s ttl=%ss\n' "$EVENT" "$BUILD_ID" "$ttl"
+    exit 0
+  fi
+fi
+
+# --- Emit event to events.jsonl (TD-014) -----------------------------------
+if [[ "$EMIT_EVENT" -eq 1 ]]; then
+  payload="$(jq -nc \
+    --arg msg "$MESSAGE" \
+    --arg url "$PREVIEW_URL" \
+    --arg task "$TASK" \
+    '{message: $msg}
+     + (if $url  != "" then {preview_url: $url} else {} end)
+     + (if $task != "" then {task: $task} else {} end)')"
+
+  notify_args=(notify --json "$payload")
+  [[ -n "$BUILD_DIR" ]] && notify_args+=(--build-dir "$BUILD_DIR")
+  [[ -n "$BUILD_ID" ]] && notify_args+=(--build-id "$BUILD_ID")
+  # Emit a "notify_<event>" so the consumer can distinguish notification
+  # lines from the underlying lifecycle events.
+  "$RDS_ROOT/bin/rds-event" "notify_${EVENT}" \
+    --json "$(jq -nc --arg msg "$MESSAGE" --arg url "$PREVIEW_URL" --arg task "$TASK" \
+      '{message: $msg}
+       + (if $url  != "" then {preview_url: $url} else {} end)
+       + (if $task != "" then {task: $task} else {} end)')" \
+    ${BUILD_DIR:+--build-dir "$BUILD_DIR"} \
+    ${BUILD_ID:+--build-id "$BUILD_ID"} \
+    || true  # never fail the caller if event logging glitches
+fi
+
+# --- Send via Zo /zo/ask ---------------------------------------------------
+if [[ "$DRY_RUN" -eq 1 || -n "${RDS_NOTIFY_DISABLED:-}" ]]; then
+  printf '[rds-notify dry-run] event=%s build=%s\n%s\n' "$EVENT" "$BUILD_ID" "$MESSAGE"
+  if [[ -n "${cache_file:-}" ]]; then
+    printf '%s\n' "${now_epoch:-$(date +%s)}" > "$cache_file" 2>/dev/null || true
+  fi
+  exit 0
+fi
+
+if [[ -z "${ZO_CLIENT_IDENTITY_TOKEN:-}" ]]; then
+  echo "WARN: ZO_CLIENT_IDENTITY_TOKEN unset — skipping Telegram send." >&2
+  echo "  (event was still logged to events.jsonl)" >&2
+  printf '[rds-notify offline] event=%s build=%s\n%s\n' "$EVENT" "$BUILD_ID" "$MESSAGE"
+  exit 0
+fi
+
+timeout="${RDS_NOTIFY_TIMEOUT:-10}"
+
+# Compose a /zo/ask request that has Zo deliver the message via Telegram
+# verbatim. The wording mirrors the AGE-POC supervisor.sh pattern that's
+# already trusted in operator memory.
+zo_input="Please send this Telegram message to the operator verbatim and respond 'sent' (no commentary, no edits):
+
+${MESSAGE}"
+
+response="$(curl -sS --fail-with-body \
+  --max-time "$timeout" \
+  -H "authorization: ${ZO_CLIENT_IDENTITY_TOKEN}" \
+  -H "content-type: application/json" \
+  -d "$(jq -nc --arg input "$zo_input" '{input: $input}')" \
+  https://api.zo.computer/zo/ask 2>&1)" || {
+    rc=$?
+    echo "ERROR: rds-notify curl to /zo/ask failed (rc=$rc): $response" >&2
+    # Don't fail caller — notification is best-effort.
+    exit 0
+  }
+
+if [[ -n "${cache_file:-}" ]]; then
+  printf '%s\n' "${now_epoch:-$(date +%s)}" > "$cache_file" 2>/dev/null || true
+fi
+
+# Optional: log what Zo replied (for operator-side debugging).
+if [[ -n "${RDS_NOTIFY_VERBOSE:-}" ]]; then
+  printf '[rds-notify] /zo/ask replied: %s\n' "$response" >&2
+fi
+exit 0

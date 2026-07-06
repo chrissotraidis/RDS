@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# bin/rds-approve <build-id> [--by=<name>] [--reason=<text>] — operator approval (TD-033).
+#
+# Marks state.json.review = approved and emits a `build_approved` event.
+# Intended for use after a build reaches `pending_operator_review` and the
+# operator has eyeballed the running app + Playwright artefacts. The
+# corresponding negative path is bin/rds-reject.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck disable=SC1091
+source "$ROOT/bin/lib/common.sh"
+# shellcheck disable=SC1091
+source "$ROOT/bin/lib/state.sh"
+
+BUILD_ID="${1:-}"
+if [[ -z "$BUILD_ID" || "$BUILD_ID" == --* ]]; then
+  echo "Usage: bin/rds-approve <build-id> [--by=<name>] [--reason=<text>]" >&2
+  exit 1
+fi
+shift || true
+
+BY="$(parse_flag --by "$@" || echo "${RDS_OPERATOR:-operator}")"
+REASON="$(parse_flag --reason "$@" || echo "")"
+
+BUILD_DIR="$RDS_BUILDS_DIR/$BUILD_ID"
+[[ -f "$BUILD_DIR/state.json" ]] || { echo "FATAL: no state.json for $BUILD_ID" >&2; exit 1; }
+
+if [[ -x "$ROOT/bin/rds-evidence-ledger" ]]; then
+  "$ROOT/bin/rds-evidence-ledger" "$BUILD_ID" >/dev/null 2>&1 || true
+fi
+TRUTH="$BUILD_DIR/truth.json"
+if [[ -f "$TRUTH" ]]; then
+  verdict="$(jq -r '.verdict // "unknown"' "$TRUTH" 2>/dev/null || echo unknown)"
+  if [[ "$verdict" == "blocked" || "$verdict" == "failed" || "$verdict" == "recovering" || "$verdict" == "building" ]]; then
+    echo "FATAL: refusing approval; canonical truth verdict is '$verdict'" >&2
+    jq -r '(.topBlockers // [])[:5][]? | "- " + (.code // "unknown") + ": " + (.message // "blocked")' "$TRUTH" >&2 || true
+    exit 2
+  fi
+fi
+
+state_set_review "$BUILD_DIR" approved "$BY" "$REASON"
+"$ROOT/bin/rds-event" build_approved \
+  --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+  decided_by="$BY" reason="$REASON" \
+  >/dev/null 2>&1 || true
+
+# Best-effort Telegram ping so the operator sees it on phone too.
+if [[ "${RDS_NOTIFY_ON_REVIEW:-1}" -eq 1 ]]; then
+  "$ROOT/bin/rds-notify" build_approved \
+    --build-id "$BUILD_ID" \
+    --build-dir "$BUILD_DIR" \
+    >/dev/null 2>&1 || true
+fi
+
+echo "[rds-approve] $BUILD_ID approved by $BY"
+exit 0

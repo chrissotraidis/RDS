@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# bin/rds-selftest — RDS testing RDS.
+#
+# Runs a Playwright smoke pass against the Hub dashboard:
+#   - /health, hub render, token bar visibility
+#   - row-click navigation, build view, action endpoint
+#   - artefacts written to builds/_selftest/<ts>/
+#
+# Exits 0 on pass, 1 on test failure, 2 on harness fatal.
+#
+# Usage:
+#   bin/rds-selftest                       # uses RDS_DASHBOARD_URL or http://localhost:4000
+#   RDS_DASHBOARD_URL=https://… bin/rds-selftest
+#
+# Runtime path overrides and RDS_DASHBOARD_TOKEN are auto-loaded from .env.
+# Without a token, the action checks are skipped (still useful as a render smoke).
+# RDS_DASHBOARD_PASSWORD is used for HTTP Basic Auth when the service is
+# configured with the dashboard password gate.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
+
+# Hydrate local runtime path overrides and dashboard credentials from .env so
+# the test writes fixtures where the dashboard reads them.
+if [[ -f "$ROOT/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  . "$ROOT/.env"
+  set +a
+fi
+
+if [[ -z "${RDS_DASHBOARD_PASSWORD:-}" && -f /etc/zo/supervisord-user.conf ]]; then
+  service_env="$(
+    awk '
+      /^\[program:rds\]$/ { seen=1; next }
+      seen && /^environment=/ { print; exit }
+      seen && /^\[program:/ { exit }
+    ' /etc/zo/supervisord-user.conf
+  )"
+  RDS_DASHBOARD_PASSWORD="$(printf '%s\n' "$service_env" | sed -n 's/.*RDS_DASHBOARD_PASSWORD="\([^"]*\)".*/\1/p')"
+  RDS_DASHBOARD_USER="$(printf '%s\n' "$service_env" | sed -n 's/.*RDS_DASHBOARD_USER="\([^"]*\)".*/\1/p')"
+fi
+
+URL="${RDS_DASHBOARD_URL:-http://localhost:4000}"
+
+# If the URL is local, sanity-check that the dashboard is up. For remote URLs,
+# trust the operator and let the Playwright run surface the failure.
+if [[ "$URL" =~ ^http://localhost ]] || [[ "$URL" =~ ^http://127\. ]]; then
+  if ! curl -sS -o /dev/null --max-time 4 "$URL/healthz" >/dev/null 2>&1; then
+    echo "[rds-selftest] dashboard not responding on $URL — start it (or set RDS_DASHBOARD_URL)" >&2
+    exit 2
+  fi
+fi
+
+cd "$ROOT/dashboard"
+
+# Make sure playwright is installed locally; bun install is idempotent.
+if [[ ! -d node_modules/playwright ]]; then
+  /root/.bun/bin/bun install >/dev/null 2>&1 || /root/.bun/bin/bun install
+fi
+
+export RDS_DASHBOARD_URL="$URL"
+export RDS_DASHBOARD_TOKEN="${RDS_DASHBOARD_TOKEN:-}"
+export RDS_DASHBOARD_USER="${RDS_DASHBOARD_USER:-rds}"
+export RDS_DASHBOARD_PASSWORD="${RDS_DASHBOARD_PASSWORD:-}"
+export RDS_ROOT="$ROOT"
+
+exec /root/.bun/bin/bun run tests/selftest.ts

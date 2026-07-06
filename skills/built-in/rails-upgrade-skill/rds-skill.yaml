@@ -1,0 +1,20 @@
+---
+slug: rails-upgrade-skill
+name: Rails upgrade
+status: ready
+default: false
+applies_to:
+- rails-web
+description: Rails version drift and upgrade guidance.
+install:
+  command: bin/rds-skill-materialize rails-upgrade-skill
+verify:
+  command: bin/rds-skill-verify rails-upgrade-skill
+maturity: beta
+category: maintenance
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should
+  understand during stack selection, skill resolution, implementation guidance, or
+  verification.
+source_links:
+- label: guides.rubyonrails.org
+  url: https://guides.rubyonrails.org/

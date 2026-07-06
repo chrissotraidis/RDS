@@ -1,0 +1,146 @@
+#!/usr/bin/env ruby
+# Validate the RDS V1 expansion registry, stack contracts, and skill catalog.
+
+require "json"
+require "yaml"
+
+root = File.expand_path("..", __dir__)
+errors = []
+
+registry_path = File.join(root, "stacks", "registry.yml")
+registry = YAML.load_file(registry_path)
+ready_stacks = registry.fetch("stacks").select { |stack| stack["status"] == "ready" }
+expected_stacks = %w[
+  rails-web nextjs-fullstack python-ai-service astro-thin-web web-3d game-engine
+  game-asset-pipeline mobile-native browser-extension
+]
+
+missing_stacks = expected_stacks - ready_stacks.map { |stack| stack.fetch("slug") }
+errors << "missing ready stacks: #{missing_stacks.join(", ")}" unless missing_stacks.empty?
+
+required_stack_fields = %w[slug name category v1_status language framework scaffold commands ports health_path deploy mockup_analog public_preview_model compatible_skills agent_notes]
+mockup_enum = %w[
+  ui-kit-styleguide single-html-mockup reference-image-plus-scene-spec gameplay-spec
+  screens-folder popup-html-preview asset-target-spec
+]
+preview_enum = %w[live-html static-bundle api-docs device-tunnel download-artifact docs-page report]
+catalog_registry = JSON.parse(File.read(File.join(root, "skills", "registry.json")))
+catalog_slugs = catalog_registry.fetch("skills").map { |skill| skill.fetch("slug") }
+ready_stacks.each do |stack|
+  contract = File.join(root, stack.fetch("contract"))
+  manifest = File.join(root, stack.fetch("manifest"))
+  errors << "missing contract #{stack.fetch("contract")}" unless File.exist?(contract)
+  errors << "missing manifest #{stack.fetch("manifest")}" unless File.exist?(manifest)
+  next unless File.exist?(contract)
+
+  data = YAML.load_file(contract) || {}
+  missing = required_stack_fields.reject { |field| data.key?(field) }
+  errors << "#{stack.fetch("slug")} missing stack.yaml fields: #{missing.join(", ")}" unless missing.empty?
+  errors << "#{stack.fetch("slug")} stack.yaml port range is not 4000-4099" unless data.dig("ports", "range") == [4000, 4099]
+  mockup = data.dig("mockup_analog", "primary")
+  preview = data.dig("public_preview_model", "type")
+  errors << "#{stack.fetch("slug")} invalid mockup_analog.primary: #{mockup.inspect}" unless mockup_enum.include?(mockup)
+  errors << "#{stack.fetch("slug")} invalid public_preview_model.type: #{preview.inspect}" unless preview_enum.include?(preview)
+  declared_skills = Array(data.dig("compatible_skills", "primary")) + Array(data.dig("compatible_skills", "universal"))
+  unknown_skills = declared_skills.uniq - catalog_slugs
+  errors << "#{stack.fetch("slug")} references unknown compatible skills: #{unknown_skills.join(", ")}" unless unknown_skills.empty?
+  required_quality_skills = %w[rds-context7-mount rds-mockup-fidelity rds-secrets-broker rds-eval-harness playwright-mcp]
+  missing_quality = required_quality_skills - declared_skills
+  errors << "#{stack.fetch("slug")} missing default quality skills: #{missing_quality.join(", ")}" unless missing_quality.empty?
+  commands = data["commands"] || {}
+  errors << "#{stack.fetch("slug")} missing commands.test" if commands["test"].to_s.strip.empty?
+end
+
+Dir[File.join(root, "stacks", "*", "manifest.json")].sort.each do |path|
+  data = JSON.parse(File.read(path))
+  errors << "#{path.sub("#{root}/", "")} default_port_range is not 4000-4099" unless data["default_port_range"] == [4000, 4099]
+end
+
+built_in = %w[
+  rds-mockup-fidelity rds-context7-mount rds-secrets-broker rds-usd-validator rds-eval-harness playwright-mcp
+]
+built_in.each do |slug|
+  dir = File.join(root, "skills", "built-in", slug)
+  yaml = File.join(dir, "rds-skill.yaml")
+  agents = File.join(dir, "AGENTS.md")
+  data = File.exist?(yaml) ? YAML.load_file(yaml) : {}
+  errors << "missing built-in skill #{slug}/rds-skill.yaml" unless File.exist?(yaml)
+  errors << "missing built-in skill #{slug}/AGENTS.md" unless File.exist?(agents)
+  errors << "built-in skill #{slug} verify.command missing" if data.dig("verify", "command").to_s.empty?
+  if File.exist?(agents)
+    guide = File.read(agents)
+    errors << "core built-in skill #{slug} guide is too thin" if guide.lines.size < 14
+    errors << "core built-in skill #{slug} guide missing verification section" unless guide.match?(/^Verification:/)
+    errors << "core built-in skill #{slug} guide missing sources section" unless guide.match?(/^Sources:/)
+  end
+end
+
+Dir[File.join(root, "skills", "built-in", "*", "rds-skill.yaml")].sort.each do |yaml|
+  slug = File.basename(File.dirname(yaml))
+  dir = File.dirname(yaml)
+  data = YAML.load_file(yaml) || {}
+  agents = File.join(dir, "AGENTS.md")
+  errors << "built-in skill #{slug} slug mismatch" unless data["slug"] == slug
+  errors << "built-in skill #{slug} must be status=ready" unless data["status"] == "ready"
+  errors << "built-in skill #{slug} AGENTS.md missing" unless File.exist?(agents)
+  errors << "built-in skill #{slug} install.command missing" if data.dig("install", "command").to_s.empty? && data.dig("install", "mode") != "metadata"
+  errors << "built-in skill #{slug} verify.command missing" if data.dig("verify", "command").to_s.empty?
+  if File.exist?(agents)
+    guide = File.read(agents)
+    errors << "built-in skill #{slug} still contains generic curated rationale" if guide.include?("Curated from the RDS V1")
+    errors << "built-in skill #{slug} guide missing implementation contract" unless guide.match?(/^Implementation contract:/)
+    errors << "built-in skill #{slug} guide missing verification section" unless guide.match?(/^Verification:/)
+  end
+  Array(data["source_links"]).each do |link|
+    errors << "built-in skill #{slug} has source link without url" if link["url"].to_s.empty?
+  end
+end
+
+registry_json = catalog_registry
+skill_slugs = registry_json.fetch("skills").map { |skill| skill.fetch("slug") }
+required_skill_slugs = %w[
+  auth-better-auth auth-rails-generator payments-stripe-mcp email-resend solid-queue jobs-trigger-dev
+  observability-sentry-otel llm-vercel-ai-sdk llm-pydantic-ai vector-pgvector search-meilisearch
+  storage-s3-r2 realtime-liveblocks analytics-posthog testing-vitest-playwright deploy-vercel deploy-fly
+  deploy-cloudflare-workers deploy-eas-build deploy-itch-io deploy-chrome-web-store
+  hotwire-stimulus-generator solid-queue-doctor kamal-vps-bootstrap actionmailbox-ingest
+  propshaft-importmap-pin bin-ci-skill rails-upgrade-skill next-devtools-mcp-mount cache-components-enable
+  rsc-boundary-linter drizzle-introspect-skill shadcn-add opennext-cloudflare-deploy
+  partial-prerendering-skill litellm-gateway-skill pydantic-evals mcp-builder arq-jobs-skill
+  sse-streaming-helper dspy-optimizer astro-content-collections-skill starlight-add hono-catchall-mount
+  view-transitions-router gltf-transform-pipeline gltfpack-skill r3f-drei-helpers rapier-physics
+  playwright-canvas-snapshot instances-batcher browser-game-product-quality godot-scene-scaffolder gdunit4-suite godot-web-export
+  godot-4.6-api-reference itch-deploy godot-mcp-pro-mount godogen-bridge gltf-validator-skill
+  bpy-headless-runner model-viewer-preview lod-generator turntable-renderer blender-mcp-mount
+  expo-skills-mount expo-mcp-server eas-build-skill qr-tunnel-publisher react-native-reanimated-helpers
+  expo-router-codegen apple-credentials-skill play-targetsdk-bumper wxt-config-skill content-script-helpers
+  chrome-storage-sync-skill rds-mockup-fidelity rds-context7-mount rds-secrets-broker rds-usd-validator
+  rds-eval-harness
+]
+missing_skills = required_skill_slugs - skill_slugs
+errors << "missing skills: #{missing_skills.join(", ")}" unless missing_skills.empty?
+
+deepened_guides = %w[
+  rds-mockup-fidelity rds-context7-mount rds-secrets-broker rds-usd-validator rds-eval-harness
+  astro-content-collections-skill wxt-config-skill expo-skills-mount godot-scene-scaffolder
+]
+deepened_guides.each do |slug|
+  guide = File.join(root, "skills", "built-in", slug, "AGENTS.md")
+  next unless File.exist?(guide)
+  text = File.read(guide)
+  errors << "deepened skill #{slug} still contains generic curated rationale" if text.include?("Curated from the RDS V1")
+  errors << "deepened skill #{slug} missing implementation contract" unless text.match?(/^Implementation contract:/)
+  errors << "deepened skill #{slug} missing verification section" unless text.match?(/^Verification:/)
+end
+
+if errors.empty?
+  audit = system(File.join(root, "bin", "rds-skill-matrix-audit"), out: $stdout, err: $stderr)
+  errors << "rds-skill-matrix-audit failed" unless audit
+end
+
+if errors.empty?
+  puts "RDS V1 validation passed: #{ready_stacks.length} ready stacks, #{skill_slugs.length} indexed skills."
+else
+  warn errors.join("\n")
+  exit 1
+end

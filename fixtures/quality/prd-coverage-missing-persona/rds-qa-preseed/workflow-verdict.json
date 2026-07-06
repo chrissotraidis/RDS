@@ -1,0 +1,18 @@
+{
+  "status": "pass",
+  "actionGraph": {
+    "firstPageInteractions": [
+      { "label": "Search sources", "tag": "button", "href": null, "outcome": "changed" }
+    ],
+    "sampledRoutes": [
+      {
+        "url": "http://127.0.0.1:47101/sources",
+        "interactions": [
+          { "label": "Search sources", "tag": "button", "href": null, "outcome": "changed" }
+        ]
+      }
+    ]
+  },
+  "scenarioIssues": []
+}
+

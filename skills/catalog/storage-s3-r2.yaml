@@ -1,0 +1,25 @@
+---
+slug: storage-s3-r2
+name: S3/R2 storage
+status: curated
+category: storage
+maturity: stable
+applies_to:
+- rails-web
+- nextjs-fullstack
+- python-ai-service
+- astro-thin-web
+- web-3d
+- game-engine
+- game-asset-pipeline
+- mobile-native
+- browser-extension
+description: S3-compatible object storage, defaulting to Cloudflare R2 for high-egress assets.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: developers.cloudflare.com
+  url: https://developers.cloudflare.com/r2/
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

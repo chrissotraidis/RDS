@@ -1,0 +1,17 @@
+---
+slug: deploy-chrome-web-store
+name: Chrome Web Store deploy
+status: curated
+category: deploy
+maturity: beta
+applies_to:
+- browser-extension
+description: Chrome Web Store artifact and submission handoff metadata.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: developer.chrome.com
+  url: https://developer.chrome.com/docs/webstore/publish
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

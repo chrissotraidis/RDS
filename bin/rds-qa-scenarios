@@ -1,0 +1,463 @@
+#!/usr/bin/env python3
+"""Generate PRD-specific QA scenarios before Scaffold plans implementation."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+from pathlib import Path
+from typing import Any
+
+
+def read_text(path: Path, limit: int = 500_000) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="ignore")[:limit]
+    except Exception:
+        return ""
+
+
+def read_json(path: Path) -> Any:
+    try:
+        return json.loads(read_text(path))
+    except Exception:
+        return {}
+
+
+def slugify(text: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return slug[:48] or "scenario"
+
+
+def expectation_for_promise(text: str) -> dict[str, str]:
+    lower = text.lower()
+    state_words = {
+        "approve": "Approved",
+        "approved": "Approved",
+        "reject": "Rejected",
+        "rejected": "Rejected",
+        "complete": "Completed",
+        "completed": "Completed",
+        "publish": "Published",
+        "published": "Published",
+        "resolve": "Resolved",
+        "resolved": "Resolved",
+        "save": "Saved",
+        "saved": "Saved",
+    }
+    object_terms = [
+        "episode",
+        "request",
+        "order",
+        "application",
+        "source",
+        "job",
+        "lead",
+        "record",
+        "item",
+        "task",
+        "entry",
+    ]
+    for action, state in state_words.items():
+        if re.search(rf"\b{re.escape(action)}\b", lower):
+            for obj in object_terms:
+                if re.search(rf"\b{re.escape(obj)}s?\b", lower):
+                    return {"type": "business-state", "target": obj, "value": state}
+            return {"type": "state-change"}
+    words = re.findall(r"[A-Za-z][A-Za-z0-9-]{3,}", text)
+    stop = {
+        "with", "that", "this", "must", "should", "requires", "visible",
+        "runtime", "evidence", "exists", "placeholder", "only",
+    }
+    terms: list[str] = []
+    for word in words:
+        clean = word.strip("-")
+        if clean.lower() in stop:
+            continue
+        if clean.lower() not in [term.lower() for term in terms]:
+            terms.append(clean)
+        if len(terms) >= 4:
+            break
+    return {"type": "text", "value": "|".join(terms[:4]) or "status"}
+
+
+def source_tokens(text: str) -> set[str]:
+    return set(re.findall(r"[a-z][a-z0-9-]{2,}", text.lower()))
+
+
+def infer_kind(state: dict[str, Any], spec: str) -> str:
+    explicit = str(state.get("app_type") or "").strip().lower().replace("_", "-")
+    if explicit and explicit not in {"auto", "unknown"}:
+        return explicit
+    lower = spec.lower()
+    if any(w in lower for w in ["game", "score", "enemy", "player", "level", "arcade", "puzzle"]):
+        return "game"
+    if any(w in lower for w in ["landing page", "website", "marketing", "portfolio", "hero", "waitlist"]):
+        return "website"
+    return "web-app"
+
+
+def is_turn_based_board_game(spec: str) -> bool:
+    lower = spec.lower()
+    terms = [
+        "board game",
+        "abstract strategy",
+        "strategy game",
+        "turn-based",
+        "two-player",
+        "custodial capture",
+        "legal moves",
+        "grid board",
+        "polis",
+        "chess",
+        "checkers",
+        "go",
+    ]
+    return any(term in lower for term in terms)
+
+
+def source_prd_only(spec: str) -> str:
+    """Remove RDS-generated addenda before extracting user-authored promises."""
+    markers = [
+        "<!-- RDS_TASTE_BRIEF_V1 -->",
+        "## RDS Taste Brief",
+        "## RDS QA Scenarios",
+    ]
+    cut = len(spec)
+    for marker in markers:
+        idx = spec.find(marker)
+        if idx >= 0:
+            cut = min(cut, idx)
+    return spec[:cut]
+
+
+def unwrap_markdown_paragraphs(text: str) -> list[str]:
+    paragraphs: list[str] = []
+    current: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        line = re.sub(r"^>\s?", "", line)
+        line = re.sub(r"^[-*+]\s+", "", line)
+        line = re.sub(r"^\d+[.)]\s+", "", line)
+        if not line:
+            if current:
+                paragraphs.append(" ".join(current))
+                current = []
+            continue
+        if line.startswith("|") or line.startswith("```"):
+            if current:
+                paragraphs.append(" ".join(current))
+                current = []
+            continue
+        current.append(line)
+    if current:
+        paragraphs.append(" ".join(current))
+    return paragraphs
+
+
+def looks_like_code_or_generated_evidence(text: str) -> bool:
+    stripped = text.strip()
+    if re.search(r"(const|let|var|function|return|import|export)\s+[\w{]", stripped):
+        return True
+    if re.search(r"[A-Za-z0-9_]+\([^)]*\)|<[/A-Z][^>]+>|=>|window\.|document\.|markBrowserAction|className=", stripped):
+        return True
+    if stripped.count("`") >= 2 or stripped.count("{") + stripped.count("}") >= 2:
+        return True
+    return False
+
+
+def extract_user_promises(spec: str, limit: int = 5) -> list[str]:
+    candidates: list[str] = []
+    for paragraph in unwrap_markdown_paragraphs(spec):
+        text = re.sub(r"\s+", " ", paragraph).strip()
+        text = re.sub(r"^[^A-Za-z0-9]+", "", text)
+        if len(text) < 48:
+            continue
+        lower = text.lower()
+        if looks_like_code_or_generated_evidence(text):
+            continue
+        if any(token in lower for token in ["rds taste brief", "rds qa scenarios", "classification note for the build pipeline"]):
+            continue
+        if not any(
+            token in lower
+            for token in [
+                "user",
+                "player",
+                "visitor",
+                "operator",
+                "admin",
+                "click",
+                "tap",
+                "play",
+                "create",
+                "save",
+                "search",
+                "filter",
+                "navigate",
+                "must",
+                "should",
+                "requires",
+            ]
+        ):
+            continue
+        sentences = re.split(r"(?<=[.!?])\s+", text)
+        selected = next((s for s in sentences if 48 <= len(s) <= 220 and not looks_like_code_or_generated_evidence(s)), text[:220])
+        selected = selected.strip()
+        if selected and selected not in candidates:
+            candidates.append(selected)
+        if len(candidates) >= limit:
+            break
+    return candidates
+
+
+def route_names(spec: str) -> list[str]:
+    names: list[str] = []
+    for match in re.finditer(r"`(/[A-Za-z0-9_./\-[\]]+)`\s*\|\s*\*\*([^*`|]{3,64})\*\*", spec):
+        label = re.sub(r"\s+", " ", match.group(2)).strip()
+        if label and label not in names:
+            names.append(label)
+    return names[:8]
+
+
+def domain_action_targets(spec: str) -> list[str]:
+    lower = spec.lower()
+    tokens = source_tokens(spec)
+    targets: list[str] = []
+    families = [
+        ({"briefing", "briefingcard", "copilot", "financial", "finance"}, ["Create review packet", "Open full review"]),
+        ({"journal", "decision", "thesis"}, ["Log decision", "Edit note"]),
+        ({"paper-trading", "paper", "prediction", "sandbox"}, ["Submit prediction"]),
+        ({"portfolio", "holding", "holdings"}, ["Save portfolio"]),
+        ({"integration", "credential", "oauth", "connect"}, ["Connect demo integration"]),
+        ({"alert", "alerts", "acknowledged", "feedback", "rationale"}, ["See rationale", "Useful"]),
+        ({"executor", "guardrail", "kill-switch", "strategy"}, ["Save guardrails", "Kill switch"]),
+        ({"approve", "approval", "request", "review"}, ["Approve selected"]),
+        ({"reject", "rejection", "request", "review"}, ["Reject selected"]),
+        ({"export", "report", "download"}, ["Export report"]),
+    ]
+    for required, labels in families:
+        if required & tokens or any(term in lower for term in required):
+            for label in labels:
+                if label not in targets:
+                    targets.append(label)
+    for label in route_names(spec):
+        verb = label.split()[0].lower()
+        if verb in {"daily", "alert", "portfolio", "decision", "paper-trading", "agent", "web3", "review", "integrations"}:
+            continue
+        if label not in targets:
+            targets.append(label)
+    return targets[:8]
+
+
+def primary_dashboard_target(spec: str) -> str:
+    targets = domain_action_targets(spec)
+    if targets:
+        return "|".join(targets[:5])
+    return "Create|Save|Submit|Approve|Reject|Export|Filter|Search"
+
+
+def baseline_scenarios(kind: str, spec: str = "") -> list[dict[str, Any]]:
+    if kind == "game":
+        if is_turn_based_board_game(spec):
+            return [
+                {
+                    "id": "start-play-loop",
+                    "title": "Start and play the core turn loop",
+                    "mustVerify": ["visible start/play affordance", "board is the dominant first-viewport element", "multiple inputs change meaningful game state"],
+                    "actions": [
+                        {"type": "click", "target": "start"},
+                        {"type": "click", "target": "board|cell|piece"},
+                        {"type": "click", "target": "legal move|cell"},
+                    ],
+                    "expectations": [{"type": "state-change"}],
+                    "blockingIfMissing": True,
+                },
+                {
+                    "id": "strategic-feedback",
+                    "title": "Verify turn, legal moves, capture/victory pressure, and idle clarity",
+                    "mustVerify": ["current turn is visible", "selected piece and legal moves are visible", "captures/score/victory pressure or AI-thinking state is visible"],
+                    "actions": [{"type": "wait", "ms": 1200}],
+                    "expectations": [{"type": "visible", "target": "turn|legal|capture|score|victory|ai|thinking"}],
+                    "blockingIfMissing": True,
+                },
+                {
+                    "id": "restart-responsive-board",
+                    "title": "Expose restart and responsive board layout",
+                    "mustVerify": ["restart/reset control exists", "mobile board remains playable", "no clipped or overlapping controls"],
+                    "actions": [{"type": "press", "key": "KeyR"}],
+                    "expectations": [{"type": "text", "value": "restart|reset|new game"}],
+                    "blockingIfMissing": True,
+                },
+            ]
+        return [
+            {
+                "id": "start-play-loop",
+                "title": "Start and play the core loop",
+                "mustVerify": ["visible start/play affordance", "multiple inputs change game state", "controls work on desktop"],
+                "actions": [
+                    {"type": "click", "target": "start"},
+                    {"type": "press", "key": "ArrowRight"},
+                    {"type": "press", "key": "ArrowDown"},
+                    {"type": "press", "key": "Space"},
+                    {"type": "wait", "ms": 700},
+                ],
+                "expectations": [{"type": "state-change"}],
+                "blockingIfMissing": True,
+            },
+            {
+                "id": "progression-pressure-feedback",
+                "title": "Experience pressure, progression, and feedback",
+                "mustVerify": ["score or progress is visible", "hazard/enemy/timer/constraint creates pressure", "actions have visible feedback"],
+                "actions": [{"type": "wait", "ms": 1200}],
+                "expectations": [{"type": "state-change"}],
+                "blockingIfMissing": True,
+            },
+            {
+                "id": "failure-restart-responsive",
+                "title": "Reach or expose win/fail/restart behavior across viewports",
+                "mustVerify": ["restart/failure/win state exists", "mobile layout is usable", "no clipped or overlapping controls"],
+                "actions": [{"type": "press", "key": "KeyR"}],
+                "expectations": [{"type": "text", "value": "restart"}],
+                "blockingIfMissing": True,
+            },
+        ]
+    if kind == "website":
+        return [
+            {
+                "id": "first-screen-offer",
+                "title": "Understand the offer in the first viewport",
+                "mustVerify": ["specific headline", "credible supporting copy", "primary action visible without scrolling"],
+                "expectations": [{"type": "visible", "target": "Get started|Contact|Book|Learn|View"}],
+                "blockingIfMissing": True,
+            },
+            {
+                "id": "cta-navigation",
+                "title": "Click through primary CTA and navigation",
+                "mustVerify": ["CTA is not a no-op", "nav links resolve", "no placeholder or debug links"],
+                "actions": [{"type": "click", "target": "Contact|Book|Demo|Get started|Start"}],
+                "expectations": [{"type": "state-change"}],
+                "blockingIfMissing": True,
+            },
+            {
+                "id": "responsive-polish",
+                "title": "Review desktop and mobile visual composition",
+                "mustVerify": ["mobile has no overflow", "sections are aligned", "visual design is domain-specific"],
+                "expectations": [{"type": "text", "value": "contact"}],
+                "blockingIfMissing": True,
+            },
+        ]
+    return [
+        {
+            "id": "primary-workflow",
+            "title": "Complete the primary workflow",
+            "mustVerify": ["main action is visible", "controls change durable state", "success/error state is shown"],
+            "actions": [{"type": "click", "target": primary_dashboard_target(spec)}],
+            "expectations": [{"type": "state-change"}],
+            "blockingIfMissing": True,
+        },
+        {
+            "id": "secondary-controls",
+            "title": "Exercise search/filter/settings/export-style controls",
+            "mustVerify": ["visible controls are not no-ops", "sample data is realistic", "empty/loading/error states exist"],
+            "actions": [
+                {"type": "click", "target": "Search"},
+                {"type": "click", "target": "Filter|Settings"},
+            ],
+            "expectations": [{"type": "state-change"}],
+            "blockingIfMissing": True,
+        },
+        {
+            "id": "operator-confidence-responsive",
+            "title": "Verify operator confidence and responsive layout",
+            "mustVerify": ["status/history/progress is visible", "mobile layout is usable", "no clipped controls or horizontal overflow"],
+            "expectations": [{"type": "text", "value": "status"}],
+            "blockingIfMissing": True,
+        },
+    ]
+
+
+def scenario_markdown(payload: dict[str, Any]) -> str:
+    lines = [
+        "## RDS QA Scenarios",
+        "",
+        "These scenarios are binding implementation and QA requirements. Do not treat browser boot or a passing unit test as sufficient unless these user-facing paths are implemented and verifiable.",
+        "",
+    ]
+    for scenario in payload["scenarios"]:
+        lines.append(f"### {scenario['title']}")
+        for item in scenario["mustVerify"]:
+            lines.append(f"- {item}")
+        if scenario.get("actions"):
+            lines.append("- QA actions:")
+            for action in scenario["actions"]:
+                target = action.get("target") or action.get("value") or action.get("key") or action.get("ms") or ""
+                lines.append(f"  - {action.get('type')}: {target}")
+        if scenario.get("expectations"):
+            lines.append("- QA expectations:")
+            for expectation in scenario["expectations"]:
+                target = expectation.get("target") or expectation.get("value") or ""
+                lines.append(f"  - {expectation.get('type')}: {target}")
+        lines.append(f"- Blocking if missing: {'yes' if scenario.get('blockingIfMissing') else 'no'}")
+        lines.append("")
+    if payload.get("sourcePromises"):
+        lines.append("### PRD Promises To Preserve")
+        for item in payload["sourcePromises"]:
+            lines.append(f"- {item}")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("build_id")
+    parser.add_argument("--root", default=str(Path(__file__).resolve().parents[1]))
+    args = parser.parse_args()
+
+    root = Path(args.root).resolve()
+    build_dir = root / "builds" / args.build_id
+    spec_path = build_dir / "spec.md"
+    state = read_json(build_dir / "state.json")
+    spec = read_text(spec_path)
+    if not spec:
+        raise SystemExit(f"FATAL: spec missing or empty: {spec_path}")
+
+    kind = infer_kind(state if isinstance(state, dict) else {}, spec)
+    source_spec = source_prd_only(spec)
+    source_promises = extract_user_promises(source_spec)
+    scenarios = baseline_scenarios(kind, spec)
+    for promise in source_promises[:2]:
+        scenarios.append(
+            {
+                "id": f"prd-{slugify(promise)}",
+                "title": f"Verify PRD promise: {promise[:96]}",
+                "mustVerify": [promise, "visible runtime evidence exists", "not implemented as placeholder text only"],
+                "actions": [{"type": "goto", "target": "/"}],
+                "expectations": [expectation_for_promise(promise)],
+                "blockingIfMissing": True,
+            }
+        )
+
+    payload = {
+        "schema": "rds.qa.scenarios.v1",
+        "buildId": args.build_id,
+        "appType": kind,
+        "source": "spec.md",
+        "scenarios": scenarios,
+        "sourcePromises": source_promises,
+    }
+    json_path = build_dir / "qa-scenarios.json"
+    md_path = build_dir / "qa-scenarios.md"
+    json_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    md = scenario_markdown(payload)
+    md_path.write_text(md, encoding="utf-8")
+
+    marker = "## RDS QA Scenarios"
+    if marker not in spec:
+        spec_path.write_text(spec.rstrip() + "\n\n" + md, encoding="utf-8")
+
+    print(json.dumps({"ok": True, "appType": kind, "scenarios": len(scenarios), "path": str(json_path)}))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

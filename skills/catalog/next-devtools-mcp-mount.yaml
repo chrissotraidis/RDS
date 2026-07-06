@@ -1,0 +1,17 @@
+---
+slug: next-devtools-mcp-mount
+name: Next Devtools MCP mount
+status: curated
+category: mcp
+maturity: beta
+applies_to:
+- nextjs-fullstack
+description: Next.js devtools MCP context mount.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: nextjs.org
+  url: https://nextjs.org/docs
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

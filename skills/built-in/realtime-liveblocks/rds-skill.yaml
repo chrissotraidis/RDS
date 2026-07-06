@@ -1,0 +1,21 @@
+---
+slug: realtime-liveblocks
+name: Liveblocks realtime
+status: ready
+default: false
+applies_to:
+- nextjs-fullstack
+- web-3d
+description: Presence and collaborative state via Liveblocks.
+install:
+  command: bin/rds-skill-materialize realtime-liveblocks
+verify:
+  command: bin/rds-skill-verify realtime-liveblocks
+maturity: stable
+category: realtime
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should
+  understand during stack selection, skill resolution, implementation guidance, or
+  verification.
+source_links:
+- label: liveblocks.io
+  url: https://liveblocks.io/docs

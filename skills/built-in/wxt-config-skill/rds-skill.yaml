@@ -1,0 +1,18 @@
+---
+slug: wxt-config-skill
+name: WXT config
+status: ready
+default: false
+applies_to:
+- browser-extension
+description: WXT manifest and config setup for MV3 extensions.
+install:
+  command: bin/rds-skill-materialize wxt-config-skill
+verify:
+  command: bin/rds-skill-verify wxt-config-skill
+maturity: stable
+category: browser-extension
+rationale: Browser-extension builds need MV3 manifest, entrypoint, permission, and packaging choices to be explicit. This skill anchors extension work to WXT conventions and reviewable permissions.
+source_links:
+- label: wxt.dev
+  url: https://wxt.dev/

@@ -1,0 +1,43 @@
+{
+  "id": "game-engine",
+  "name": "Game engine project",
+  "language": "typescript",
+  "runtime": {
+    "bun": ">=1.1.0",
+    "node": ">=20"
+  },
+  "framework": {
+    "name": "html5-canvas-game",
+    "version": "1"
+  },
+  "database": "none",
+  "default_port_range": [
+    4000,
+    4099
+  ],
+  "health_path": "/health.json",
+  "stages": [
+    "intake",
+    "spec",
+    "init",
+    "scaffold",
+    "local-run",
+    "deploy",
+    "qa"
+  ],
+  "init": "stacks/game-engine/init.sh",
+  "local_run": "stacks/game-engine/local-run.sh",
+  "doctor": "stacks/game-engine/doctor.sh",
+  "scaffold_recipe": "game_engine",
+  "service_entrypoint": "bash -c 'exec bun server.ts'",
+  "service_env": {
+    "NODE_ENV": "development",
+    "RDS_RUNTIME": "zo"
+  },
+  "supports_modes": [
+    "green",
+    "brown"
+  ],
+  "status": "ready",
+  "notes": "Ready V1 Phase 1b playable HTML5 canvas game stack. Godot 4.6 native export remains the target upgrade path when a Godot runtime is installed on Zo."
+}

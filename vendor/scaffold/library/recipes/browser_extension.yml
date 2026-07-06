@@ -1,0 +1,86 @@
+name: Browser Extension
+type: browser_extension
+keywords:
+  - browser extension
+  - chrome extension
+  - mv3
+  - wxt
+  - popup
+  - content script
+  - side panel
+description: >
+  Chrome Manifest V3 browser extension built with WXT and TypeScript.
+  Produces popup/background/content entrypoints, a Zo-served popup preview,
+  and a zip artifact for side-loading or Chrome Web Store submission.
+
+framework:
+  primary: WXT
+  manifest: Chrome MV3
+  language: TypeScript
+  runtime: Bun
+  deployment: Zip artifact plus Zo preview page
+
+workflow:
+  capabilities:
+    popup_ui: true
+    content_scripts: true
+    background_worker: true
+    artifact_zip: true
+    native_tests: false
+    database: false
+
+finalization:
+  commands:
+    - bun install
+    - bun run build:extension
+    - bun run package
+  checks:
+    - name: WXT build
+      command: bun run build:extension
+      type: compilation
+      required: true
+    - name: Zip artifact
+      command: test -f .output/rds-extension.zip
+      type: artifact
+      required: true
+
+verification:
+  setup_commands:
+    - bun install
+  boot_command: HOST_PORT=3000 bun preview-server.ts
+  health_checks:
+    - url: "http://localhost:3000/health.json"
+      expected_status: 200
+    - url: "http://localhost:3000/"
+      expected_status: 200
+  test_command: bun run build:extension
+
+sections:
+  - name: Runtime Contract
+    phase: pipeline
+    labels: ["setup", "extension"]
+    description: Keep the generated app a WXT MV3 browser extension.
+    guidance:
+      - Preserve WXT entrypoints for popup, background, content, and options.
+      - Preserve the Zo preview page at / and /health.json.
+      - Preserve zip artifact generation at .output/rds-extension.zip.
+      - Do not require Chrome Web Store publishing during RDS QA.
+
+  - name: Permissions
+    phase: pipeline
+    labels: ["security", "manifest"]
+    description: Keep extension permissions narrow and explicit.
+    guidance:
+      - Prefer activeTab and storage by default.
+      - Add host_permissions only when the PRD requires specific sites.
+      - Document why every permission is needed.
+      - Avoid broad all-site behavior unless explicitly requested.
+
+  - name: Quality
+    phase: pipeline
+    labels: ["qa"]
+    description: Verify the extension builds and the preview artifact is available.
+    guidance:
+      - bun run build:extension must pass.
+      - A side-loadable zip must exist.
+      - The popup preview must render without broken text or layout overflow.

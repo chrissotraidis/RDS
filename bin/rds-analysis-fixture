@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# Regression tests for PRD/front-door analysis: stack, app type, and skills.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+TMP_ROOT="${TMPDIR:-/tmp}/rds-analysis-fixture-$$"
+mkdir -p "$TMP_ROOT"
+
+run_case() {
+  local name="$1" expected_stack="$2" expected_type="$3" expected_skill="$4" text="$5"
+  local source="$TMP_ROOT/$name.md"
+  local out="$TMP_ROOT/$name.json"
+  printf '%s\n' "$text" > "$source"
+  "$ROOT/bin/rds-analyze-source" "$source" --root "$ROOT" --out "$out" >/dev/null
+  local stack app_type
+  stack="$(jq -r '.stack' "$out")"
+  app_type="$(jq -r '.appType' "$out")"
+  if [[ "$stack" != "$expected_stack" ]]; then
+    echo "FATAL: $name expected stack=$expected_stack got=$stack" >&2
+    cat "$out" >&2
+    exit 1
+  fi
+  if [[ "$app_type" != "$expected_type" ]]; then
+    echo "FATAL: $name expected appType=$expected_type got=$app_type" >&2
+    cat "$out" >&2
+    exit 1
+  fi
+  if [[ -n "$expected_skill" ]] && ! jq -e --arg slug "$expected_skill" '.skills | index($slug)' "$out" >/dev/null; then
+    echo "FATAL: $name expected skill=$expected_skill" >&2
+    cat "$out" >&2
+    exit 1
+  fi
+  printf '✓ %-22s stack=%-20s appType=%-14s skill=%s\n' "$name" "$stack" "$app_type" "${expected_skill:-<none>}"
+}
+
+run_case "game-prd" "game-engine" "game" "browser-game-product-quality" \
+'# Neon Maze PRD
+Build a playable arcade browser game. The player moves through levels, earns score, avoids enemies and hazards, has lives, game over, restart, and difficulty progression. Must feel polished and fun.'
+
+run_case "polis-prd" "game-engine" "game" "browser-game-product-quality" \
+'# POLIS Product Requirements
+Polis is a two-player abstract strategy web game reconstructing an ancient board game. Ship a modern ruleset with a grid board, two colors of pieces, custodial capture, legal moves, AI opponent, presets, tutorial, turn state, victory conditions, draw rules, and responsive web-first PWA play.
+
+Non-Goals:
+- Native iOS/Android apps.
+- Online matchmaking.'
+
+run_case "inline-nongoal-game" "game-engine" "game" "browser-game-product-quality" \
+'POLIS is a two-player abstract strategy web game. Non-Goals: Native iOS/Android apps, online matchmaking, and accounts.'
+
+run_case "tetris-clone" "game-engine" "game" "browser-game-product-quality" \
+'Build a clone of Tetris with falling tetrominoes, line clears, score, levels, game over, restart, keyboard controls, touch controls, and polished browser play.'
+
+run_case "missile-command" "game-engine" "game" "browser-game-product-quality" \
+'Create a complete browser-playable arcade game inspired by Missile Command. The player defends cities from enemy missiles, launches interceptors, survives waves, earns score, loses cities, restarts after game over, and plays on desktop and mobile browsers.'
+
+run_case "marketing-prd" "astro-thin-web" "website" "astro-content-collections-skill" \
+'# RDS Launch Website
+Build a marketing site with a strong landing page, SEO, blog-style content, newsletter capture, case studies, responsive sections, and reference screenshots.'
+
+run_case "dashboard-prd" "rails-web" "dashboard" "postgres-mcp" \
+'# Ops Dashboard PRD
+Build an internal operator dashboard for approvals, records, filters, exports, audit history, forms, admin workflow, and Postgres-backed CRUD. Must include success and error states.'
+
+run_case "financial-copilot" "nextjs-fullstack" "dashboard" "rds-eval-harness" \
+'# Master Mold Financial Agent PRD
+Build a personal financial copilot web dashboard with a pre-market briefing, prioritized alert feed, read-only portfolio, decision journal, track record by confidence tier, agent chat, integrations, and a paper-trading sandbox. The paper-trading game rewards calibration and process, but the product is a fintech dashboard and never executes trades.'
+
+run_case "extension-prd" "browser-extension" "web-app" "wxt-config-skill" \
+'# Browser Extension PRD
+Build a Chrome extension using manifest v3 with a popup, content script, browser storage sync, and permissions for selected pages.'
+
+run_case "mobile-prd" "mobile-native" "web-app" "expo-router-codegen" \
+'# Mobile App PRD
+Build an iOS and Android mobile app with Expo and React Native. It needs phone-first navigation, offline-friendly screens, and EAS build readiness.'
+
+run_case "rag-service-prd" "python-ai-service" "web-app" "llm-pydantic-ai" \
+'# RAG Agent Service PRD
+Build a FastAPI Python agent service with Pydantic AI, typed extraction, embeddings, vector search, webhook endpoints, and evaluation criteria.'
+
+echo "Analysis fixtures passed."
+echo "Artifacts: $TMP_ROOT"

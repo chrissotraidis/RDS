@@ -1,0 +1,18 @@
+---
+slug: rds-eval-harness
+name: RDS eval harness
+status: ready
+default: true
+applies_to:
+- universal
+description: Records regression/eval fixture expectations for agentic or LLM-backed builds.
+install:
+  mode: metadata
+verify:
+  command: skills/built-in/rds-eval-harness/scripts/verify.sh
+maturity: operational
+category: verification
+rationale: Default eval-capable skill for agentic builds because LLM features need regression fixtures, not only visual smoke checks.
+source_links:
+- label: Ragas evals
+  url: https://docs.ragas.io/

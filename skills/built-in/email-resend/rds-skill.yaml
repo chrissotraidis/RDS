@@ -1,0 +1,23 @@
+---
+slug: email-resend
+name: Resend email
+status: ready
+default: false
+applies_to:
+- rails-web
+- nextjs-fullstack
+- python-ai-service
+- astro-thin-web
+description: Adds the transactional email implementation contract.
+install:
+  command: bin/rds-skill-materialize email-resend
+verify:
+  command: bin/rds-skill-verify email-resend
+maturity: operational
+category: email
+rationale: Transactional email needs explicit sender/domain assumptions and nonblocking failure behavior. This skill standardizes how RDS wires or stubs email.
+source_links:
+- label: Resend Docs
+  url: https://resend.com/docs
+- label: Resend API Reference
+  url: https://resend.com/docs/api-reference

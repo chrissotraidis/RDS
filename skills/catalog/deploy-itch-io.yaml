@@ -1,0 +1,17 @@
+---
+slug: deploy-itch-io
+name: itch.io deploy
+status: curated
+category: deploy
+maturity: beta
+applies_to:
+- game-engine
+description: itch.io web game artifact upload metadata.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: itch.io
+  url: https://itch.io/docs/butler/
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

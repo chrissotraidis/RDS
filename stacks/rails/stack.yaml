@@ -1,0 +1,60 @@
+---
+slug: rails-web
+runtime_id: rails
+name: Rails business web app
+description: Server-rendered, database-backed Rails app with Hotwire, jobs, forms,
+  dashboards, and PostgreSQL.
+category: server-rendered-web
+v1_status: ship
+priority: 1
+language:
+  primary: ruby
+  versions:
+    ruby: 4.0.1
+framework:
+  name: rails
+  version: '8.0'
+scaffold:
+  command: bin/rds-rails-init
+  template_source: vendor/rails-starter
+commands:
+  install: bundle install
+  run: bin/rails server -b 0.0.0.0 -p ${HOST_PORT}
+  test: bin/rails test
+  lint: bin/rubocop
+  doctor: stacks/rails/doctor.sh
+ports:
+  range:
+  - 4000
+  - 4099
+health_path: "/up"
+deploy:
+  preview_on_zo: durable-zo-http-service
+  default_external: kamal2-hetzner
+  alternates:
+  - fly
+  - hatchbox
+  - render
+  - railway
+  - zo
+mockup_analog:
+  primary: ui-kit-styleguide
+  artifacts:
+  - app/views/
+  - app/assets/stylesheets/
+public_preview_model:
+  type: live-html
+compatible_skills:
+  primary:
+  - hotwire-stimulus-generator
+  universal:
+  - rds-context7-mount
+  - rds-secrets-broker
+  - rds-mockup-fidelity
+  - rds-eval-harness
+  - playwright-mcp
+agent_notes:
+  primary: claude-code
+  codex_role: Fan-out tests and surgical fixes.
+aliases:
+- rails

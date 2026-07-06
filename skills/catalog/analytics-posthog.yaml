@@ -1,0 +1,24 @@
+---
+slug: analytics-posthog
+name: PostHog analytics
+status: curated
+category: analytics
+maturity: stable
+applies_to:
+- rails-web
+- nextjs-fullstack
+- python-ai-service
+- astro-thin-web
+- web-3d
+- game-engine
+- mobile-native
+- browser-extension
+description: Product analytics and event capture capability.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: posthog.com
+  url: https://posthog.com/docs
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

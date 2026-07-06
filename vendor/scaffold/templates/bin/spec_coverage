@@ -1,0 +1,858 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# bin/spec_coverage — Cross-reference spec.md requirements against tasks.json
+#
+# Extracts testable requirements from spec.md (GIVEN/WHEN/THEN scenarios,
+# entity attributes, business rules) and fuzzy-matches them against tasks.json
+# to produce a coverage report.
+#
+# Usage:
+#   bin/spec_coverage                        # Print coverage report
+#   bin/spec_coverage --json                 # Output as JSON
+#   bin/spec_coverage --up-to 8             # Evaluate progress through task 8
+#   bin/spec_coverage --enforce-final       # Enforce final-project threshold
+#   bin/spec_coverage --fail-under 90       # Exit 1 if effective coverage < 90%
+
+require "json"
+require "optparse"
+require "set"
+require "yaml"
+
+SPEC_FILE = "spec.md"
+TASKS_FILE = "tasks.json"
+CONFIG_FILE = "config.yml"
+DETAIL_DIR = ".scaffold/task-details"
+REQUIREMENT_REF_PATTERN = /\bREQ-[A-Z0-9-]+\b(?:#[A-Za-z0-9:_-]+)?/
+FIELD_SECTION_PATTERN = /\b(fields?|properties|attributes|schema|data model|object shape|models?|entities?|catalog)\b/i
+RULE_SECTION_PATTERN = /\b(business|invariant|rule|rules|calculation|formula|acceptance criteria)\b/i
+RULE_CANDIDATE_SECTION_PATTERN = /\b(system behaviors|external connections|security|privacy|logic)\b/i
+DEFERRED_SECTION_PATTERN = /\b(future considerations|deferred)\b/i
+NON_SCORING_SECTION_PATTERN = /\btesting strategy|test strategy\b/i
+NON_NORMATIVE_CALLOUT_PATTERN = /^\s*>\s*\[!(?:IDEA|QUESTION|PLACEHOLDER)\]/i
+ATTRIBUTE_CONTAINER_PATTERN = /\b(attributes?|fields?|properties?|columns?)\b/i
+RULE_CONTAINER_PATTERN = /\b(business rules?|invariants?|rules?|calculations?|formula|polic(?:y|ies))\b/i
+NON_RULE_LABELS = %w[example examples input output description attributes relationships].to_set
+GENERIC_ENTITY_HEADINGS = %w[
+  overview requirement requirements user journeys business rules rules entities models schema
+  data model object shape features feature views interfaces security privacy system behaviors
+  external connections logic calculations testing strategy
+].to_set
+
+def load_tasks
+  raw = JSON.parse(File.read(TASKS_FILE, encoding: "utf-8"))
+  if raw.is_a?(Hash) && raw["schema_version"] == 2 && raw["tasks"].is_a?(Array)
+    raw["tasks"]
+  elsif raw.is_a?(Array)
+    raw
+  else
+    abort "Invalid tasks.json: expected array or schema v2 wrapper"
+  end
+end
+
+def load_config
+  return {} unless File.exist?(CONFIG_FILE)
+
+  YAML.safe_load(File.read(CONFIG_FILE, encoding: "utf-8"), aliases: false) || {}
+rescue Psych::SyntaxError
+  {}
+end
+
+def load_prepared_detail(position)
+  path = File.join(DETAIL_DIR, "#{position}.json")
+  return {} unless File.exist?(path)
+
+  JSON.parse(File.read(path, encoding: "utf-8"))
+rescue JSON::ParserError
+  {}
+end
+
+def parse_table_row(line)
+  stripped = line.to_s.strip
+  return [] unless stripped.start_with?("|")
+
+  stripped.sub(/\A\|/, "").sub(/\|\z/, "").split("|").map { |cell| cell.strip }
+end
+
+def extract_requirement_refs(text)
+  text.to_s.scan(REQUIREMENT_REF_PATTERN).uniq
+end
+
+def table_separator?(line)
+  line.to_s.strip.match?(/\A\|?\s*:?-{3,}:?(?:\s*\|\s*:?-{3,}:?)+\s*\|?\z/)
+end
+
+def field_section_heading?(heading)
+  heading.to_s.sub(/\A\d+(?:\.\d+)*\.?\s*/, "").match?(FIELD_SECTION_PATTERN)
+end
+
+def rule_section_heading?(heading)
+  heading.to_s.sub(/\A\d+(?:\.\d+)*\.?\s*/, "").match?(RULE_SECTION_PATTERN)
+end
+
+def rule_candidate_section_heading?(heading)
+  normalized = heading.to_s.sub(/\A\d+(?:\.\d+)*\.?\s*/, "")
+  normalized.match?(RULE_SECTION_PATTERN) || normalized.match?(RULE_CANDIDATE_SECTION_PATTERN)
+end
+
+def deferred_section_heading?(heading)
+  heading.to_s.sub(/\A\d+(?:\.\d+)*\.?\s*/, "").match?(DEFERRED_SECTION_PATTERN)
+end
+
+def singularize(word)
+  return word[0..-4] + "y" if word.end_with?("ies") && word.length > 4
+  return word[0..-2] if word.end_with?("s") && !word.end_with?("ss")
+
+  word
+end
+
+def canonical_entity_name(raw)
+  heading = raw.to_s.gsub(/[`*]/, "").split(":").first.to_s.strip
+  heading = heading.sub(/\s+\([^)]*\)\z/, "")
+  return nil if heading.empty?
+  return nil if field_section_heading?(heading) || rule_section_heading?(heading)
+
+  words = heading.scan(/[A-Za-z][A-Za-z0-9_]*/)
+  return nil if words.empty? || words.size > 4
+
+  normalized = words.map { |word| singularize(word) }
+  return nil if normalized.map(&:downcase).all? { |word| GENERIC_ENTITY_HEADINGS.include?(word.downcase) }
+
+  normalized.map { |word| word[0].upcase + word[1..].to_s }.join
+end
+
+def field_like_label?(label)
+  cleaned = label.to_s.gsub(/[`*]/, "").strip
+  return false if cleaned.empty? || cleaned.length > 48
+  return false if cleaned.match?(/[+%=<>]/)
+
+  words = cleaned.scan(/[A-Za-z][A-Za-z0-9_-]*/)
+  return false if words.empty? || words.size > 5
+
+  generic = %w[description details examples behavior validation note notes rules constraints]
+  words.any? { |word| !generic.include?(word.downcase) }
+end
+
+def scan_spec_entries(spec_text)
+  entries = []
+  headings = {}
+  in_code_fence = false
+
+  spec_text.each_line do |line|
+    stripped = line.rstrip
+
+    if stripped.match?(/^\s*```/)
+      in_code_fence = !in_code_fence
+      next
+    end
+    next if in_code_fence
+
+    heading_match = stripped.match(/^(#+)\s+(.+)$/)
+    if heading_match
+      level = heading_match[1].length
+      text = heading_match[2].strip
+      headings.keys.select { |key| key >= level }.each { |key| headings.delete(key) }
+      headings[level] = text
+      entries << {
+        line: line,
+        stripped: stripped,
+        indent: 0,
+        heading_level: level,
+        heading_text: text,
+        headings: headings.dup
+      }
+      next
+    end
+
+    entries << {
+      line: line,
+      stripped: stripped,
+      indent: line[/\A\s*/].to_s.length,
+      heading_level: nil,
+      heading_text: nil,
+      headings: headings.dup
+    }
+  end
+
+  entries
+end
+
+def section_path(entry)
+  entry[:headings].keys.sort.map { |level| entry[:headings][level] }
+end
+
+def refs_for_entry(entry)
+  extract_requirement_refs(section_path(entry).join(" ")) | extract_requirement_refs(entry[:stripped])
+end
+
+def active_entry?(entry)
+  return false if entry[:stripped].match?(NON_NORMATIVE_CALLOUT_PATTERN)
+  return false if section_path(entry).any? { |heading| heading.to_s.match?(NON_SCORING_SECTION_PATTERN) }
+
+  !section_path(entry).any? { |heading| deferred_section_heading?(heading) }
+end
+
+def in_field_area?(entry)
+  section_path(entry).any? { |heading| field_section_heading?(heading) }
+end
+
+def in_rule_area?(entry)
+  section_path(entry).any? { |heading| rule_candidate_section_heading?(heading) }
+end
+
+def normalize_attribute_name(raw)
+  cleaned = raw.to_s.gsub(/[`*]/, "").strip
+  return nil if cleaned.empty?
+
+  cleaned = cleaned.split(":").first.to_s.strip
+  cleaned = cleaned.sub(/\s+\([^)]*\)\z/, "")
+  return nil unless field_like_label?(cleaned)
+
+  cleaned
+end
+
+def parse_attribute_candidates(text)
+  source = text.to_s.strip
+  return [] if source.empty?
+
+  source = source.sub(/\A(?:Attributes?|Fields?|Properties?|Columns?)\s*:\s*/i, "").strip
+  return [] if source.empty?
+
+  if source.include?(":")
+    normalized = normalize_attribute_name(source.split(":").first)
+    return normalized ? [normalized] : []
+  end
+
+  if source.include?(",")
+    candidates = source.split(",").map { |token| normalize_attribute_name(token) }.compact.uniq
+    return candidates if candidates.any?
+  end
+
+  code_fields = source.scan(/`([\w_]+)`/).flatten
+  return code_fields unless code_fields.empty?
+
+  normalized = normalize_attribute_name(source)
+  normalized ? [normalized] : []
+end
+
+def entity_bullet_name(entries, index)
+  entry = entries[index]
+  return nil if entry[:heading_level]
+  return nil unless active_entry?(entry) && in_field_area?(entry)
+
+  match = entry[:stripped].match(/^\s*[-*]\s+(.+)$/)
+  return nil unless match
+
+  label = match[1].strip
+  return nil if label.include?(":")
+
+  entity = canonical_entity_name(label)
+  return nil unless entity
+
+  cursor = index + 1
+  while cursor < entries.length
+    next_entry = entries[cursor]
+    cursor += 1
+    next unless active_entry?(next_entry)
+    break if next_entry[:heading_level]
+    next if next_entry[:stripped].strip.empty?
+    break if next_entry[:indent] <= entry[:indent]
+
+    return entity if next_entry[:stripped].match?(/^\s*[-*]\s*(?:Description|Attributes?|Relationships?|Business rules?)\b/i)
+  end
+
+  nil
+end
+
+def nested_bullet_container?(entries, index)
+  entry = entries[index]
+  return false if entry[:heading_level]
+
+  cursor = index + 1
+  while cursor < entries.length
+    next_entry = entries[cursor]
+    cursor += 1
+    next unless active_entry?(next_entry)
+    break if next_entry[:heading_level]
+    next if next_entry[:stripped].strip.empty?
+    break if next_entry[:indent] <= entry[:indent]
+
+    return true if next_entry[:stripped].match?(/^\s*[-*]\s+/)
+  end
+
+  false
+end
+
+def extract_scenarios(spec_text)
+  scenarios = []
+  current_section = "Unknown"
+
+  scan_spec_entries(spec_text).each do |entry|
+    current_section = section_path(entry).join(" > ") if entry[:heading_level]
+    next unless active_entry?(entry)
+
+    stripped = entry[:stripped].strip.sub(/^[-*]\s*/, "")
+    if stripped.match?(/^GIVEN\b/i)
+      scenarios << {
+        id: "SCENARIO-#{scenarios.size + 1}",
+        type: "scenario",
+        section: current_section,
+        text: stripped,
+        requirement_refs: refs_for_entry(entry),
+        covered: false,
+        covered_by: []
+      }
+    elsif stripped.match?(/^(?:WHEN|THEN|AND)\b/i) && scenarios.last
+      scenarios.last[:text] += " #{stripped}"
+    end
+  end
+  scenarios
+end
+
+def extract_entity_attributes(spec_text)
+  attributes = []
+  seen = Set.new
+  current_entity = nil
+  attribute_indent = nil
+  in_attribute_block = false
+  entries = scan_spec_entries(spec_text)
+  i = 0
+
+  add_attribute = lambda do |entity, attribute, text, requirement_refs = []|
+    attr_name = normalize_attribute_name(attribute)
+    return if attr_name.to_s.empty?
+
+    entity_name = entity || "Generic"
+    key = [entity_name, attr_name.downcase]
+    return if seen.include?(key)
+
+    seen << key
+    attributes << {
+      id: "ATTR-#{entity_name}-#{attr_name.gsub(/\W+/, '_')}",
+      type: "attribute",
+      entity: entity_name,
+      attribute: attr_name,
+      text: text.to_s.strip,
+      requirement_refs: Array(requirement_refs).map(&:to_s).map(&:strip).reject(&:empty?).uniq,
+      covered: false,
+      covered_by: []
+    }
+  end
+
+  while i < entries.length
+    entry = entries[i]
+
+    unless active_entry?(entry)
+      i += 1
+      next
+    end
+
+    if entry[:heading_level]
+      if in_field_area?(entry)
+        current_entity = canonical_entity_name(entry[:heading_text]) if entry[:heading_level] >= 3
+      else
+        current_entity = nil
+      end
+      in_attribute_block = false
+      attribute_indent = nil
+      i += 1
+      next
+    end
+
+    stripped = entry[:stripped].strip
+    unless in_field_area?(entry)
+      current_entity = nil
+      in_attribute_block = false
+      attribute_indent = nil
+      i += 1
+      next
+    end
+
+    entity_name = entity_bullet_name(entries, i)
+    if entity_name
+      current_entity = entity_name
+      in_attribute_block = false
+      attribute_indent = nil
+      i += 1
+      next
+    end
+
+    if stripped.start_with?("|") && entries[i + 1] && table_separator?(entries[i + 1][:stripped])
+      headers = parse_table_row(stripped).map(&:downcase)
+      field_idx = headers.index { |header| header.match?(/\b(field|property|attribute|column|name|key)\b/) }
+
+      if field_idx
+        i += 2
+        while i < entries.length && entries[i][:stripped].strip.start_with?("|")
+          cells = parse_table_row(entries[i][:stripped])
+          label = cells[field_idx].to_s
+          entity = current_entity || canonical_entity_name(headers.join(" "))
+          add_attribute.call(entity, label, entries[i][:stripped], refs_for_entry(entries[i])) if field_like_label?(label)
+          i += 1
+        end
+        next
+      end
+    end
+
+    if current_entity && (match = stripped.match(/^[*-]\s*(?:Attributes?|Fields?|Properties?|Columns?)\s*:\s*(.*)$/i))
+      inline = match[1].to_s.strip
+      parse_attribute_candidates(inline).each { |candidate| add_attribute.call(current_entity, candidate, stripped, refs_for_entry(entry)) }
+      in_attribute_block = true
+      attribute_indent = entry[:indent]
+      i += 1
+      next
+    end
+
+    if current_entity && stripped.match?(/^[*-]\s*(?:Relationships?|Business rules?|Description)\b/i)
+      in_attribute_block = false
+      attribute_indent = nil
+      i += 1
+      next
+    end
+
+    if current_entity && in_attribute_block
+      if stripped.match?(/^[*-]\s+/) && attribute_indent && entry[:indent] <= attribute_indent
+        in_attribute_block = false
+        attribute_indent = nil
+        next
+      end
+
+      if (match = stripped.match(/^[*-]\s*(.+)$/))
+        parse_attribute_candidates(match[1]).each { |candidate| add_attribute.call(current_entity, candidate, stripped, refs_for_entry(entry)) }
+      elsif (match = stripped.match(/^`([\w_]+)`/))
+        add_attribute.call(current_entity, match[1], stripped, refs_for_entry(entry))
+      end
+    end
+
+    i += 1
+  end
+  attributes
+end
+
+def extract_business_rules(spec_text)
+  rules = []
+  entries = scan_spec_entries(spec_text)
+  in_rule_block = false
+  rule_indent = nil
+  current_entity = nil
+
+  entries.each_with_index do |entry, idx|
+    next unless active_entry?(entry)
+
+    if entry[:heading_level]
+      in_rule_block = in_rule_area?(entry)
+      rule_indent = nil
+      current_entity = in_field_area?(entry) ? canonical_entity_name(entry[:heading_text]) : nil
+      next
+    end
+
+    stripped = entry[:stripped].strip
+    next if stripped.empty?
+
+    entity_name = entity_bullet_name(entries, idx)
+    current_entity = entity_name if entity_name
+
+    if current_entity && stripped.match?(/^[*-]\s*(?:Business rules?|Invariants?|Rules?)\s*:\s*(.*)$/i)
+      inline = stripped.sub(/^[*-]\s*(?:Business rules?|Invariants?|Rules?)\s*:\s*/i, "").strip
+      unless inline.empty?
+        rules << {
+          id: "RULE-#{rules.size + 1}",
+          type: "business_rule",
+          text: inline,
+          full_text: stripped,
+          requirement_refs: refs_for_entry(entry),
+          covered: false,
+          covered_by: []
+        }
+      end
+      in_rule_block = true
+      rule_indent = entry[:indent]
+      next
+    end
+
+    if current_entity && stripped.match?(/^[*-]\s*(?:Attributes?|Relationships?|Description)\b/i)
+      in_rule_block = false if rule_indent
+      rule_indent = nil
+      next
+    end
+
+    next unless in_rule_area?(entry) || in_rule_block
+
+    if in_rule_block && stripped.match?(/^[*-]\s+/) && rule_indent && entry[:indent] <= rule_indent
+      in_rule_block = false
+      rule_indent = nil
+      next unless in_rule_area?(entry)
+    end
+
+    rule_text =
+      if (match = stripped.match(/^\s*[-*]\s*\*\*(.+?)\*\*/))
+        match[1]
+      elsif (match = stripped.match(/^\s*[-*]\s*(.+)$/))
+        match[1].strip
+      end
+
+    next unless rule_text
+
+    label = rule_text.split(":").first.to_s.strip.downcase
+    next if NON_RULE_LABELS.include?(label)
+    next if rule_text.match?(/\[!(?:IDEA|QUESTION|PLACEHOLDER|WARNING|NOTE)\]/i)
+    next if rule_text.match?(/\bdeferred\b|\bfuture release\b|\blater releases?\b/i)
+    next if nested_bullet_container?(entries, idx) && rule_text.end_with?(":")
+    next if rule_text.match?(/\A[A-Z][A-Za-z0-9\/&() +_-]{2,}\z/)
+
+    rules << {
+      id: "RULE-#{rules.size + 1}",
+      type: "business_rule",
+      text: rule_text.strip,
+      full_text: stripped,
+      requirement_refs: refs_for_entry(entry),
+      covered: false,
+      covered_by: []
+    }
+  end
+  rules
+end
+
+STOP_WORDS = %w[
+  the and for with from that this have been will
+  when then given should must each also
+  user data type name field value
+].to_set
+
+def clause_terms(text)
+  text.to_s.downcase.scan(/\b\w{4,}\b/).uniq - STOP_WORDS.to_a
+end
+
+def extract_scenario_clauses(scenario_text)
+  clauses = { given: [], when: [], then: [] }
+  current_key = nil
+
+  scenario_text.split(/\b(GIVEN|WHEN|THEN)\b/i).each do |part|
+    keyword = part.strip.downcase
+    if %w[given when then].include?(keyword)
+      current_key = keyword.to_sym
+      next
+    end
+
+    next unless current_key
+
+    cleaned = part.gsub(/\bAND\b/i, " ").strip
+    clauses[current_key] << cleaned unless cleaned.empty?
+  end
+
+  clauses.transform_values { |parts| parts.join(" ").strip }
+end
+
+def scenario_covered?(scenario_text, task_text)
+  clauses = extract_scenario_clauses(scenario_text)
+  given_terms = clause_terms(clauses[:given])
+  when_terms = clause_terms(clauses[:when])
+  then_terms = clause_terms(clauses[:then])
+  all_terms = (given_terms + when_terms + then_terms).uniq
+
+  if when_terms.empty? && then_terms.empty?
+    terms = clause_terms(scenario_text)
+    return false if terms.empty?
+
+    matches = terms.count { |term| task_text.include?(term) }
+    return matches >= [2, (terms.size * 0.4).ceil].max
+  end
+
+  when_ok = when_terms.empty? || when_terms.any? { |term| task_text.include?(term) }
+  then_ok = then_terms.empty? || then_terms.any? { |term| task_text.include?(term) }
+  return false unless when_ok && then_ok
+
+  all_terms.count { |term| task_text.include?(term) } >= 2
+end
+
+def task_requirement_refs(task, detail)
+  refs = []
+  refs.concat(Array(task["requirement_refs"]))
+  refs.concat(Array(detail["requirement_refs"]))
+  refs.concat(Array(detail.dig("task_metadata", "requirement_refs")))
+  refs.concat(Array(detail["acceptance_criteria"]).flat_map { |criterion| Array(criterion["requirement_refs"]) })
+  refs.map(&:to_s).map(&:strip).reject(&:empty?).uniq
+end
+
+def match_requirements_to_tasks(requirements, tasks)
+  tasks.each do |task|
+    detail = load_prepared_detail(task["position"])
+    explicit_refs = task_requirement_refs(task, detail)
+    task_text = [
+      task["title"],
+      task["done_when"],
+      task["user_story"],
+      task["section_ref"],
+      Array(task["requirement_refs"]).join(" "),
+      Array(task["capabilities_required"]).join(" "),
+      Array(task["entities_touched"]).join(" "),
+      Array(task["ui_actions"]).join(" "),
+      Array(task["sensitive_events"]).join(" "),
+      Array(task["operational_prerequisites"]).join(" "),
+      detail["description"],
+      detail["runbook"],
+      (detail["acceptance_criteria"] || []).map { |criterion| criterion.values.join(" ") }.join(" ")
+    ].compact.join(" ").downcase
+
+    requirements.each do |req|
+      covered = false
+
+      req_refs = Array(req[:requirement_refs]).map(&:to_s).map(&:strip).reject(&:empty?).uniq
+      covered = (req_refs & explicit_refs).any? if req_refs.any? && explicit_refs.any?
+
+      unless covered
+        covered = case req[:type]
+        when "scenario"
+          scenario_covered?(req[:text], task_text)
+        when "attribute"
+          attr_term = req[:attribute].to_s.downcase
+          entity_term = req[:entity].to_s.downcase
+          next false if attr_term.empty?
+
+          entity_present = entity_term.empty? || entity_term == "generic" || task_text.include?(entity_term)
+          schema_present = task_text.match?(/\b(model|schema|migration|column|field|fields|attribute|attributes)\b/)
+
+          entity_present && (task_text.include?(attr_term) || (entity_term != "generic" && schema_present))
+        when "business_rule"
+          terms = req[:text].downcase.scan(/\b\w{4,}\b/).uniq - STOP_WORDS.to_a
+          next if terms.empty?
+
+          matches = terms.count { |term| task_text.include?(term) }
+          matches >= [1, (terms.size * 0.4).ceil].max
+        else
+          false
+        end
+      end
+
+      next unless covered
+
+      req[:covered] = true
+      req[:covered_by] << task["position"]
+    end
+  end
+end
+
+def deep_dup_requirements(requirements)
+  Marshal.load(Marshal.dump(requirements))
+end
+
+def classify_requirements(all_requirements, scoped_requirements, up_to)
+  all_index = all_requirements.to_h { |req| [req[:id], req] }
+  scoped_index = scoped_requirements.to_h { |req| [req[:id], req] }
+
+  covered = []
+  future_owned = []
+  uncovered = []
+
+  all_requirements.each do |req|
+    scoped = scoped_index.fetch(req[:id])
+    full = all_index.fetch(req[:id])
+
+    if scoped[:covered]
+      covered << scoped
+    elsif !up_to.nil? && full[:covered_by].any? { |pos| pos > up_to }
+      future_owned << full
+    else
+      uncovered << full
+    end
+  end
+
+  [covered, future_owned, uncovered]
+end
+
+def format_requirement_label(req)
+  text = req[:text] || req[:full_text] || ""
+  "#{req[:id]}: #{text[0..100]}"
+end
+
+def print_requirement_examples(title, requirements, limit:, up_to: nil)
+  return if requirements.empty?
+
+  puts title
+  requirements.first(limit).each do |req|
+    line = "  #{format_requirement_label(req)}"
+    if up_to && req[:covered_by]
+      later_positions = req[:covered_by].select { |pos| pos > up_to }
+      line += " (later task(s): #{later_positions.join(', ')})" if later_positions.any?
+    end
+    puts line
+  end
+  puts
+end
+
+options = {
+  json: false,
+  fail_under: nil,
+  up_to: nil,
+  enforce_final: false,
+  verbose: false
+}
+
+OptionParser.new do |opts|
+  opts.banner = "Usage: bin/spec_coverage [options]"
+  opts.on("--json", "Output JSON") { options[:json] = true }
+  opts.on("--fail-under PERCENT", Float, "Exit 1 if effective coverage is below percent") { |v| options[:fail_under] = v }
+  opts.on("--up-to POSITION", Integer, "Evaluate progress through task POSITION") { |v| options[:up_to] = v }
+  opts.on("--enforce-final", "Apply final-project threshold semantics") { options[:enforce_final] = true }
+  opts.on("--verbose", "Print full uncovered requirement listings") { options[:verbose] = true }
+end.parse!(ARGV)
+
+abort "#{SPEC_FILE} not found" unless File.exist?(SPEC_FILE)
+abort "#{TASKS_FILE} not found" unless File.exist?(TASKS_FILE)
+
+config = load_config
+coverage_policy = config["coverage_policy"] || {}
+
+spec_text = File.read(SPEC_FILE, encoding: "utf-8")
+tasks = load_tasks
+
+all_requirements = extract_scenarios(spec_text) + extract_entity_attributes(spec_text) + extract_business_rules(spec_text)
+
+if all_requirements.empty?
+  puts "No testable requirements found in #{SPEC_FILE}."
+  puts "Ensure spec contains GIVEN/WHEN/THEN scenarios, entity attributes (`field_name`), or business rules."
+  exit 0
+end
+
+all_matches = deep_dup_requirements(all_requirements)
+match_requirements_to_tasks(all_matches, tasks)
+
+scoped_tasks =
+  if options[:up_to].nil?
+    tasks
+  else
+    tasks.select { |task| task["position"] <= options[:up_to] }
+  end
+
+scoped_matches = deep_dup_requirements(all_requirements)
+match_requirements_to_tasks(scoped_matches, scoped_tasks)
+
+covered, future_owned, uncovered = classify_requirements(all_matches, scoped_matches, options[:up_to])
+
+effective_total =
+  if options[:enforce_final] || options[:up_to].nil?
+    all_requirements.size
+  else
+    all_requirements.size - future_owned.size
+  end
+
+effective_total = 0 if effective_total.negative?
+coverage = effective_total.zero? ? 100.0 : (covered.size.to_f / effective_total * 100).round(1)
+
+fail_threshold =
+  if options[:fail_under]
+    options[:fail_under]
+  elsif options[:enforce_final]
+    coverage_policy["final_fail_under"]
+  end
+
+payload = {
+  mode: options[:enforce_final] ? "final" : (options[:up_to] ? "progress" : "overall"),
+  up_to: options[:up_to],
+  total_requirements: all_requirements.size,
+  effective_total: effective_total,
+  covered: covered.size,
+  future_owned: future_owned.size,
+  uncovered: uncovered.size,
+  coverage_percent: coverage,
+  scenarios: {
+    total: all_requirements.count { |req| req[:type] == "scenario" },
+    covered: covered.count { |req| req[:type] == "scenario" }
+  },
+  attributes: {
+    total: all_requirements.count { |req| req[:type] == "attribute" },
+    covered: covered.count { |req| req[:type] == "attribute" }
+  },
+  rules: {
+    total: all_requirements.count { |req| req[:type] == "business_rule" },
+    covered: covered.count { |req| req[:type] == "business_rule" }
+  },
+  uncovered_requirements: uncovered,
+  future_task_requirements: future_owned
+}
+
+if options[:json]
+  puts JSON.pretty_generate(payload)
+else
+  title =
+    if options[:enforce_final]
+      "Spec Coverage Report (Final Enforcement)"
+    elsif options[:up_to]
+      "Spec Coverage Report (Through Task #{options[:up_to]})"
+    else
+      "Spec Coverage Report"
+    end
+
+  puts title
+  puts "=" * 60
+  puts
+  puts "Overall: #{covered.size}/#{effective_total} requirements covered (#{coverage}%)"
+  puts
+  puts "  Scenarios:  #{covered.count { |req| req[:type] == 'scenario' }}/#{payload[:scenarios][:total]}"
+  puts "  Attributes: #{covered.count { |req| req[:type] == 'attribute' }}/#{payload[:attributes][:total]}"
+  puts "  Rules:      #{covered.count { |req| req[:type] == 'business_rule' }}/#{payload[:rules][:total]}"
+
+  compact_progress = options[:up_to] && !options[:enforce_final] && coverage_policy.fetch("progress_compact", true) && !options[:verbose]
+  example_limit = coverage_policy["progress_example_limit"] || 3
+
+  if options[:up_to] && !options[:enforce_final] && future_owned.any?
+    puts
+    puts "Future-task requirements not counted yet: #{future_owned.size}"
+  end
+
+  if uncovered.any?
+    puts
+    if compact_progress
+      print_requirement_examples("Representative uncovered requirements:", uncovered, limit: example_limit)
+    else
+      puts "UNCOVERED REQUIREMENTS:"
+      puts
+
+      uncovered.group_by { |req| req[:type] }.each do |type, reqs|
+        label =
+          case type
+          when "scenario" then "SCENARIO"
+          when "attribute" then "ATTRIBUTE"
+          when "business_rule" then "RULE"
+          else type.upcase
+          end
+
+        puts "  #{label} (#{reqs.size} uncovered):"
+        reqs.each do |req|
+          puts "    #{format_requirement_label(req)}"
+        end
+        puts
+      end
+    end
+  end
+
+  if options[:up_to] && !options[:enforce_final] && future_owned.any?
+    if compact_progress
+      print_requirement_examples("Representative future-task requirements:", future_owned, limit: example_limit, up_to: options[:up_to])
+    else
+      puts "FUTURE-TASK REQUIREMENTS:"
+      puts
+      future_owned.group_by { |req| req[:type] }.each do |type, reqs|
+        label =
+          case type
+          when "scenario" then "SCENARIO"
+          when "attribute" then "ATTRIBUTE"
+          when "business_rule" then "RULE"
+          else type.upcase
+          end
+
+        puts "  #{label} (#{reqs.size} future):"
+        reqs.each do |req|
+          puts "    #{format_requirement_label(req)} (later task(s): #{req[:covered_by].select { |pos| pos > options[:up_to] }.join(', ')})"
+        end
+        puts
+      end
+    end
+  end
+
+  if fail_threshold && coverage < fail_threshold
+    puts "COVERAGE BELOW THRESHOLD: #{coverage}% < #{fail_threshold}%"
+  end
+end
+
+exit(1) if fail_threshold && coverage < fail_threshold

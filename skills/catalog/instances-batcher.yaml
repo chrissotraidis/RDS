@@ -1,0 +1,17 @@
+---
+slug: instances-batcher
+name: Instances batcher
+status: curated
+category: performance
+maturity: beta
+applies_to:
+- web-3d
+description: Instanced rendering performance helper.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: drei.docs.pmnd.rs
+  url: https://drei.docs.pmnd.rs/performances/instances
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

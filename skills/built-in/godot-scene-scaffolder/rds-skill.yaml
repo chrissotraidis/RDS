@@ -1,0 +1,20 @@
+---
+slug: godot-scene-scaffolder
+name: Godot scene scaffolder
+status: ready
+default: false
+applies_to:
+- game-engine
+description: Godot scene and autoload scaffold contract.
+install:
+  command: bin/rds-skill-materialize godot-scene-scaffolder
+verify:
+  command: bin/rds-skill-verify godot-scene-scaffolder
+maturity: beta
+category: game
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should
+  understand during stack selection, skill resolution, implementation guidance, or
+  verification.
+source_links:
+- label: docs.godotengine.org
+  url: https://docs.godotengine.org/

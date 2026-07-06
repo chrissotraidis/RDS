@@ -1,0 +1,17 @@
+---
+slug: hotwire-stimulus-generator
+name: Hotwire Stimulus generator
+status: curated
+category: frontend
+maturity: stable
+applies_to:
+- rails-web
+description: Rails Hotwire and Stimulus generator conventions.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: stimulus.hotwired.dev
+  url: https://stimulus.hotwired.dev/
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

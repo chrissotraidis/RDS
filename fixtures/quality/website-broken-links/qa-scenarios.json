@@ -1,0 +1,8 @@
+{
+  "schema": "rds.qa.scenarios.v1",
+  "scenarios": [
+    { "title": "Open case studies", "objective": "Primary navigation reaches case studies." },
+    { "title": "Open pricing", "objective": "Pricing navigation is not a dead anchor." },
+    { "title": "Book demo", "objective": "Hero CTA reaches a demo/contact flow." }
+  ]
+}

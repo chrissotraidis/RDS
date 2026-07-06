@@ -1,0 +1,24 @@
+---
+slug: postgres-mcp
+name: Postgres context
+status: ready
+default: false
+applies_to:
+- rails-web
+- nextjs-fullstack
+- python-ai-service
+- astro-thin-web
+- mobile-native
+description: Adds the database inspection and migration safety contract for Postgres-backed builds.
+install:
+  command: bin/rds-skill-materialize postgres-mcp
+verify:
+  command: bin/rds-skill-verify postgres-mcp
+maturity: operational
+category: database
+rationale: Database-backed builds need schema awareness, migration checks, and seed/setup verification. This skill makes DB state part of build planning and QA.
+source_links:
+- label: PostgreSQL Docs
+  url: https://www.postgresql.org/docs/
+- label: Model Context Protocol servers
+  url: https://github.com/modelcontextprotocol/servers

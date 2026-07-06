@@ -1,0 +1,24 @@
+---
+slug: testing-vitest-playwright
+name: Vitest and Playwright
+status: ready
+default: false
+applies_to:
+- nextjs-fullstack
+- astro-thin-web
+- web-3d
+- game-engine
+- browser-extension
+description: Adds the RDS testing contract for Vitest unit tests and Playwright browser checks.
+install:
+  command: bin/rds-skill-materialize testing-vitest-playwright
+verify:
+  command: bin/rds-skill-verify testing-vitest-playwright
+maturity: operational
+category: testing
+rationale: Web builds need a fast unit/integration layer plus a real browser check before RDS can trust a preview. This skill tells the build agent which test surfaces must exist and how they should be verified.
+source_links:
+- label: Vitest
+  url: https://vitest.dev/
+- label: Playwright
+  url: https://playwright.dev/

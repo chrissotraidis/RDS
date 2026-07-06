@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""Audit stack/skill default bundles and intent-triggered optional skills."""
+
+from __future__ import annotations
+
+import json
+import subprocess
+import tempfile
+from pathlib import Path
+
+import yaml
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+EXPECTED_DEFAULTS = {
+    "rails-web": {
+        "rds-context7-mount",
+        "rds-mockup-fidelity",
+        "rds-secrets-broker",
+        "rds-eval-harness",
+        "playwright-mcp",
+        "hotwire-stimulus-generator",
+    },
+    "nextjs-fullstack": {
+        "rds-context7-mount",
+        "rds-mockup-fidelity",
+        "rds-secrets-broker",
+        "rds-eval-harness",
+        "playwright-mcp",
+        "shadcn-add",
+    },
+    "python-ai-service": {
+        "rds-context7-mount",
+        "rds-mockup-fidelity",
+        "rds-secrets-broker",
+        "rds-eval-harness",
+        "playwright-mcp",
+        "llm-pydantic-ai",
+    },
+    "astro-thin-web": {
+        "rds-context7-mount",
+        "rds-mockup-fidelity",
+        "rds-secrets-broker",
+        "rds-eval-harness",
+        "playwright-mcp",
+        "astro-content-collections-skill",
+    },
+    "web-3d": {
+        "rds-context7-mount",
+        "rds-mockup-fidelity",
+        "rds-secrets-broker",
+        "rds-eval-harness",
+        "playwright-mcp",
+        "r3f-drei-helpers",
+        "playwright-canvas-snapshot",
+    },
+    "game-engine": {
+        "rds-context7-mount",
+        "rds-mockup-fidelity",
+        "rds-secrets-broker",
+        "rds-eval-harness",
+        "playwright-mcp",
+        "browser-game-product-quality",
+        "testing-vitest-playwright",
+        "playwright-canvas-snapshot",
+    },
+    "mobile-native": {
+        "rds-context7-mount",
+        "rds-mockup-fidelity",
+        "rds-secrets-broker",
+        "rds-eval-harness",
+        "playwright-mcp",
+        "expo-skills-mount",
+        "expo-router-codegen",
+        "qr-tunnel-publisher",
+    },
+    "browser-extension": {
+        "rds-context7-mount",
+        "rds-mockup-fidelity",
+        "rds-secrets-broker",
+        "rds-eval-harness",
+        "playwright-mcp",
+        "wxt-config-skill",
+        "content-script-helpers",
+    },
+    "game-asset-pipeline": {
+        "rds-context7-mount",
+        "rds-mockup-fidelity",
+        "rds-secrets-broker",
+        "rds-eval-harness",
+        "playwright-mcp",
+        "rds-usd-validator",
+        "gltf-validator-skill",
+        "model-viewer-preview",
+    },
+}
+
+INTENT_PROBES = [
+    ("rails-auth", "rails-web", "auth-rails-generator", "Build a Rails portal with login, protected routes, user accounts, and sessions."),
+    ("rails-jobs", "rails-web", "solid-queue", "Build a Rails workflow with background jobs, retries, scheduled imports, and exports."),
+    ("next-auth", "nextjs-fullstack", "auth-better-auth", "Build a Next.js app with login, protected routes, user accounts, and sessions."),
+    ("next-db", "nextjs-fullstack", "drizzle-introspect-skill", "Build a Next.js dashboard with Postgres database tables, schema migrations, records, and forms."),
+    ("python-vector", "python-ai-service", "vector-pgvector", "Build a FastAPI RAG service with embeddings, semantic search, vector search, and pgvector."),
+    ("astro-docs", "astro-thin-web", "starlight-add", "Build a documentation site with API docs, reference docs, and developer guides."),
+    ("web3d-assets", "web-3d", "gltf-transform-pipeline", "Build a Three.js product configurator loading GLTF models, textures, and optimized 3D assets."),
+    ("asset-blender", "game-asset-pipeline", "blender-mcp-mount", "Build an asset pipeline that uses Blender, bpy, blend files, and procedural modeling."),
+    ("mobile-build", "mobile-native", "eas-build-skill", "Build an Expo app that needs EAS native builds, TestFlight, APK, and app store readiness."),
+]
+
+
+def run_json(cmd: list[str]) -> dict:
+    proc = subprocess.run(cmd, cwd=ROOT, text=True, capture_output=True)
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr or proc.stdout)
+    return json.loads(proc.stdout)
+
+
+def resolve_defaults(stack: str) -> tuple[set[str], list[dict]]:
+    with tempfile.TemporaryDirectory() as tmp:
+        proc = subprocess.run(
+            [str(ROOT / "bin/rds-skill-resolve"), f"--stack={stack}", "--requested=default", f"--build-dir={tmp}"],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(proc.stderr or proc.stdout)
+        payload = json.loads((Path(tmp) / "skills/resolved.json").read_text())
+        return {item["slug"] for item in payload["resolved"]}, payload.get("skipped", [])
+
+
+def ready_stacks() -> list[str]:
+    registry = yaml.safe_load((ROOT / "stacks/registry.yml").read_text())
+    return [item["slug"] for item in registry["stacks"] if item.get("status") == "ready"]
+
+
+def main() -> int:
+    errors: list[str] = []
+    registry = json.loads((ROOT / "skills/registry.json").read_text())
+    by_slug = {item["slug"]: item for item in registry["skills"]}
+    for stack in ready_stacks():
+        expected = EXPECTED_DEFAULTS.get(stack)
+        if not expected:
+            errors.append(f"{stack}: no expected default policy")
+            continue
+        resolved, skipped = resolve_defaults(stack)
+        if skipped:
+            errors.append(f"{stack}: default resolution skipped skills: {skipped}")
+        if resolved != expected:
+            errors.append(
+                f"{stack}: default mismatch\n"
+                f"  missing={sorted(expected - resolved)}\n"
+                f"  extra={sorted(resolved - expected)}"
+            )
+        for slug in sorted(resolved):
+            skill = by_slug.get(slug, {})
+            rationale = skill.get("rationale") or ""
+            if "Curated from the RDS V1" in rationale:
+                errors.append(f"{stack}: default skill {slug} still has generic curated rationale")
+            guide_path = ROOT / str(skill.get("path", "")).replace("rds-skill.yaml", "AGENTS.md")
+            if guide_path.exists():
+                guide = guide_path.read_text(errors="replace")
+                if "The PRD explicitly asks for" in guide and "selected stack commonly needs" in guide:
+                    errors.append(f"{stack}: default skill {slug} still has generic guide trigger language")
+
+    for name, stack, skill, text in INTENT_PROBES:
+        payload = run_json([str(ROOT / "bin/rds-analyze-source"), text, "--root", str(ROOT)])
+        if payload.get("stack") != stack:
+            errors.append(f"{name}: expected stack={stack}, got {payload.get('stack')}")
+        if skill not in payload.get("skills", []):
+            errors.append(f"{name}: expected intent skill {skill}, got {payload.get('skills')}")
+
+    if errors:
+        print("\n".join(errors))
+        return 1
+    print(f"RDS skill matrix audit passed: {len(EXPECTED_DEFAULTS)} stack defaults, {len(INTENT_PROBES)} intent probes.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# Smoke-test the RDS Agent Sessions CLI without launching a coding agent.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+RDS_ROOT="$ROOT"
+source "$ROOT/bin/lib/common.sh"
+source "$ROOT/bin/lib/agents.sh"
+
+PROVIDER="$(agent_normalize_provider "$(parse_flag --provider "$@" || echo codex)")"
+KEEP_ARTIFACTS=0
+
+usage() {
+  cat <<'EOF'
+Usage: bin/rds-agent-fixture [--provider=codex|claude-code] [--keep-artifacts]
+
+Creates a throwaway git repo, starts a batch-mode Agent Session, verifies the
+worktree starts clean, checks status/diff/discard, and removes smoke artifacts.
+It does not launch an interactive Claude Code or Codex process.
+EOF
+}
+
+for arg in "$@"; do
+  case "$arg" in
+    --provider=*) ;;
+    --keep-artifacts) KEEP_ARTIFACTS=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "FATAL: unknown argument: $arg" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+smoke="${TMPDIR:-/tmp}/rds-agent-fixture-$$"
+json_path=""
+worktree_path=""
+
+cleanup() {
+  if [[ "$KEEP_ARTIFACTS" != "1" ]]; then
+    if [[ -n "$json_path" ]]; then
+      rm -f "$json_path" "${json_path%.json}.log" "${json_path%.json}.diff"
+      rmdir "$(dirname "$json_path")" 2>/dev/null || true
+    fi
+    rm -rf "$smoke"
+  fi
+}
+trap cleanup EXIT
+
+mkdir -p "$smoke/repo"
+git -C "$smoke/repo" init -q -b main
+git -C "$smoke/repo" config user.email rds-agent-fixture@example.local
+git -C "$smoke/repo" config user.name "RDS Agent Fixture"
+printf 'hello\n' >"$smoke/repo/README.md"
+git -C "$smoke/repo" add README.md
+git -C "$smoke/repo" commit -q -m init
+
+out="$("$ROOT/bin/rds-agent-start" \
+  --provider="$PROVIDER" \
+  --mode=batch \
+  --repo="$smoke/repo" \
+  --task="Smoke verify clean agent context lifecycle" \
+  --base-branch=main \
+  --started-by=fixture)"
+
+sid="$(printf '%s\n' "$out" | awk -F= '/^session_id=/{print $2; exit}')"
+json_path="$(printf '%s\n' "$out" | awk -F= '/^json=/{print $2; exit}')"
+worktree_path="$(printf '%s\n' "$out" | awk -F= '/^worktree=/{print $2; exit}')"
+
+[[ -n "$sid" && -f "$json_path" && -d "$worktree_path" ]] || {
+  echo "FATAL: fixture did not create a valid session/worktree" >&2
+  printf '%s\n' "$out" >&2
+  exit 1
+}
+
+status_json="$("$ROOT/bin/rds-agent-status" "$sid")"
+changed_count="$(printf '%s\n' "$status_json" | jq '.changed_files | length')"
+if [[ "$changed_count" != "0" ]]; then
+  echo "FATAL: new Agent Session worktree is dirty before agent work" >&2
+  printf '%s\n' "$status_json" | jq '{id,status,changed_files}'
+  exit 1
+fi
+
+"$ROOT/bin/rds-agent-diff" "$sid" >/dev/null
+"$ROOT/bin/rds-agent-discard" "$sid" --confirm=DISCARD >/dev/null
+[[ ! -d "$worktree_path" ]] || { echo "FATAL: discard did not remove worktree: $worktree_path" >&2; exit 1; }
+
+printf '✓ agent fixture provider=%s session=%s clean_worktree=true discarded=true\n' "$PROVIDER" "$sid"

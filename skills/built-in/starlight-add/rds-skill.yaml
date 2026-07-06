@@ -1,0 +1,20 @@
+---
+slug: starlight-add
+name: Astro Starlight
+status: ready
+default: false
+applies_to:
+- astro-thin-web
+description: Astro Starlight docs-site capability.
+install:
+  command: bin/rds-skill-materialize starlight-add
+verify:
+  command: bin/rds-skill-verify starlight-add
+maturity: stable
+category: content
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should
+  understand during stack selection, skill resolution, implementation guidance, or
+  verification.
+source_links:
+- label: starlight.astro.build
+  url: https://starlight.astro.build/

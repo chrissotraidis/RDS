@@ -1,0 +1,20 @@
+---
+slug: realtime-solid-cable
+name: Solid Cable realtime
+status: ready
+default: false
+applies_to:
+- rails-web
+description: Rails realtime through Solid Cable.
+install:
+  command: bin/rds-skill-materialize realtime-solid-cable
+verify:
+  command: bin/rds-skill-verify realtime-solid-cable
+maturity: stable
+category: realtime
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should
+  understand during stack selection, skill resolution, implementation guidance, or
+  verification.
+source_links:
+- label: guides.rubyonrails.org
+  url: https://guides.rubyonrails.org/

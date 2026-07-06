@@ -1,0 +1,17 @@
+---
+slug: rapier-physics
+name: Rapier physics
+status: curated
+category: physics
+maturity: stable
+applies_to:
+- web-3d
+description: Rapier physics setup for interactive 3D scenes.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: rapier.rs
+  url: https://rapier.rs/
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

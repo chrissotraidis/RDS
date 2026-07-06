@@ -1,0 +1,17 @@
+---
+slug: bin-ci-skill
+name: Rails bin/ci
+status: curated
+category: testing
+maturity: stable
+applies_to:
+- rails-web
+description: Rails one-shot CI command contract.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: modelcontextprotocol.io
+  url: https://modelcontextprotocol.io/
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

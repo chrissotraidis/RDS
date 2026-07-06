@@ -1,0 +1,102 @@
+name: Game Engine Project
+type: game_engine
+keywords:
+  - game
+  - html5 game
+  - canvas
+  - godot
+  - gameplay
+  - itch
+  - arcade
+description: >
+  Playable browser game stack with a deterministic HTML5 canvas preview,
+  gameplay spec, scene reference, tests, and a static export. Godot 4.6 is
+  the target native-engine upgrade path once the runtime is installed on Zo.
+
+framework:
+  primary: HTML5 Canvas
+  target_engine: Godot 4.6
+  language: TypeScript
+  runtime: Bun
+  deployment: Zo HTTP service
+
+workflow:
+  capabilities:
+    browser_ui: true
+    canvas: true
+    gameplay_loop: true
+    static_export: true
+    native_tests: true
+    database: false
+
+finalization:
+  commands:
+    - bun install
+    - bun test
+    - bun run build
+  checks:
+    - name: Game tests
+      command: bun test
+      type: test
+      required: true
+    - name: Static export
+      command: bun run build
+      type: compilation
+      required: true
+
+verification:
+  setup_commands:
+    - bun install
+  boot_command: HOST_PORT=3000 bun server.ts
+  health_checks:
+    - url: "http://localhost:3000/health.json"
+      expected_status: 200
+    - url: "http://localhost:3000/"
+      expected_status: 200
+  test_command: bun test
+
+sections:
+  - name: Runtime Contract
+    phase: pipeline
+    labels: ["setup", "game"]
+    description: Keep the generated game bootable and playable in the browser.
+    guidance:
+      - Preserve /health.json.
+      - Preserve docs/GAMEPLAY_SPEC.md and update it as mechanics change.
+      - Preserve reset, controls, and a completion or failure state.
+      - Keep the static export under build/web.
+
+  - name: Gameplay
+    phase: pipeline
+    labels: ["gameplay", "interaction"]
+    description: Implement the PRD's core loop.
+    guidance:
+      - Build the actual playable game, not a marketing page.
+      - Include keyboard controls and mobile/touch controls when the PRD targets mobile.
+      - Keep collision, scoring, state transitions, and restart behavior testable.
+      - Use stable canvas dimensions and responsive scaling.
+      - For board or strategy games, make the board the dominant play surface; show selected piece, legal moves, captures, turn, score/victory pressure, history, AI-thinking state, and restart without crowding it.
+      - For arcade/action games, prioritize immediate input feel, impact feedback, pressure, score progression, game over, and instant restart before secondary screens.
+
+  - name: Product Feel
+    phase: pipeline
+    labels: ["design", "game-feel", "mobile"]
+    description: Make the generated game feel opinionated, polished, and purpose-built.
+    guidance:
+      - Establish a visual stance before implementing screens: genre, world/table metaphor, palette, typography, motion, and feedback language.
+      - Avoid generic dashboard layouts, beige cards, nested admin panels, placeholder controls, and documentation-first copy around the game.
+      - Every core interaction needs visible feedback: hover/focus, selection, legal/illegal action, hit/capture, progress, win/loss, and restart.
+      - Mobile must preserve a stable play surface with reachable controls and no overlapping or clipped text.
+
+  - name: Quality
+    phase: pipeline
+    labels: ["qa"]
+    description: Verify the game compiles, serves, and can be played.
+    guidance:
+      - bun test must pass.
+      - /health.json must return 200.
+      - Browser preview must show a nonblank canvas.
+      - Verify at least one input path and restart behavior.
+      - Run a real play path: start/quick-play, make multiple actions or moves, observe visible state changes, and reach or expose restart/failure/win behavior.
+      - Verify desktop and mobile screenshots for no overlap, no horizontal overflow, and no clipped control text.
+      - Treat ugly, misaligned, or generic UI as a failed quality gate even when the engine tests pass.

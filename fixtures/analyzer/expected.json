@@ -1,0 +1,38 @@
+{
+  "ai-api-service.md": {
+    "stack": "python-ai-service",
+    "appType": "web-app",
+    "skills": ["llm-pydantic-ai", "vector-pgvector"]
+  },
+  "browser-game.md": {
+    "stack": "game-engine",
+    "appType": "game",
+    "skills": ["godot-scene-scaffolder", "gdunit4-suite"]
+  },
+  "chrome-extension.md": {
+    "stack": "browser-extension",
+    "appType": "web-app",
+    "skills": ["wxt-config-skill", "content-script-helpers"]
+  },
+  "crafty-web-tool.md": {
+    "stack": "nextjs-fullstack",
+    "appType": "web-app",
+    "skills": ["storage-s3-r2", "llm-vercel-ai-sdk"]
+  },
+  "internal-dashboard.md": {
+    "stack": "rails-web",
+    "appType": "dashboard",
+    "skills": ["auth-rails-generator", "postgres-mcp"]
+  },
+  "mobile-app.md": {
+    "stack": "mobile-native",
+    "appType": "web-app",
+    "skills": ["expo-skills-mount", "eas-build-skill"]
+  },
+  "static-site.md": {
+    "stack": "astro-thin-web",
+    "appType": "website",
+    "skills": ["astro-content-collections-skill"]
+  }
+}
+

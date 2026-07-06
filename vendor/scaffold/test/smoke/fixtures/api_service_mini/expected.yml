@@ -1,0 +1,5 @@
+primary_recipe: api_service
+persona: software_architect
+domains_any_of:
+  - fintech
+  - generic

@@ -1,0 +1,288 @@
+#!/usr/bin/env bash
+# bin/rds-spec — runs Wiki against research.md to produce spec.md.
+# Green-field only. Called by bin/rds-build in stage 2.
+#
+# Usage:
+#   ./bin/rds-spec <research.md> <spec.md>
+#
+# Wiki is loaded as a Claude Code plugin via --plugin-dir when Claude is
+# available. If the selected build provider is Codex and Claude is unavailable
+# in the service PATH, RDS falls back to a provider-native spec pass that writes
+# the same spec.md contract. Any PO questions Wiki surfaces are captured at
+# $(dirname "$SPEC_OUT")/po-questions.md without pausing the build.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck disable=SC1091
+source "$ROOT/bin/lib/common.sh"
+# shellcheck disable=SC1091
+source "$ROOT/bin/lib/logging.sh"
+
+RESEARCH="${1:?research.md path}"
+SPEC_OUT="${2:?spec.md output path}"
+
+[[ -s "$RESEARCH" ]] || { echo "FATAL: $RESEARCH is empty or missing" >&2; exit 1; }
+
+WIKI_DIR="$(dirname "$SPEC_OUT")/wiki"
+mkdir -p "$WIKI_DIR/review"
+cp "$RESEARCH" "$WIKI_DIR/research.md"
+
+# Compose the prompt handed to Claude Code.
+PROMPT_TEMPLATE="$ROOT/prompts/wiki-prd-from-research.md"
+[[ -f "$PROMPT_TEMPLATE" ]] || { echo "FATAL: missing $PROMPT_TEMPLATE" >&2; exit 1; }
+
+PROMPT="$(cat "$PROMPT_TEMPLATE")
+
+RESEARCH_FILE:  $WIKI_DIR/research.md
+OUTPUT_SPEC:    $SPEC_OUT
+WIKI_WORKSPACE: $WIKI_DIR"
+
+SPEC_PROVIDER="${RDS_SPEC_PROVIDER:-${RDS_INFERENCE_PROVIDER:-claude}}"
+
+log "invoking spec generator"
+log "  provider=$SPEC_PROVIDER"
+log "  research=$RESEARCH"
+log "  spec_out=$SPEC_OUT"
+log "  wiki_dir=$WIKI_DIR"
+
+if [[ "$SPEC_PROVIDER" == "claude" || "$SPEC_PROVIDER" == "" ]]; then
+  if ! command -v claude >/dev/null 2>&1; then
+    echo "FATAL: Claude CLI not found and RDS_SPEC_PROVIDER='$SPEC_PROVIDER' requires Claude." >&2
+    echo "  PATH=$PATH" >&2
+    exit 127
+  fi
+  log "  using Claude Code with Wiki plugin"
+  # Run inside WIKI_DIR so any relative paths Wiki writes land there.
+  # IS_SANDBOX=1 lets --dangerously-skip-permissions run as root in the Zo gVisor sandbox.
+  (
+    cd "$WIKI_DIR"
+    IS_SANDBOX=1 claude --dangerously-skip-permissions --plugin-dir "$ROOT/vendor/wiki" --print "$PROMPT"
+  )
+elif [[ "$SPEC_PROVIDER" == "codex" ]]; then
+  log "  using Codex spec generation"
+  research_body="$(sed -n '1,260p' "$RESEARCH")"
+  existing_questions=""
+  [[ -f "$WIKI_DIR/review/product-owner-questions.md" ]] && existing_questions="$(sed -n '1,220p' "$WIKI_DIR/review/product-owner-questions.md")"
+  existing_entities=""
+  [[ -f "$WIKI_DIR/entities.md" ]] && existing_entities="$(sed -n '1,220p' "$WIKI_DIR/entities.md")"
+  existing_routes=""
+  [[ -f "$WIKI_DIR/routes.md" ]] && existing_routes="$(sed -n '1,220p' "$WIKI_DIR/routes.md")"
+  existing_risks=""
+  [[ -f "$WIKI_DIR/risks.md" ]] && existing_risks="$(sed -n '1,220p' "$WIKI_DIR/risks.md")"
+  fallback_prompt="$(cat <<EOF
+You are the RDS green-field spec generator. Return a Scaffold-compatible
+implementation spec as markdown only. Do not use tools. Do not wrap the result
+in code fences. Do not ask questions.
+
+Requirements:
+- Preserve the product intent from the research document.
+- Include project summary, target users, core features, UX/UI requirements,
+  acceptance criteria, implementation notes, and non-goals.
+- Make it suitable as direct input to Scaffold for a ${RDS_INFERENCE_PROVIDER:-codex} build.
+- Use best-effort defaults where the source is ambiguous.
+- Include a Review readiness / truthfulness section requiring an app-visible
+  surface for what works, what is seeded/sample/demo, what is stubbed or
+  credential-gated, what PRD promises are missing, and any review-mode
+  credentials or seeded personas.
+
+Research document:
+---
+$research_body
+---
+
+Existing product-owner defaults, if any:
+---
+$existing_questions
+---
+
+Existing entities notes, if any:
+---
+$existing_entities
+---
+
+Existing routes/views notes, if any:
+---
+$existing_routes
+---
+
+Existing risks notes, if any:
+---
+$existing_risks
+---
+EOF
+)"
+  tmp_spec="$SPEC_OUT.tmp"
+  if [[ "${RDS_SPEC_CODEX_INFER:-0}" == "1" ]]; then
+    if (
+      export RDS_INFER_FINAL_ONLY=1
+      printf '%s\n' "$fallback_prompt" \
+        | rds_infer codex "$ROOT" 20 "${RDS_SPEC_BUDGET_USD:-1.00}" "" > "$tmp_spec" 2>>"$WIKI_DIR/spec-generator.err"
+    ); then
+      if [[ -s "$tmp_spec" ]]; then
+        mv "$tmp_spec" "$SPEC_OUT"
+      fi
+    else
+      log "  Codex spec generation failed; writing deterministic fallback spec"
+    fi
+  else
+    log "  RDS_SPEC_CODEX_INFER!=1; writing deterministic fallback spec"
+  fi
+  if [[ ! -s "$SPEC_OUT" ]]; then
+    python3 - "$RESEARCH" "$SPEC_OUT" "$existing_entities" "$existing_routes" "$existing_risks" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+research_path = Path(sys.argv[1])
+spec_out = Path(sys.argv[2])
+existing_entities = sys.argv[3].strip()
+existing_routes = sys.argv[4].strip()
+existing_risks = sys.argv[5].strip()
+
+research = research_path.read_text(encoding="utf-8", errors="replace")
+research = research.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+def clean_line(value: str) -> str:
+    return re.sub(r"\s+", " ", value.strip().lstrip("#").strip())
+
+lines = [clean_line(line) for line in research.splitlines() if clean_line(line)]
+def infer_title(text: str, fallback_lines: list[str]) -> str:
+    compact_head = re.sub(r"\s+", " ", text[:1200]).strip()
+    first_line = fallback_lines[0] if fallback_lines else compact_head
+    candidates = [
+        re.sub(r"\bVersion\b.*$", "", compact_head, flags=re.I),
+        re.sub(r"\bOwner\b.*$", "", compact_head, flags=re.I),
+        re.sub(r"\bStatus\b.*$", "", compact_head, flags=re.I),
+        first_line,
+        next((line for line in fallback_lines if 4 <= len(line) <= 160), ""),
+    ]
+    for candidate in candidates:
+        candidate = re.sub(r"\bv\d+\s*Version\b.*$", "", candidate, flags=re.I).strip()
+        candidate = re.sub(r"\s+(status|owner|version|last updated)\s*[:|].*$", "", candidate, flags=re.I).strip()
+        candidate = re.sub(r"\s*\([^)]*$", "", candidate).strip()
+        candidate = re.sub(r"\s+", " ", candidate).strip(" —-:()")
+        if 4 <= len(candidate) <= 180:
+            return candidate
+    return "Generated Product"
+
+title = infer_title(research, lines)
+title = title or "Generated Product"
+base_title = re.sub(r"\s*[—-]\s*(product requirements document|requirements document|prd)\b.*$", "", title, flags=re.I)
+base_title = re.sub(r"\b(product requirements document|requirements document|prd)\b", "", base_title, flags=re.I)
+base_title = re.sub(r"\s+", " ", base_title).strip(" —-:()") or title
+spec_title = f"{base_title} — Implementation Spec"
+
+paragraphs = [p.strip() for p in re.split(r"\n\s*\n", research) if p.strip()]
+summary = ""
+for i, para in enumerate(paragraphs):
+    if re.search(r"executive summary|overview|objective|goal", para, flags=re.I):
+        summary = paragraphs[i + 1] if i + 1 < len(paragraphs) else para
+        break
+if not summary:
+    summary = "\n".join(lines[:8])
+summary = re.sub(r"\s+", " ", summary).strip()[:1800]
+
+source_excerpt = research[:60000].rstrip()
+if len(research) > len(source_excerpt):
+    source_excerpt += "\n\n[Source truncated for deterministic fallback spec. Use the full research.md as first-party source.]"
+
+sections = [
+    f"# {spec_title}",
+    "",
+    "## Overview",
+    "",
+    f"Build {base_title} according to the source brief in `research.md`. Preserve the product intent, rules, constraints, acceptance criteria, and non-goals from the source rather than substituting a generic template.",
+    "",
+    summary,
+    "",
+    "## Source Requirements",
+    "",
+    "The following source text is first-party build scope. Treat explicit requirements, constraints, data models, UX notes, tests, and roadmap boundaries as authoritative unless they conflict with a later operator instruction.",
+    "",
+    "```markdown",
+    source_excerpt,
+    "```",
+    "",
+    "## Users / Personas",
+    "",
+    "- Use the users/personas stated in the source brief.",
+    "- If the source is incomplete, infer only the minimum personas needed to implement the primary workflow.",
+    "",
+    "## Core Features",
+    "",
+    "- Implement the primary workflow described by the source brief end to end.",
+    "- Preserve named rules, states, configuration options, data contracts, and acceptance criteria from the source.",
+    "- Prefer a smaller complete implementation over broad placeholder screens.",
+    "",
+    "## Entities / Models",
+    "",
+    existing_entities or "- Derive models directly from the source brief and keep them explicit in code.",
+    "",
+    "## Routes / Views",
+    "",
+    existing_routes or "- Root route should open directly into the primary product experience unless the source explicitly requires another information architecture.",
+    "",
+    "## UX / UI Requirements",
+    "",
+    "- Match the source brief's domain, terminology, interaction model, and visual requirements.",
+    "- Make the first screen usable, not a marketing page, unless the source is explicitly a marketing website.",
+    "- Include realistic empty, loading, success, failure, and end states where the product shape requires them.",
+    "- Keep the layout responsive without overlapping controls or unreadable text.",
+    "",
+    "## Review Readiness / Truthfulness",
+    "",
+    "- The app must include a visible review-mode/readiness surface reachable from the primary UI.",
+    "- That surface must state what works now, what data is seeded/sample/demo, which integrations or workflows are stubbed or credential-gated, what PRD promises remain missing, and any review-mode credentials or seeded personas.",
+    "- If the app displays costs, provider calls, source data, generated media, external publishing, or operational metrics before production wiring is proven, label them honestly in the UI.",
+    "- This is not README-only documentation; QA must be able to see the disclosure in the running app.",
+    "",
+    "## Acceptance Criteria",
+    "",
+    "- The app starts locally with the selected stack's standard run command.",
+    "- The root route loads the source brief's primary experience.",
+    "- Every explicit acceptance criterion in the source brief is either implemented or called out as intentionally deferred.",
+    "- The implementation includes enough real behavior that QA can verify the core loop without relying on static copy.",
+    "- The running app exposes review readiness/truthfulness disclosure for seeded data, stubbed integrations, fake costs, placeholder workflows, and review credentials when any of those apply.",
+    "- The generated app does not include unrelated product concepts from other builds.",
+    "",
+    "## Build Assumptions",
+    "",
+    "- Use the stack selected by RDS for this build.",
+    "- Keep implementation choices consistent with the source brief and selected stack.",
+    "- Use best-effort defaults only where the source is genuinely ambiguous.",
+    "",
+    "## Risks / Mitigations",
+    "",
+    existing_risks or "- Main risk: deterministic fallback may be less structured than an AI-authored spec. Mitigate by preserving the source brief verbatim in this spec and tracing implementation decisions back to it.",
+    "",
+    "## Non-Goals",
+    "",
+    "- Do not add unrelated clone/game/app mechanics from previous builds.",
+    "- Do not silently replace the source brief with a canned example.",
+    "- Respect explicit non-goals and deferred scope in the source.",
+    "",
+]
+
+spec_out.write_text("\n".join(sections).rstrip() + "\n", encoding="utf-8")
+PY
+  fi
+else
+  echo "FATAL: unsupported RDS_SPEC_PROVIDER='$SPEC_PROVIDER' (expected claude|codex)." >&2
+  exit 127
+fi
+
+# --- Assert the spec was produced -------------------------------------------
+if [[ ! -s "$SPEC_OUT" ]]; then
+  echo "FATAL: Wiki did not produce a spec at $SPEC_OUT" >&2
+  echo "  Wiki workspace (for debugging): $WIKI_DIR" >&2
+  exit 1
+fi
+log "spec produced at $SPEC_OUT ($(wc -l < "$SPEC_OUT") lines)"
+
+# --- Capture PO questions for later human review ----------------------------
+PO_SRC="$WIKI_DIR/review/product-owner-questions.md"
+if [[ -f "$PO_SRC" ]]; then
+  PO_DST="$(dirname "$SPEC_OUT")/po-questions.md"
+  cp "$PO_SRC" "$PO_DST"
+  log "NOTE: PO questions captured at $PO_DST — build continues with best-effort defaults."
+fi

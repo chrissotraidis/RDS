@@ -1,0 +1,150 @@
+#!/usr/bin/env ruby
+# Pre-scaffold: write skill-using starter files into the app BEFORE the builder runs.
+#
+# Why: skills like shadcn-add install components/dependencies, but the builder
+# still sees a bare stack-init app/page.tsx with no shadcn imports — so it has
+# no reason to use the design system. Pre-scaffold replaces those defaults with
+# real, working starter pages that already consume the skill, so the builder
+# modifies skill-using code instead of choosing whether to use the skill.
+#
+# Safety rules (per-file, declared in each skill's prescaffold/MANIFEST.json):
+#   - if dest doesn't exist           -> write
+#   - if dest contains marker comment -> overwrite (it's our own from prior run)
+#   - if dest matches any string in   -> overwrite (a known stack-init default
+#     replace_if_contains_any                       we're allowed to replace)
+#   - else                            -> skip (likely builder/user authored)
+#
+# This makes pre-scaffold idempotent and resume-safe.
+
+require "json"
+require "fileutils"
+require "time"
+
+PRESCAFFOLD_MARKER = "RDS prescaffold:".freeze
+
+args = {}
+ARGV.each_with_index do |arg, idx|
+  next unless arg.start_with?("--")
+  key, value = arg[2..].split("=", 2)
+  value ||= ARGV[idx + 1] unless ARGV[idx + 1]&.start_with?("--")
+  args[key] = value
+end
+
+root = File.expand_path("..", __dir__)
+build_dir = args.fetch("build-dir")
+app_dest = args.fetch("app-dest")
+resolved_path = File.join(build_dir, "skills", "resolved.json")
+
+unless File.exist?(resolved_path)
+  puts "prescaffold: no resolved.json — skipping"
+  exit 0
+end
+
+resolved = JSON.parse(File.read(resolved_path)).fetch("resolved", [])
+
+written = []
+overwritten_default = []
+overwritten_marker = []
+skipped_user = []
+skills_with_prescaffold = []
+skills_without = []
+
+resolved.each do |skill|
+  slug = skill.fetch("slug")
+  src_dir = File.join(root, "skills", "built-in", slug, "prescaffold")
+  manifest_path = File.join(src_dir, "MANIFEST.json")
+  unless Dir.exist?(src_dir) && File.exist?(manifest_path)
+    skills_without << slug
+    next
+  end
+  skills_with_prescaffold << slug
+
+  manifest = JSON.parse(File.read(manifest_path))
+  writes = manifest.fetch("writes", [])
+
+  writes.each do |entry|
+    rel = entry.fetch("path")
+    src_rel = entry.fetch("source", rel)
+    src = File.join(src_dir, src_rel)
+    unless File.exist?(src)
+      warn "prescaffold: missing source #{src} for #{slug}; skipping"
+      next
+    end
+    dest = File.join(app_dest, rel)
+    replace_patterns = Array(entry["replace_if_contains_any"])
+
+    decision =
+      if !File.exist?(dest)
+        :write_new
+      else
+        existing = File.read(dest)
+        if existing.include?(PRESCAFFOLD_MARKER)
+          :overwrite_marker
+        elsif replace_patterns.any? { |p| existing.include?(p) }
+          :overwrite_default
+        else
+          :skip_user
+        end
+      end
+
+    case decision
+    when :skip_user
+      skipped_user << { slug: slug, path: rel }
+      puts "prescaffold: skip (user/builder-authored) #{rel}"
+      next
+    when :overwrite_marker
+      overwritten_marker << { slug: slug, path: rel }
+      puts "prescaffold: rewrite (prior prescaffold) #{rel} (from #{slug})"
+    when :overwrite_default
+      overwritten_default << { slug: slug, path: rel }
+      puts "prescaffold: replace stack default #{rel} (from #{slug})"
+    else
+      written << { slug: slug, path: rel }
+      puts "prescaffold: wrote #{rel} (from #{slug})"
+    end
+
+    FileUtils.mkdir_p(File.dirname(dest))
+    FileUtils.cp(src, dest)
+  end
+end
+
+manifest = {
+  generated_at: Time.now.utc.iso8601,
+  written: written,
+  overwritten_default: overwritten_default,
+  overwritten_marker: overwritten_marker,
+  skipped_user_authored: skipped_user,
+  skills_with_prescaffold: skills_with_prescaffold,
+  skills_without_prescaffold: skills_without,
+}
+FileUtils.mkdir_p(File.join(build_dir, "skills"))
+File.write(File.join(build_dir, "skills", "prescaffold-manifest.json"),
+           JSON.pretty_generate(manifest) + "\n")
+
+total = written.size + overwritten_default.size + overwritten_marker.size
+puts "prescaffold: #{total} file(s) installed " \
+     "(#{written.size} new, #{overwritten_default.size} replaced defaults, " \
+     "#{overwritten_marker.size} re-written), #{skipped_user.size} preserved"
+
+# Append a "Pre-scaffolded files" section to SKILLS.md so the builder reads
+# (via SKILLS.md) which files already consume which skills and must be kept.
+skills_md = File.join(app_dest, "SKILLS.md")
+if File.exist?(skills_md) && (written.any? || overwritten_default.any? || overwritten_marker.any?)
+  section = +"\n## Pre-scaffolded files\n\n"
+  section << "These files already exist and consume the skills listed above.\n"
+  section << "**Modify them in place — do not delete or rewrite from scratch.**\n"
+  section << "They include the marker comment `// RDS prescaffold: <slug>`; keep the skill imports.\n\n"
+  by_skill = (written + overwritten_default + overwritten_marker).group_by { |e| e[:slug] }
+  by_skill.each do |slug, entries|
+    section << "- **#{slug}**:\n"
+    entries.sort_by { |e| e[:path] }.uniq { |e| e[:path] }.each do |e|
+      section << "  - `#{e[:path]}`\n"
+    end
+  end
+
+  existing = File.read(skills_md)
+  unless existing.include?("## Pre-scaffolded files")
+    File.write(skills_md, existing.rstrip + "\n" + section)
+    puts "prescaffold: appended Pre-scaffolded files section to SKILLS.md"
+  end
+end

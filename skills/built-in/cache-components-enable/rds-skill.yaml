@@ -1,0 +1,20 @@
+---
+slug: cache-components-enable
+name: Next.js cache components
+status: ready
+default: false
+applies_to:
+- nextjs-fullstack
+description: Next.js cache component setup and conventions.
+install:
+  command: bin/rds-skill-materialize cache-components-enable
+verify:
+  command: bin/rds-skill-verify cache-components-enable
+maturity: beta
+category: performance
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should
+  understand during stack selection, skill resolution, implementation guidance, or
+  verification.
+source_links:
+- label: nextjs.org
+  url: https://nextjs.org/docs

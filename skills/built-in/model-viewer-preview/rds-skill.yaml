@@ -1,0 +1,18 @@
+---
+slug: model-viewer-preview
+name: model-viewer preview
+status: ready
+default: false
+applies_to:
+- game-asset-pipeline
+description: Browser preview surface for generated 3D assets.
+install:
+  command: bin/rds-skill-materialize model-viewer-preview
+verify:
+  command: bin/rds-skill-verify model-viewer-preview
+maturity: stable
+category: preview
+rationale: Asset-pipeline outputs need an inspectable browser preview, not just files on disk. This skill requires a model-viewer surface that proves generated assets load, frame, and render.
+source_links:
+- label: modelviewer.dev
+  url: https://modelviewer.dev/

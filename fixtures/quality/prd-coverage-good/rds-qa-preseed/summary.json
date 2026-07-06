@@ -1,0 +1,14 @@
+{
+  "pages": [
+    {
+      "url": "http://127.0.0.1:47101/",
+      "elements": [
+        { "href": "/sources" },
+        { "href": "/dashboard" }
+      ]
+    },
+    { "url": "http://127.0.0.1:47101/sources", "elements": [] },
+    { "url": "http://127.0.0.1:47101/dashboard", "elements": [] }
+  ]
+}
+

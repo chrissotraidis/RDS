@@ -1,0 +1,82 @@
+version: 1
+default_stack: rails-web
+preview_ports:
+  range: [4000, 4099]
+aliases:
+  rails: rails-web
+  react: react-spa
+  nextjs: nextjs-fullstack
+  react-native: mobile-native
+stacks:
+  - slug: rails-web
+    runtime_id: rails
+    manifest: stacks/rails/manifest.json
+    contract: stacks/rails/stack.yaml
+    status: ready
+    priority: 1
+  - slug: nextjs-fullstack
+    runtime_id: nextjs
+    manifest: stacks/nextjs/manifest.json
+    contract: stacks/nextjs/stack.yaml
+    status: ready
+    priority: 2
+  - slug: react-spa
+    runtime_id: react
+    manifest: stacks/react/manifest.json
+    contract: stacks/react/stack.yaml
+    status: defer
+    priority: 3
+  - slug: python-ai-service
+    runtime_id: python-ai-service
+    manifest: stacks/python-ai-service/manifest.json
+    contract: stacks/python-ai-service/stack.yaml
+    status: ready
+    priority: 4
+  - slug: astro-thin-web
+    runtime_id: astro-thin-web
+    manifest: stacks/astro-thin-web/manifest.json
+    contract: stacks/astro-thin-web/stack.yaml
+    status: ready
+    priority: 5
+  - slug: web-3d
+    runtime_id: web-3d
+    manifest: stacks/web-3d/manifest.json
+    contract: stacks/web-3d/stack.yaml
+    status: ready
+    priority: 6
+  - slug: game-engine
+    runtime_id: game-engine
+    manifest: stacks/game-engine/manifest.json
+    contract: stacks/game-engine/stack.yaml
+    status: ready
+    priority: 7
+  - slug: mobile-native
+    runtime_id: react-native
+    manifest: stacks/react-native/manifest.json
+    contract: stacks/react-native/stack.yaml
+    status: ready
+    priority: 8
+  - slug: browser-extension
+    runtime_id: browser-extension
+    manifest: stacks/browser-extension/manifest.json
+    contract: stacks/browser-extension/stack.yaml
+    status: ready
+    priority: 9
+  - slug: game-asset-pipeline
+    runtime_id: game-asset-pipeline
+    manifest: stacks/game-asset-pipeline/manifest.json
+    contract: stacks/game-asset-pipeline/stack.yaml
+    status: ready
+    priority: 10
+  - slug: cli-dev-tool
+    runtime_id: cli-dev-tool
+    manifest: stacks/cli-dev-tool/manifest.json
+    contract: stacks/cli-dev-tool/stack.yaml
+    status: defer
+    priority: 11
+  - slug: python-ml-pipeline
+    runtime_id: python-ml-pipeline
+    manifest: stacks/python-ml-pipeline/manifest.json
+    contract: stacks/python-ml-pipeline/stack.yaml
+    status: defer
+    priority: 12

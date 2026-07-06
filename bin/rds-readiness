@@ -1,0 +1,418 @@
+#!/usr/bin/env python3
+"""Assert that an RDS build is autonomously ready for operator review."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+
+REVIEW_READY_STAGES = [
+    "intake",
+    "spec",
+    "taste",
+    "skill-resolve",
+    "rails-init",
+    "skill-install",
+    "scaffold",
+    "local-run",
+    "deploy",
+    "qa",
+    "taste-review",
+]
+
+TYPED_ARTIFACT_BY_TYPE = {
+    "game": "game-verdict.json",
+    "website": "website-verdict.json",
+    "web-app": "workflow-verdict.json",
+    "dashboard": "workflow-verdict.json",
+    "internal-tool": "workflow-verdict.json",
+}
+
+RECOVERY_BY_CODE = {
+    "stage_not_complete": "Resume the build from the incomplete stage.",
+    "required_quality_stage_skipped": "Reset QA/taste-review and rerun the required quality stages.",
+    "preview_missing": "Reset deploy, QA, and taste-review; redeploy before review.",
+    "preview_pending": "Reset deploy, QA, and taste-review; complete Zo registration before review.",
+    "qa_iteration_missing": "Reset QA and taste-review so browser evidence is regenerated.",
+    "qa_summary_missing": "Reset QA and taste-review so crawler evidence is regenerated.",
+    "qa_not_converged": "Run a targeted app iteration, then rerun QA and taste-review.",
+    "spec_verdict_missing": "Reset QA and taste-review so spec coverage is regenerated.",
+    "spec_verdict_blocking": "Run a targeted app iteration against the unverified spec requirements.",
+    "visual_verdict_missing": "Reset QA and taste-review so visual audit evidence is regenerated.",
+    "visual_verdict_blocking": "Run a layout/polish iteration, then rerun QA.",
+    "scenario_verdict_missing": "Reset QA and taste-review so PRD scenario execution is regenerated.",
+    "scenario_verdict_blocking": "Run an app iteration against the failed PRD scenario transcript.",
+    "typed_uat_missing": "Reset QA and taste-review so typed UAT evidence is regenerated.",
+    "typed_uat_blocking": "Run an app iteration against the failed typed UAT criteria.",
+    "truthfulness_verdict_missing": "Reset QA and taste-review so product truthfulness evidence is regenerated.",
+    "truthfulness_verdict_blocking": "Run an app iteration that labels sample data, fake costs, stubbed integrations, and unfinished workflows in the UI.",
+    "persona_verdict_missing": "Reset QA and taste-review so authenticated persona evidence is regenerated.",
+    "persona_verdict_blocking": "Run an app iteration until the operator login path and protected route walkthrough work in Playwright.",
+    "prd_coverage_missing": "Reset QA and taste-review so PRD route/action coverage evidence is regenerated.",
+    "prd_coverage_blocking": "Run an app iteration against missing promised routes/actions, then rerun QA.",
+    "design_review_blocking": "Run a polish/design iteration using design-review.json evidence.",
+    "taste_review_missing": "Reset taste-review so RDS evaluates the current QA evidence.",
+    "taste_review_blocking": "Run the taste iteration prompt, then rerun taste-review.",
+    "qa_scenario_gate_blocking": "Regenerate stronger PRD-specific QA scenarios before scaffold, then restart the build.",
+    "taste_gate_blocking": "Strengthen the pre-scaffold taste brief, regenerate QA scenarios, then restart the build before scaffold.",
+    "quality_ledger_missing": "Regenerate quality-ledger.json and rerun readiness.",
+    "quality_ledger_blocking": "Inspect quality-ledger.json blockers and repair the highest-severity gate.",
+    "qa_evidence_stale": "Reset QA and taste-review so browser evidence is regenerated against the current app.",
+    "taste_review_stale": "Rerun taste-review against the latest QA evidence.",
+    "quality_ledger_stale": "Regenerate quality-ledger.json after the latest QA/taste evidence.",
+    "deploy_fingerprint_mismatch": "Rerun QA against the currently deployed artifact before review.",
+    "service_runtime_missing": "Redeploy so RDS can verify the live preview is serving the deployed artifact marker.",
+    "service_runtime_failed": "Redeploy or restart the Zo service until the live runtime marker matches the deploy fingerprint.",
+    "service_runtime_stale": "Rerun deploy so service-runtime.json is regenerated after the latest deploy fingerprint.",
+    "evidence_ledger_blocking": "Resolve the canonical evidence-ledger blocker, then rerun readiness.",
+}
+
+
+def read_text(path: Path, limit: int = 500_000) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="ignore")[:limit]
+    except Exception:
+        return ""
+
+
+def read_json(path: Path) -> Any:
+    try:
+        return json.loads(read_text(path))
+    except Exception:
+        return None
+
+
+def parse_ts(value: Any) -> float:
+    if not isinstance(value, str) or not value:
+        return 0.0
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0.0
+
+
+def file_ts(path: Path | None) -> float:
+    if not path:
+        return 0.0
+    try:
+        return path.stat().st_mtime
+    except Exception:
+        return 0.0
+
+
+def read_events(build_dir: Path) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for line in read_text(build_dir / "events.jsonl").splitlines()[-1000:]:
+        try:
+            event = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+    return events
+
+
+def latest_event_ts(events: list[dict[str, Any]], names: set[str]) -> float:
+    latest = 0.0
+    for event in events:
+        if event.get("event") in names:
+            latest = max(latest, parse_ts(event.get("ts")))
+    return latest
+
+
+def latest_stage_completed_ts(events: list[dict[str, Any]], stages: set[str]) -> float:
+    latest = 0.0
+    for event in events:
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        if event.get("event") == "stage_completed" and payload.get("stage") in stages:
+            latest = max(latest, parse_ts(event.get("ts")))
+    return latest
+
+
+def latest_iter(build_dir: Path) -> Path | None:
+    root = build_dir / "playwright"
+    if not root.exists():
+        return None
+    iters = sorted(path for path in root.glob("iter-*") if path.is_dir())
+    return iters[-1] if iters else None
+
+
+def add_issue(issues: list[dict[str, Any]], code: str, severity: str, detail: str, path: Path | None = None) -> None:
+    issues.append({
+        "code": code,
+        "severity": severity,
+        "detail": detail,
+        "path": str(path) if path else None,
+        "recovery": RECOVERY_BY_CODE.get(code, "Inspect the evidence path and rerun the failed stage."),
+    })
+
+
+def status_is_blocking(value: Any) -> bool:
+    return value in {False, "fail", "failed", "needs_iteration", "partial", "missing", "unknown", "skipped"}
+
+
+def design_status_is_blocking(value: Any) -> bool:
+    return value in {False, "fail", "failed", "needs_iteration", "partial", "missing", "unknown", "skipped"}
+
+
+def validate_build(root: Path, build_id: str) -> tuple[int, dict[str, Any]]:
+    build_dir = root / "builds" / build_id
+    issues: list[dict[str, Any]] = []
+    events = read_events(build_dir)
+    state = read_json(build_dir / "state.json")
+    if not isinstance(state, dict):
+        add_issue(issues, "state_missing", "blocker", "state.json is missing or invalid", build_dir / "state.json")
+        return 1, {"schema": "rds.readiness.v1", "buildId": build_id, "status": "fail", "issues": issues}
+
+    app_type = str(state.get("app_type") or "auto")
+    stages = state.get("stages") if isinstance(state.get("stages"), dict) else {}
+    for stage in REVIEW_READY_STAGES:
+        status = (stages.get(stage) or {}).get("status") if isinstance(stages.get(stage), dict) else None
+        if status not in {"done", "skipped"}:
+            add_issue(issues, "stage_not_complete", "blocker", f"{stage} is {status or 'missing'}", build_dir / "state.json")
+        if stage in {"qa", "taste-review"} and status == "skipped":
+            add_issue(issues, "required_quality_stage_skipped", "blocker", f"{stage} was skipped before review readiness", build_dir / "state.json")
+
+    preview = read_text(build_dir / "preview-url.txt", 2048).strip() or str(state.get("preview_url") or "").strip()
+    if not re.match(r"^https?://", preview):
+        add_issue(issues, "preview_missing", "blocker", f"preview URL is not a public/local HTTP URL: {preview or '<empty>'}", build_dir / "preview-url.txt")
+    if preview.startswith("pending-zo-registration://"):
+        add_issue(issues, "preview_pending", "blocker", "deploy left a pending Zo registration sentinel", build_dir / "preview-url.txt")
+    current_deploy_fingerprint = read_json(build_dir / "deploy-fingerprint.json")
+    service_runtime = read_json(build_dir / "service-runtime.json")
+    runtime_marker_required = isinstance(current_deploy_fingerprint, dict) and bool(current_deploy_fingerprint.get("runtimeMarkerPath"))
+    if runtime_marker_required:
+        if not isinstance(service_runtime, dict):
+            add_issue(issues, "service_runtime_missing", "blocker", "service-runtime.json is missing for a marker-enabled deploy", build_dir / "service-runtime.json")
+        elif service_runtime.get("status") != "pass":
+            add_issue(
+                issues,
+                "service_runtime_failed",
+                "blocker",
+                f"runtime marker status={service_runtime.get('status')} error={service_runtime.get('error')}",
+                build_dir / "service-runtime.json",
+            )
+        elif service_runtime.get("expectedHash") != current_deploy_fingerprint.get("hash") or service_runtime.get("servedHash") != current_deploy_fingerprint.get("hash"):
+            add_issue(
+                issues,
+                "service_runtime_failed",
+                "blocker",
+                "live runtime marker does not match deploy-fingerprint.json",
+                build_dir / "service-runtime.json",
+            )
+        elif file_ts(build_dir / "deploy-fingerprint.json") > file_ts(build_dir / "service-runtime.json") + 1:
+            add_issue(
+                issues,
+                "service_runtime_stale",
+                "blocker",
+                "service-runtime.json predates deploy-fingerprint.json",
+                build_dir / "service-runtime.json",
+            )
+
+    iter_dir = latest_iter(build_dir)
+    latest_app_change_ts = max(
+        latest_stage_completed_ts(events, {"deploy"}),
+        latest_event_ts(events, {
+            "iterate_apply_completed",
+            "iterate_deploy_completed",
+            "fixer_apply_completed",
+        }),
+        parse_ts(((stages.get("deploy") or {}).get("ended_at") if isinstance(stages.get("deploy"), dict) else None)),
+    )
+    latest_qa_ts = latest_event_ts(events, {"qa_iteration_completed", "iterate_qa_completed"})
+    if not iter_dir:
+        add_issue(issues, "qa_iteration_missing", "blocker", "no Playwright iteration exists", build_dir / "playwright")
+    else:
+        summary = read_json(iter_dir / "summary.json")
+        if not isinstance(summary, dict):
+            add_issue(issues, "qa_summary_missing", "blocker", "latest QA summary is missing", iter_dir / "summary.json")
+        elif summary.get("converged") is not True or int(summary.get("gapsFound") or 0) > 0:
+            add_issue(issues, "qa_not_converged", "blocker", f"crawler converged={summary.get('converged')} gaps={summary.get('gapsFound')}", iter_dir / "summary.json")
+
+        spec = read_json(iter_dir / "spec-verdict.json")
+        if not isinstance(spec, dict):
+            add_issue(issues, "spec_verdict_missing", "blocker", "spec-verdict.json is missing", iter_dir / "spec-verdict.json")
+        elif status_is_blocking(spec.get("overall")):
+            add_issue(issues, "spec_verdict_blocking", "blocker", f"spec verdict is {spec.get('overall')}", iter_dir / "spec-verdict.json")
+
+        visual = read_json(iter_dir / "visual-verdict.json")
+        if not isinstance(visual, dict):
+            add_issue(issues, "visual_verdict_missing", "blocker", "visual-verdict.json is missing", iter_dir / "visual-verdict.json")
+        elif status_is_blocking(visual.get("status")) or int(visual.get("blockerCount") or 0) > 0:
+            add_issue(issues, "visual_verdict_blocking", "blocker", f"visual status={visual.get('status')} blockers={visual.get('blockerCount')}", iter_dir / "visual-verdict.json")
+
+        scenarios = read_json(iter_dir / "scenario-verdict.json")
+        if not isinstance(scenarios, dict):
+            add_issue(issues, "scenario_verdict_missing", "blocker", "scenario-verdict.json is missing", iter_dir / "scenario-verdict.json")
+        elif scenarios.get("status") != "pass" or int(scenarios.get("blockingFailures") or 0) > 0:
+            add_issue(issues, "scenario_verdict_blocking", "blocker", f"scenario status={scenarios.get('status')} blockers={scenarios.get('blockingFailures')}", iter_dir / "scenario-verdict.json")
+
+        typed_name = TYPED_ARTIFACT_BY_TYPE.get(app_type)
+        if typed_name:
+            typed = read_json(iter_dir / typed_name)
+            if not isinstance(typed, dict):
+                add_issue(issues, "typed_uat_missing", "blocker", f"{typed_name} is missing for app_type={app_type}", iter_dir / typed_name)
+            elif typed.get("status") != "pass":
+                add_issue(issues, "typed_uat_blocking", "blocker", f"{typed_name} status={typed.get('status')} score={typed.get('score')}", iter_dir / typed_name)
+
+        design = read_json(iter_dir / "design-review.json")
+        if isinstance(design, dict) and design_status_is_blocking(design.get("status")):
+            add_issue(issues, "design_review_blocking", "blocker", f"design status={design.get('status')} score={design.get('score')}", iter_dir / "design-review.json")
+
+        truthfulness = read_json(iter_dir / "truthfulness-verdict.json")
+        if not isinstance(truthfulness, dict):
+            add_issue(issues, "truthfulness_verdict_missing", "blocker", "truthfulness-verdict.json is missing", iter_dir / "truthfulness-verdict.json")
+        elif truthfulness.get("status") != "pass":
+            add_issue(
+                issues,
+                "truthfulness_verdict_blocking",
+                "blocker",
+                f"truthfulness status={truthfulness.get('status')} score={truthfulness.get('score')}",
+                iter_dir / "truthfulness-verdict.json",
+            )
+
+        persona = read_json(iter_dir / "persona-verdict.json")
+        if not isinstance(persona, dict):
+            add_issue(issues, "persona_verdict_missing", "blocker", "persona-verdict.json is missing", iter_dir / "persona-verdict.json")
+        elif persona.get("status") != "pass":
+            add_issue(
+                issues,
+                "persona_verdict_blocking",
+                "blocker",
+                f"persona status={persona.get('status')} score={persona.get('score')}",
+                iter_dir / "persona-verdict.json",
+            )
+
+        prd_coverage = read_json(iter_dir / "prd-coverage-verdict.json")
+        if not isinstance(prd_coverage, dict):
+            add_issue(issues, "prd_coverage_missing", "blocker", "prd-coverage-verdict.json is missing", iter_dir / "prd-coverage-verdict.json")
+        elif prd_coverage.get("status") != "pass":
+            add_issue(
+                issues,
+                "prd_coverage_blocking",
+                "blocker",
+                f"PRD coverage status={prd_coverage.get('status')} score={prd_coverage.get('score')}",
+                iter_dir / "prd-coverage-verdict.json",
+            )
+
+        qa_evidence_ts = max(latest_qa_ts, file_ts(iter_dir / "summary.json"), file_ts(iter_dir / "scenario-verdict.json"))
+        if latest_app_change_ts and qa_evidence_ts and latest_app_change_ts > qa_evidence_ts + 1:
+            add_issue(
+                issues,
+                "qa_evidence_stale",
+                "blocker",
+                "app-changing work happened after the latest QA evidence",
+                iter_dir / "summary.json",
+            )
+        qa_deploy_fingerprint = read_json(iter_dir / "deploy-fingerprint.json")
+        current_hash = current_deploy_fingerprint.get("hash") if isinstance(current_deploy_fingerprint, dict) else None
+        qa_hash = qa_deploy_fingerprint.get("hash") if isinstance(qa_deploy_fingerprint, dict) else None
+        if current_hash and qa_hash and current_hash != qa_hash:
+            add_issue(
+                issues,
+                "deploy_fingerprint_mismatch",
+                "blocker",
+                "latest QA evidence was captured against a different deployed artifact",
+                iter_dir / "deploy-fingerprint.json",
+            )
+        qa_service_runtime = read_json(iter_dir / "service-runtime.json")
+        current_runtime_hash = service_runtime.get("servedHash") if isinstance(service_runtime, dict) else None
+        qa_runtime_hash = qa_service_runtime.get("servedHash") if isinstance(qa_service_runtime, dict) else None
+        if current_runtime_hash and qa_runtime_hash and current_runtime_hash != qa_runtime_hash:
+            add_issue(
+                issues,
+                "service_runtime_failed",
+                "blocker",
+                "latest QA evidence was captured against a different live runtime marker",
+                iter_dir / "service-runtime.json",
+            )
+
+    taste = read_json(build_dir / "taste-review.json")
+    scenario_gate = read_json(build_dir / "qa-scenario-gate.json")
+    if isinstance(scenario_gate, dict) and scenario_gate.get("status") == "fail":
+        issue_codes = ", ".join(str(issue.get("code")) for issue in scenario_gate.get("issues") or [] if isinstance(issue, dict))
+        add_issue(issues, "qa_scenario_gate_blocking", "blocker", f"pre-scaffold QA scenario gate failed: {issue_codes or 'unknown'}", build_dir / "qa-scenario-gate.json")
+    taste_gate = read_json(build_dir / "taste-gate.json")
+    if isinstance(taste_gate, dict) and taste_gate.get("status") == "fail":
+        issue_codes = ", ".join(str(issue.get("code")) for issue in taste_gate.get("issues") or [] if isinstance(issue, dict))
+        add_issue(issues, "taste_gate_blocking", "blocker", f"pre-scaffold taste gate failed: {issue_codes or 'unknown'}", build_dir / "taste-gate.json")
+    if not isinstance(taste, dict):
+        add_issue(issues, "taste_review_missing", "blocker", "taste-review.json is missing", build_dir / "taste-review.json")
+    elif taste.get("status") != "pass":
+        add_issue(issues, "taste_review_blocking", "blocker", f"taste status={taste.get('status')} score={taste.get('score')}", build_dir / "taste-review.json")
+    elif latest_qa_ts and file_ts(build_dir / "taste-review.json") and latest_qa_ts > file_ts(build_dir / "taste-review.json") + 1:
+        add_issue(issues, "taste_review_stale", "blocker", "taste-review.json predates the latest QA run", build_dir / "taste-review.json")
+
+    ledger = read_json(build_dir / "quality-ledger.json")
+    if not isinstance(ledger, dict):
+        add_issue(issues, "quality_ledger_missing", "blocker", "quality-ledger.json is missing", build_dir / "quality-ledger.json")
+    else:
+        blocking = ledger.get("blocking") if isinstance(ledger.get("blocking"), list) else []
+        if blocking:
+            add_issue(issues, "quality_ledger_blocking", "blocker", f"quality ledger has blocking gates: {', '.join(map(str, blocking))}", build_dir / "quality-ledger.json")
+        latest_quality_input_ts = max(latest_qa_ts, file_ts(build_dir / "taste-review.json"))
+        if latest_quality_input_ts and file_ts(build_dir / "quality-ledger.json") and latest_quality_input_ts > file_ts(build_dir / "quality-ledger.json") + 1:
+            add_issue(issues, "quality_ledger_stale", "blocker", "quality-ledger.json predates the latest QA/taste evidence", build_dir / "quality-ledger.json")
+
+    status = "pass" if not issues else "fail"
+    payload = {
+        "schema": "rds.readiness.v1",
+        "buildId": build_id,
+        "status": status,
+        "appType": app_type,
+        "previewUrl": preview,
+        "latestPlaywrightIteration": iter_dir.name if iter_dir else None,
+        "issues": issues,
+    }
+    out = build_dir / "readiness.json"
+    out.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+    if status == "pass":
+        ledger_cmd = Path(__file__).resolve().parent / "rds-evidence-ledger"
+        if ledger_cmd.exists():
+            subprocess.run([str(ledger_cmd), build_id, "--root", str(root)], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            evidence = read_json(build_dir / "evidence-ledger.json")
+            blockers = evidence.get("blockers") if isinstance(evidence, dict) and isinstance(evidence.get("blockers"), list) else []
+            existing_codes = {str(issue.get("code")) for issue in issues if isinstance(issue, dict)}
+            for blocker in blockers:
+                if not isinstance(blocker, dict) or blocker.get("severity") == "warning":
+                    continue
+                code = str(blocker.get("code") or "unknown")
+                if code in existing_codes:
+                    continue
+                detail = f"{code}: {blocker.get('message') or 'canonical evidence ledger blocks review'}"
+                source = blocker.get("source")
+                source_path = root / source if isinstance(source, str) and source else build_dir / "evidence-ledger.json"
+                add_issue(issues, "evidence_ledger_blocking", "blocker", detail, source_path)
+            if issues:
+                payload["status"] = "fail"
+                payload["issues"] = issues
+                out.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+                subprocess.run([str(ledger_cmd), build_id, "--root", str(root)], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                status = "fail"
+    return (0 if status == "pass" else 1), payload
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("build_id")
+    parser.add_argument("--root", default=str(Path(__file__).resolve().parents[1]))
+    args = parser.parse_args()
+
+    rc, payload = validate_build(Path(args.root).resolve(), args.build_id)
+    print(json.dumps({
+        "status": payload["status"],
+        "path": str(Path(args.root).resolve() / "builds" / args.build_id / "readiness.json"),
+        "issues": len(payload["issues"]),
+    }))
+    return rc
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

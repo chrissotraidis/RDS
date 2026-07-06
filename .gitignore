@@ -1,0 +1,59 @@
+# Environment / secrets
+.env
+.rds-installed
+config/model.env
+
+# Build outputs — everything under builds/<id>/ except README + .gitkeep
+builds/*
+!builds/.gitkeep
+!builds/README.md
+
+# Global event substrate (TD-014). Runtime data, not source.
+events.jsonl
+events.jsonl.lock
+
+# Dashboard runtime
+dashboard/node_modules/
+dashboard/bun.lock
+dashboard/bun.lockb
+dashboard/audit.jsonl
+dashboard/chat/*
+!dashboard/chat/.gitkeep
+dashboard/dismissed-alerts.json
+dashboard/dismissed-reviews.json
+dashboard/last-refresh.json
+
+# Operator-provided build inputs. Keep fixture docs tracked.
+inbox/*.md
+!inbox/fixture-prd.md
+!inbox/fixture-research.md
+inbox/attachments/
+
+# Generated brown-field smoke-test fixture (rebuild with build-fixture-repo.sh)
+fixtures/fixture-brown-field-repo.git/
+fixtures/_work/
+
+# Held-back planning/source/reference material for public release boundary
+/notes/
+/research/
+/ref/
+
+# Vendor scratch
+vendor/*/tmp/
+
+# Logs
+logs/
+*.log
+
+# macOS / editor cruft
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Ruby / bundler scratch the vendored template might drop here at runtime
+vendor/bundle/
+
+# Node (shouldn't be used, but just in case Scaffold pulls something)
+node_modules/

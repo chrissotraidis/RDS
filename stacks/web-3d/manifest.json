@@ -1,0 +1,43 @@
+{
+  "id": "web-3d",
+  "name": "3D web experience",
+  "language": "typescript",
+  "runtime": {
+    "bun": ">=1.1.0",
+    "node": ">=20"
+  },
+  "framework": {
+    "name": "react-three-fiber",
+    "version": "9"
+  },
+  "database": "none",
+  "default_port_range": [
+    4000,
+    4099
+  ],
+  "health_path": "/",
+  "stages": [
+    "intake",
+    "spec",
+    "init",
+    "scaffold",
+    "local-run",
+    "deploy",
+    "qa"
+  ],
+  "init": "stacks/web-3d/init.sh",
+  "local_run": "stacks/web-3d/local-run.sh",
+  "doctor": "stacks/web-3d/doctor.sh",
+  "scaffold_recipe": "web_3d",
+  "service_entrypoint": "bash -c 'bun install --frozen-lockfile || bun install; exec bunx --bun vite --host 0.0.0.0 --port %(ENV_PORT)s --strictPort'",
+  "service_env": {
+    "NODE_ENV": "development",
+    "RDS_RUNTIME": "zo"
+  },
+  "supports_modes": [
+    "green",
+    "brown"
+  ],
+  "status": "ready",
+  "notes": "Ready V1 Phase 1b stack for browser-rendered Three.js/R3F scenes, configurators, and 3D product experiences."
+}

@@ -1,0 +1,45 @@
+---
+slug: react-spa
+runtime_id: react
+name: React single-page app
+description: Client-only React 19 + Vite app for browser games, dashboards, prototypes,
+  and interactive tools.
+category: client-only-web
+v1_status: defer
+priority: 3
+language:
+  primary: typescript
+framework:
+  name: react
+  version: '19'
+scaffold:
+  command: stacks/react/init.sh
+commands:
+  install: bun install
+  run: bunx --bun vite --host 0.0.0.0 --port ${HOST_PORT} --strictPort
+  doctor: stacks/react/doctor.sh
+ports:
+  range:
+  - 4000
+  - 4099
+health_path: "/"
+deploy:
+  preview_on_zo: durable-zo-http-service
+  default_external: cloudflare-pages
+mockup_analog:
+  primary: single-html-mockup
+public_preview_model:
+  type: static-bundle
+compatible_skills:
+  primary:
+  - rds-mockup-fidelity
+  universal:
+  - rds-context7-mount
+  - rds-eval-harness
+agent_notes:
+  primary: claude-code
+  codex_role: Small component fixes and test generation.
+  v1_note: Deferred in V1; nextjs-fullstack owns the modern-web default unless a Vite-only
+    SPA is explicitly requested.
+aliases:
+- react

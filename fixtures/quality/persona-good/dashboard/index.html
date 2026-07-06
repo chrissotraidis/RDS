@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8" /><title>Dashboard</title></head>
+  <body>
+    <main>
+      <h1>Dashboard</h1>
+      <p>Running orders, source queue, and operator alerts are visible.</p>
+      <a href="/orders/">Orders</a>
+      <button id="refresh">Refresh queue</button>
+      <p id="status">Idle</p>
+    </main>
+    <script>
+      if (localStorage.getItem("operator-session") !== "ok") location.href = "/login/";
+      document.getElementById("refresh").onclick = () => document.getElementById("status").textContent = "Queue refreshed";
+    </script>
+  </body>
+</html>

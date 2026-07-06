@@ -1,0 +1,17 @@
+---
+slug: deploy-eas-build
+name: EAS Build deploy
+status: curated
+category: deploy
+maturity: beta
+applies_to:
+- mobile-native
+description: Expo EAS preview build artifact contract.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: docs.expo.dev
+  url: https://docs.expo.dev/build/introduction/
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

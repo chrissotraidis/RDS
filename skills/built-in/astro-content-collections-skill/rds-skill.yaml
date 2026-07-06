@@ -1,0 +1,18 @@
+---
+slug: astro-content-collections-skill
+name: Astro content collections
+status: ready
+default: false
+applies_to:
+- astro-thin-web
+description: Content collection schema and routing conventions for Astro.
+install:
+  command: bin/rds-skill-materialize astro-content-collections-skill
+verify:
+  command: bin/rds-skill-verify astro-content-collections-skill
+maturity: stable
+category: content
+rationale: Astro content-led builds need typed collections and predictable routes instead of ad hoc markdown globbing. This skill keeps marketing/docs/blog content structured and build-validated.
+source_links:
+- label: docs.astro.build
+  url: https://docs.astro.build/en/guides/content-collections/

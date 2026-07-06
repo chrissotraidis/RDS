@@ -1,0 +1,84 @@
+name: Mobile Native App
+type: mobile_native
+keywords:
+  - mobile
+  - expo
+  - react native
+  - ios
+  - android
+  - eas
+  - expo router
+description: >
+  Expo + React Native mobile app with Expo Router, TypeScript, mockup-screen
+  fidelity targets, Zo web fallback preview, and EAS build handoff.
+
+framework:
+  primary: Expo
+  navigation: Expo Router
+  language: TypeScript
+  runtime: Bun + Node
+  deployment: Expo Go tunnel or EAS artifact
+
+workflow:
+  capabilities:
+    native_mobile: true
+    device_preview: true
+    web_fallback: true
+    screen_mockups: true
+    native_tests: false
+    database: false
+
+finalization:
+  commands:
+    - bun install
+    - bun run check
+  checks:
+    - name: TypeScript check
+      command: bun run check
+      type: compilation
+      required: true
+    - name: Zo fallback preview
+      command: bun preview-server.ts
+      type: runtime
+      required: true
+
+verification:
+  setup_commands:
+    - bun install
+  boot_command: HOST_PORT=3000 bun preview-server.ts
+  health_checks:
+    - url: "http://localhost:3000/health.json"
+      expected_status: 200
+    - url: "http://localhost:3000/"
+      expected_status: 200
+  test_command: bun run check
+
+sections:
+  - name: Runtime Contract
+    phase: pipeline
+    labels: ["setup", "mobile"]
+    description: Keep the generated project an Expo Router app.
+    guidance:
+      - Preserve app.json, eas.json, Expo Router, and TypeScript.
+      - Preserve mockup-screens/ as the screen fidelity contract.
+      - Keep the Zo fallback preview bootable even when Expo/EAS credentials are absent.
+      - Treat App Store, Play Store, and EAS submit as explicit deploy skills, not defaults.
+
+  - name: Native UX
+    phase: pipeline
+    labels: ["mobile", "frontend"]
+    description: Implement native screens from the PRD.
+    guidance:
+      - Build real screens using React Native primitives.
+      - Account for safe areas, keyboard behavior, offline states, and device permissions.
+      - Avoid browser-only APIs in app screens.
+      - Keep native modules within Expo Go unless the PRD explicitly needs a development build.
+
+  - name: Quality
+    phase: pipeline
+    labels: ["qa"]
+    description: Verify typecheck, preview, and handoff instructions.
+    guidance:
+      - bun run check must pass.
+      - /health.json must return 200.
+      - If native modules are added, document whether Expo Go still works or an EAS development build is required.

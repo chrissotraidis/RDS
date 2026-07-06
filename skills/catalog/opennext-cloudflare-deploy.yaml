@@ -1,0 +1,17 @@
+---
+slug: opennext-cloudflare-deploy
+name: OpenNext Cloudflare deploy
+status: curated
+category: deploy
+maturity: beta
+applies_to:
+- nextjs-fullstack
+description: OpenNext deployment path for Cloudflare.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: opennext.js.org
+  url: https://opennext.js.org/cloudflare
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

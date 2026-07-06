@@ -1,0 +1,319 @@
+name: Bot / Agent
+type: bot_agent
+keywords:
+  - bot
+  - chatbot
+  - agent
+  - discord
+  - slack
+  - telegram
+  - assistant
+  - automation
+  - ai agent
+  - conversational
+  - webhook
+  - integration
+description: >
+  Conversational bot or automated agent with a Rails 8+ backend.
+  Rails handles webhook ingestion, conversation state, user
+  management, AI/LLM integration, and business logic. The bot
+  connects to one or more platforms (Discord, Slack, Telegram,
+  web chat) via their APIs and webhooks.
+
+framework:
+  primary: Rails 8+ (full or API mode)
+  bot_adapters: Platform SDKs (discordrb, slack-ruby-client, telegram-bot-ruby)
+  ai_integration: ruby-openai, anthropic gem, or HTTP client to LLM APIs
+  realtime: Action Cable (for web-based chat widget)
+  deployment: Kamal 2
+
+workflow:
+  capabilities:
+    browser_ui: true
+    http_routes: true
+    background_work: true
+    email_delivery: true
+    authn: true
+    authz: true
+    seed_data: true
+    accessibility: true
+    native_tests: true
+
+mcp:
+  capabilities:
+    - database_schema
+    - docs_lookup
+  hints:
+    database_schema:
+      adapter: sqlite3
+      schema_paths: ["db/schema.rb"]
+      migration_paths: ["db/migrate"]
+      model_paths: ["app/models"]
+    docs_lookup:
+      frameworks: ["rails", "action_cable", "solid_queue"]
+
+finalization:
+  commands:
+    - bundle install
+    - bin/rails db:prepare
+  checks:
+    - name: Boot check
+      command: "bin/rails runner 'puts Rails.version'"
+      type: custom
+      required: true
+
+verification:
+  checks:
+    - name: Solid stack
+      type: solid_stack
+      required: true
+  setup_commands:
+    - bin/setup
+  boot_command: bin/rails server -p 3000 -d
+  health_checks:
+    - url: "http://localhost:3000/up"
+      expected_status: 200
+  test_command: bin/rails test
+  cleanup_command: kill $(cat tmp/pids/server.pid)
+
+sections:
+  - name: Local Development
+    phase: pipeline
+    labels: ["setup"]
+    description: >
+      Development environment setup that ensures the bot's Rails
+      backend boots and responds locally with zero external dependencies.
+      During pipeline iterations, platform connections (Discord, Slack,
+      Telegram) and LLM API calls are stubbed. The project must be
+      testable via local webhook simulation and a console-based
+      interaction mode.
+    rails_tools:
+      - bin/setup (Rails default setup script)
+      - bin/dev (Procfile.dev via foreman)
+      - SQLite (Rails 8 default, zero-dependency database)
+      - Solid Queue (zero-dependency job backend)
+    guidance:
+      - The bootstrap task (task 0) MUST produce a project that starts with bin/dev
+      - bin/setup MUST run successfully (bundle install + db:prepare) with no manual steps
+      - >
+        Do NOT manually create Procfile.dev — the scaffold provides one.
+        If it is missing or needs changes, use this canonical content:
+          web: bin/rails server
+          css: bin/rails "tailwindcss:watch[always]"
+          queue: bin/jobs
+        The [always] flag is REQUIRED — without it the CSS watcher exits
+        immediately when foreman closes stdin. Solid Cable and Solid Cache
+        do NOT need their own processes (they run inside Puma).
+      - Use SQLite for development and test databases (Rails 8 default)
+      - Create db/seeds.rb with demo conversations, messages, and test users
+      - Create .env.example listing optional integration variables (none required to boot)
+      - The /up health check MUST respond 200 immediately after bootstrap
+      - Platform SDKs (Discord, Slack, Telegram) MUST NOT crash when credentials are absent — use null adapters or skip connection
+      - LLM API calls MUST degrade gracefully when API keys are absent (return canned responses or log the intended call)
+      - Provide a rake task or console command (e.g., rake bot:console) to simulate sending messages locally without a real platform connection
+      - Webhook endpoints MUST accept POST requests locally for testing with curl or request specs
+      - Do NOT generate tasks for platform bot registration, production hosting, or persistent WebSocket process management during pipeline execution
+    solid_stack_setup: >
+      Bot/agent apps heavily use Solid Queue for async message processing,
+      LLM calls, and action execution. Solid Cable may also be needed if
+      a web chat widget uses Action Cable. Each requires its own SQLite
+      database in development.
+
+      Required bootstrap steps for the Solid stack:
+
+      1. Run the install generators for needed components:
+           bin/rails solid_queue:install
+           bin/rails solid_cable:install    (only if web chat widget uses Action Cable)
+           bin/rails solid_cache:install    (only if LLM response caching is needed)
+
+      2. Verify database.yml has entries for ALL environments, not just
+         production. After running the generators, database.yml should
+         include the queue database (and cable/cache if installed) under
+         development:
+
+           development:
+             primary:
+               <<: *default
+               database: storage/development.sqlite3
+             queue:
+               <<: *default
+               database: storage/development_queue.sqlite3
+               migrations_paths: db/queue_migrate
+
+      3. Verify config/application.rb (not just production.rb) contains
+         the connects_to directives so they apply in all environments:
+           config.solid_queue.connects_to = { database: { writing: :queue } }
+
+      4. Run bin/rails db:prepare to create and load schemas for all
+         databases including queue.
+
+      Common failure mode: The generators sometimes only add database
+      entries under the production section of database.yml, and place
+      connects_to config in config/environments/production.rb only. The
+      bootstrap task MUST verify these exist in the development section
+      and in application.rb (or development.rb) before considering setup
+      complete.
+
+      If the app does not need background jobs (unlikely for a bot), skip
+      Solid Queue entirely rather than installing it and leaving it
+      misconfigured.
+
+      ANTI-PATTERNS — common mistakes AI agents make with Procfile.dev:
+      - Do NOT add `cable: bin/rails solid_cable:start` — there is no such
+        command. Solid Cable polls from within the Puma process.
+      - Do NOT add `cache: bin/rails solid_cache:start` — there is no such
+        command. Solid Cache operates inline within the web process.
+      - Do NOT use bare `tailwindcss:watch` — it exits immediately when
+        stdin is closed (which foreman does). Use `tailwindcss:watch[always]`.
+
+  - name: Platform Integration
+    phase: pipeline
+    labels: ["backend"]
+    description: >
+      Connecting to messaging platforms via webhooks, WebSockets,
+      or polling. Handling platform-specific message formats and
+      API constraints.
+    rails_tools:
+      - ActionController (webhook endpoints)
+      - ActiveJob / Solid Queue (async message processing)
+    guidance:
+      - Accept platform webhooks at dedicated controller endpoints
+      - Verify webhook signatures for security (each platform has its own method)
+      - Normalize incoming messages to a common internal format immediately
+      - Handle platform rate limits and retry policies
+      - Support multiple platforms via adapter pattern (normalize early)
+      - For Discord/Slack bots requiring persistent WebSocket, run adapter as a separate process alongside Rails
+      - In development, webhook endpoints should accept unsigned requests when signature keys are absent (with a logged warning)
+
+  - name: Conversation Management
+    phase: pipeline
+    labels: ["backend", "database"]
+    description: >
+      Message handling, conversation state, context tracking,
+      and multi-turn interactions.
+    rails_tools:
+      - ActiveRecord (Conversation, Message, User models)
+      - Callbacks or state machine gem (aasm) for conversation flow
+    guidance:
+      - Store all messages in a conversations/messages table for context
+      - Track conversation state (active, waiting_for_input, completed)
+      - Define clear conversation flows as state machines for structured bots
+      - For AI-powered bots, maintain a sliding context window of recent messages
+      - Handle conversation timeouts and stale session cleanup
+      - Support conversation handoff to human operators when needed
+
+  - name: Command & Intent Handling
+    phase: pipeline
+    labels: ["backend"]
+    description: >
+      Parsing user input into actionable intents, routing to
+      handlers, and executing commands.
+    guidance:
+      - For command-based bots, parse !command or /command prefixes
+      - For AI-powered bots, use LLM to extract intent and entities
+      - Route intents to handler classes (one class per intent/command)
+      - Define a fallback handler for unrecognized input
+      - Support help/info commands that list available capabilities
+      - Log all command invocations for analytics and debugging
+
+  - name: AI / LLM Integration
+    phase: pipeline
+    labels: ["backend"]
+    description: >
+      Connecting to language models for natural language understanding,
+      generation, and tool use.
+    rails_tools:
+      - ruby-openai or anthropic gem (API clients)
+      - Solid Queue (async LLM calls to avoid blocking)
+      - Solid Cache (cache repeated query responses)
+    guidance:
+      - Wrap LLM calls in a service object with timeout and retry logic
+      - Stream responses when the platform supports it (better UX)
+      - Cache responses for common or repeated queries to reduce cost
+      - Implement token counting and budget limits per user or conversation
+      - Store prompt templates in the database or config for easy iteration
+      - Use background jobs for LLM calls; respond with "thinking..." indicator
+      - Implement tool/function calling if the bot needs to take actions
+      - In development, the LLM service MUST return canned/stub responses when API keys are absent rather than raising errors
+
+  - name: Actions & Side Effects
+    phase: pipeline
+    labels: ["backend"]
+    description: >
+      Things the bot can do beyond responding: creating records,
+      calling APIs, scheduling tasks, sending notifications.
+    rails_tools:
+      - ActiveRecord (CRUD operations)
+      - ActiveJob / Solid Queue (async action execution)
+      - ActionMailer (email notifications)
+      - HTTP clients (Faraday) for external API calls
+    guidance:
+      - Define each action as a discrete service object
+      - Confirm destructive actions before executing ("Are you sure?")
+      - Log all actions with the triggering user and conversation context
+      - Handle external API failures gracefully; report back to user
+      - Rate limit actions per user to prevent abuse
+
+  - name: Web Chat Widget
+    phase: pipeline
+    labels: ["frontend"]
+    description: >
+      Optional browser-based chat interface embedded on a website,
+      powered by Action Cable.
+    rails_tools:
+      - Action Cable / Solid Cable (WebSocket)
+      - Turbo Streams (real-time message rendering)
+      - Stimulus (chat UI controller)
+    guidance:
+      - Build as an embeddable widget (iframe or JS snippet)
+      - Use Action Cable for real-time message delivery
+      - Support typing indicators and read receipts
+      - Handle reconnection gracefully when WebSocket drops
+      - Style to match the host website (configurable colors/branding)
+      - Solid Cable eliminates Redis dependency for Action Cable in development
+
+  - name: Testing
+    phase: pipeline
+    labels: ["testing"]
+    description: >
+      Testing conversation flows, command handling, and platform
+      integration. Tests are generated alongside feature tasks and must
+      be runnable locally with zero external dependencies. The spec's
+      GIVEN/WHEN/THEN scenarios are the primary source for integration
+      test cases.
+    rails_tools:
+      - Minitest (default)
+      - WebMock or VCR (mock platform APIs and LLM calls)
+      - Fixtures or FactoryBot
+    guidance:
+      - Every webhook, conversation, or UI task MUST ship with at least one relevant automated test or executable experience check derived from the spec's GIVEN/WHEN/THEN scenarios
+      - All tests MUST pass with bin/rails test using only local resources
+      - No test may depend on network access, deployed services, or production credentials
+      - Mock platform webhook payloads for controller tests
+      - Test conversation state transitions end-to-end
+      - Mock LLM responses with WebMock — never call real APIs in tests
+      - Test edge cases (empty input, very long messages, special characters)
+      - Test rate limiting and abuse prevention
+      - Test the local console/rake interaction mode
+      - Use fixtures or factories that mirror db/seeds.rb structure
+
+  - name: Deployment & Operations
+    phase: post_pipeline
+    description: >
+      Running the bot reliably with monitoring and uptime. This section
+      is NOT executed during pipeline iterations. Tasks derived from
+      this section should only be generated after the implementation
+      has passed analysis and the pipeline has converged on a working
+      local build.
+    rails_tools:
+      - Kamal 2 (deploy Rails app)
+      - Solid Queue (reliable job processing)
+      - Procfile or kamal accessories (for persistent bot processes)
+    guidance:
+      - Deploy Rails with Kamal; run bot adapter processes as Kamal accessories
+      - Monitor webhook delivery failures (platforms stop sending if you're down)
+      - Set up health checks and uptime monitoring
+      - Log conversation metrics (messages/day, response times, error rates)
+      - Plan for graceful restarts (don't drop in-flight conversations)
+      - DO NOT generate deployment tasks during pipeline iterations
+      - Deployment configuration is deferred until the project passes all tier gates and analysis

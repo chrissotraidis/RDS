@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+# bin/rds-chat — ad-hoc question/answer pass through the selected RDS builder, with
+# optional build context. Used by the Hub's chat panel and from the shell.
+#
+# Reads the prompt from stdin. Optionally takes a --build-id; if given, the
+# build's state.json + last 60 events + most-recent stage log tail are
+# included as context. The response is written to stdout AND, if a build is
+# given, appended as a chat-turn record to builds/<id>/chat-<ts>.md plus an
+# event on the build's stream.
+#
+# Usage:
+#   echo "what's wrong with the build?" | bin/rds-chat --build-id=<id>
+#   echo "explain the rds pipeline" | bin/rds-chat
+#
+# Env:
+#   RDS_CHAT_BUDGET_USD  default 0.40 (chats are short)
+#   IS_SANDBOX           forwarded to Claude where applicable (set to 1 inside Zo)
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck disable=SC1091
+source "$ROOT/bin/lib/common.sh"
+
+BUILD_ID=""
+BUDGET="${RDS_CHAT_BUDGET_USD:-0.40}"
+for arg in "$@"; do
+  case "$arg" in
+    --build-id=*)         BUILD_ID="${arg#*=}" ;;
+    --max-budget-usd=*)   BUDGET="${arg#*=}" ;;
+    -h|--help)            sed -n '2,18p' "$0"; exit 0 ;;
+    *)                    echo "unknown arg: $arg" >&2; exit 1 ;;
+  esac
+done
+
+message="$(cat)"
+[[ -n "$message" ]] || { echo "FATAL: no message on stdin" >&2; exit 1; }
+
+context=""
+build_dir=""
+PROVIDER="${RDS_INFERENCE_PROVIDER:-claude}"
+if [[ -n "$BUILD_ID" ]]; then
+  build_dir="$RDS_BUILDS_DIR/$BUILD_ID"
+  if [[ -d "$build_dir" ]]; then
+    state="$(cat "$build_dir/state.json" 2>/dev/null || echo '{}')"
+    PROVIDER="$(rds_build_provider_from_state "$build_dir")"
+    PROVIDER="${PROVIDER:-${RDS_INFERENCE_PROVIDER:-claude}}"
+    build_claude_model="$(jq -r '.inference.claude_model // empty' "$build_dir/state.json" 2>/dev/null || true)"
+    build_codex_model="$(jq -r '.inference.codex_model // empty' "$build_dir/state.json" 2>/dev/null || true)"
+    export RDS_CLAUDE_MODEL="${build_claude_model:-${RDS_CLAUDE_MODEL:-claude-opus-4-6}}"
+    export RDS_CODEX_MODEL="${build_codex_model:-${RDS_CODEX_MODEL:-}}"
+    events="$(tail -n 60 "$build_dir/events.jsonl" 2>/dev/null || true)"
+    stage_log=""
+    if [[ -d "$build_dir/logs" ]]; then
+      stage_log="$(ls -t "$build_dir"/logs/*.log 2>/dev/null | head -n1 || true)"
+    fi
+    log_tail=""
+    [[ -n "$stage_log" ]] && log_tail="$(tail -n 100 "$stage_log")"
+    spec_excerpt=""
+    if [[ -f "$build_dir/spec.md" ]]; then
+      spec_excerpt="$(sed -n '1,220p' "$build_dir/spec.md")"
+    elif [[ -f "$build_dir/research.md" ]]; then
+      spec_excerpt="$(sed -n '1,180p' "$build_dir/research.md")"
+    fi
+
+    context=$(cat <<EOF
+
+You have read access to one in-flight RDS build:
+
+build_id: $BUILD_ID
+
+state.json:
+\`\`\`json
+$state
+\`\`\`
+
+Last 60 events from events.jsonl:
+\`\`\`jsonl
+$events
+\`\`\`
+
+Most recent stage log: $stage_log (last 100 lines):
+\`\`\`
+$log_tail
+\`\`\`
+
+Spec/research excerpt:
+\`\`\`markdown
+$spec_excerpt
+\`\`\`
+EOF
+)
+  else
+    context="(build_id $BUILD_ID was passed but builds/$BUILD_ID does not exist)"
+  fi
+fi
+
+prompt=$(cat <<EOF
+You are RDS — the chat-shaped operator console for the Remote Deployment
+System. The operator is talking to you from the Hub dashboard.
+
+RDS is a stack-aware chat-to-deployed-app pipeline:
+  1. intake   2. spec   3. taste brief   4. stack-init   5. scaffold   6. local-run   7. deploy   8. qa   9. taste review
+
+Useful commands the operator already has and may want you to suggest:
+  bin/rds-status, bin/rds-stop, bin/rds-start, bin/rds-fix <id>,
+  bin/rds-deploy --build-id=<id> --target=teardown,
+  tail -f /dev/shm/<id>-launch-build.log
+
+$context
+
+Operator's message:
+> $message
+
+Reply rules:
+- Be terse. Use plain prose, not Markdown headers, unless code blocks help.
+- If the operator is asking about state, answer from the context above.
+- If they're asking you to *do* something destructive, name the exact
+  shell command they'd run; do NOT execute it yourself.
+- If you don't know, say so.
+- Keep replies under ~12 sentences unless the question demands depth.
+EOF
+)
+
+ts="$(date -u +%Y%m%d-%H%M%S)"
+out_log=""
+if [[ -n "$build_dir" && -d "$build_dir" ]]; then
+  out_log="$build_dir/chat-$ts.md"
+fi
+
+# Emit a chat_turn event on the build's stream (best-effort).
+if [[ -n "$BUILD_ID" && -d "$build_dir" ]]; then
+  "$ROOT/bin/rds-event" chat_turn \
+    --build-id "$BUILD_ID" --build-dir "$build_dir" \
+    msg_chars="${#message}" budget_usd="$BUDGET" provider="$PROVIDER" \
+    >/dev/null 2>&1 || true
+fi
+
+reply=""
+err_log=""
+if [[ -n "$build_dir" && -d "$build_dir" ]]; then
+  err_log="$build_dir/chat-$ts.err.log"
+else
+  err_log="$(mktemp)"
+fi
+if reply="$(printf '%s\n' "$prompt" \
+  | RDS_INFER_FINAL_ONLY=1 rds_infer "$PROVIDER" "$ROOT" 80 "$BUDGET" "" 2>"$err_log")"; then
+  rc=0
+else
+  rc=$?
+fi
+if [[ "$rc" -ne 0 && -z "$reply" ]]; then
+  reply="RDS chat failed while calling $PROVIDER. Check $(printf '%s' "$err_log") for the raw CLI error."
+fi
+
+# Persist transcript when scoped to a build.
+if [[ -n "$out_log" ]]; then
+  {
+    echo "# RDS chat turn — $ts"
+    echo
+    echo "## Operator"
+    echo
+    echo "$message"
+    echo
+    echo "## RDS"
+    echo
+    echo "$reply"
+  } > "$out_log"
+fi
+
+# Reply to caller on stdout (the dashboard captures this).
+printf '%s\n' "$reply"
+exit "$rc"

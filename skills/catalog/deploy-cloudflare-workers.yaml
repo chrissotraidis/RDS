@@ -1,0 +1,17 @@
+---
+slug: deploy-cloudflare-workers
+name: Cloudflare Workers deploy
+status: curated
+category: deploy
+maturity: beta
+applies_to:
+- astro-thin-web
+description: Cloudflare Workers deployment contract for Astro.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: developers.cloudflare.com
+  url: https://developers.cloudflare.com/workers/
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

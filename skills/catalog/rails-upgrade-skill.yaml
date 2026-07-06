@@ -1,0 +1,17 @@
+---
+slug: rails-upgrade-skill
+name: Rails upgrade
+status: curated
+category: maintenance
+maturity: beta
+applies_to:
+- rails-web
+description: Rails version drift and upgrade guidance.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: guides.rubyonrails.org
+  url: https://guides.rubyonrails.org/
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

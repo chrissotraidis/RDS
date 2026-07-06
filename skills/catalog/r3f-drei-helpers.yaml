@@ -1,0 +1,19 @@
+---
+slug: r3f-drei-helpers
+name: R3F Drei helpers
+status: curated
+category: frontend
+maturity: stable
+applies_to:
+- web-3d
+description: React Three Fiber and Drei scene helpers.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: r3f.docs.pmnd.rs
+  url: https://r3f.docs.pmnd.rs/
+- label: drei.docs.pmnd.rs
+  url: https://drei.docs.pmnd.rs/
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

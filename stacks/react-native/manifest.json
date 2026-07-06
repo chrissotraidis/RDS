@@ -1,0 +1,42 @@
+{
+  "id": "react-native",
+  "name": "React Native / Expo",
+  "language": "typescript",
+  "runtime": {
+    "node": ">=20"
+  },
+  "framework": {
+    "name": "expo",
+    "version": "latest"
+  },
+  "database": "none",
+  "default_port_range": [
+    4000,
+    4099
+  ],
+  "health_path": "/health.json",
+  "stages": [
+    "intake",
+    "spec",
+    "init",
+    "scaffold",
+    "local-run",
+    "deploy",
+    "qa"
+  ],
+  "init": "stacks/react-native/init.sh",
+  "local_run": "stacks/react-native/local-run.sh",
+  "doctor": "stacks/react-native/doctor.sh",
+  "scaffold_recipe": "mobile_native",
+  "service_entrypoint": "bash -c 'bun install --frozen-lockfile || bun install; exec bun preview-server.ts'",
+  "service_env": {
+    "NODE_ENV": "development",
+    "RDS_RUNTIME": "zo"
+  },
+  "supports_modes": [
+    "green",
+    "brown"
+  ],
+  "status": "ready",
+  "notes": "Ready V1 Phase 1c Expo/React Native stack. Zo serves a web preview and QR/tunnel instructions; native device preview uses Expo/EAS when credentials are available."
+}

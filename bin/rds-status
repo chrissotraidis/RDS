@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# bin/rds-status — reports build status from state.json + recent logs.
+# Claude Code invokes this when the operator asks for status in chat.
+#
+# Usage:
+#   ./bin/rds-status                # latest build
+#   ./bin/rds-status <build-id>     # specific build
+#   ./bin/rds-status --slug=<slug>  # latest build whose id contains <slug>
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck disable=SC1091
+source "$ROOT/bin/lib/common.sh"
+
+SLUG="$(parse_flag --slug "$@" || echo "")"
+
+if [[ -n "$SLUG" ]]; then
+  BUILD_ID="$(ls -1t "$RDS_BUILDS_DIR" 2>/dev/null | grep -F "$SLUG" | head -n1 || true)"
+  [[ -n "$BUILD_ID" ]] || { echo "No build matching slug '$SLUG'" >&2; exit 1; }
+else
+  POSITIONAL=""
+  for arg in "$@"; do
+    [[ "$arg" == --* ]] && continue
+    POSITIONAL="$arg"; break
+  done
+  if [[ -n "$POSITIONAL" ]]; then
+    BUILD_ID="$POSITIONAL"
+  else
+    BUILD_ID="$(ls -1t "$RDS_BUILDS_DIR" 2>/dev/null | grep -Ev '^(\.gitkeep|README\.md)$' | head -n1 || true)"
+    [[ -n "$BUILD_ID" ]] || { echo "No builds yet." >&2; exit 1; }
+  fi
+fi
+
+BUILD_DIR="$RDS_BUILDS_DIR/$BUILD_ID"
+[[ -d "$BUILD_DIR" ]] || { echo "No build named $BUILD_ID" >&2; exit 1; }
+
+if [[ -x "$ROOT/bin/rds-evidence-ledger" ]]; then
+  "$ROOT/bin/rds-evidence-ledger" "$BUILD_ID" >/dev/null 2>&1 || true
+fi
+EVIDENCE="$BUILD_DIR/evidence-ledger.json"
+if [[ -f "$EVIDENCE" ]]; then
+  echo "--- canonical truth ---"
+  jq -r '
+    "Verdict: \(.verdict // "unknown")",
+    "Confidence: \(.confidence // "unknown")",
+    "Blocker class: \(.summary.blockerClass // "none")",
+    "Next action: \(.summary.nextAction // "unknown")",
+    "Blockers: \((.blockers // []) | length)",
+    ((.blockers // [])[:5][]? | "  - \(.code): \(.message)")
+  ' "$EVIDENCE"
+  echo
+fi
+
+# --- Live runtime header (TD-012) ------------------------------------------
+# If bin/rds-start launched this build, $BUILD_DIR/run.pid records the
+# detached pgid + log paths. Surface "running" / "exited" up-front so the
+# operator doesn't have to grep state.json + ps to tell.
+PIDFILE="$BUILD_DIR/run.pid"
+if [[ -f "$PIDFILE" ]]; then
+  pid="$(awk -F= '/^pid=/{print $2; exit}'        "$PIDFILE" 2>/dev/null || true)"
+  started_at="$(awk -F= '/^started_at=/{print $2; exit}' "$PIDFILE" 2>/dev/null || true)"
+  shm_log="$(awk -F= '/^log=/{print $2; exit}'    "$PIDFILE" 2>/dev/null || true)"
+  if [[ "$pid" =~ ^[0-9]+$ ]] && rds_pid_is_build_runner "$pid" "$BUILD_ID"; then
+    echo "Build $BUILD_ID: RUNNING (pid=$pid, started=$started_at)"
+    [[ -n "$shm_log" ]] && echo "  live log: $shm_log"
+  elif [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+    echo "Build $BUILD_ID: NOT RUNNING (pid=$pid is alive but is not this RDS runner — stale PID file)"
+  else
+    echo "Build $BUILD_ID: NOT RUNNING (pid=$pid is gone — see state.json for outcome)"
+  fi
+  echo
+fi
+
+STATE="$BUILD_DIR/state.json"
+if [[ -f "$STATE" ]]; then
+  jq . "$STATE"
+else
+  echo "(no state.json — build may have failed before stage 1)"
+fi
+
+echo
+echo "--- last 20 lines per stage log ---"
+shopt -s nullglob
+for log in "$BUILD_DIR"/logs/*.log; do
+  echo
+  echo "### $(basename "$log")"
+  tail -n 20 "$log"
+done
+shopt -u nullglob
+
+if [[ -f "$BUILD_DIR/preview-url.txt" ]]; then
+  echo
+  echo "Preview: $(cat "$BUILD_DIR/preview-url.txt")"
+fi
+
+# Brown-field provenance, if any.
+if [[ -f "$BUILD_DIR/app/.rds/provenance.json" ]]; then
+  echo
+  echo "--- client repo provenance ---"
+  jq . "$BUILD_DIR/app/.rds/provenance.json"
+fi

@@ -1,0 +1,20 @@
+---
+slug: auth-better-auth
+name: Better Auth
+status: curated
+category: auth
+maturity: stable
+applies_to:
+- nextjs-fullstack
+- astro-thin-web
+- mobile-native
+- browser-extension
+description: Self-hosted web auth capability for TypeScript stacks.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: better-auth.com
+  url: https://www.better-auth.com/
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

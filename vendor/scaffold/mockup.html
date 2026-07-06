@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sven: Fitness AI — Mockup</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3/dist/cdn.min.js"></script>
+  <style>
+    [x-cloak] { display: none !important; }
+    @media (min-width: 1024px) {
+      #app-sidebar { position: static !important; transform: none !important; z-index: auto !important; }
+    }
+    ::-webkit-scrollbar { width: 5px; height: 5px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #d1d5db; border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: #9ca3af; }
+  </style>
+</head>
+<body class="bg-gray-50 antialiased" x-data="app()" x-init="init()">
+
+  <!-- ================================================================
+       LOGIN SCREEN
+  ================================================================ -->
+  <div x-show="!loggedIn" x-cloak
+    class="min-h-screen flex items-center justify-center bg-gradient-to-br from-zinc-950 via-zinc-900 to-indigo-950 p-4">
+    <div class="w-full max-w-sm">
+
+      <!-- Brand -->
+      <div class="text-center mb-8">
+        <div class="inline-flex items-center justify-center w-16 h-16 rounded-2xl bg-indigo-600 shadow-lg shadow-indigo-900/50 mb-4">
+          <svg class="w-8 h-8 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M3.75 13.5l10.5-11.25L12 10.5h8.25L9.75 21.75 12 13.5H3.75z"/>
+          </svg>
+        </div>
+        <h1 class="text-3xl font-bold text-white tracking-tight">Sven</h1>
+        <p class="text-zinc-400 text-sm mt-1">Your AI Fitness Coach</p>
+      </div>
+
+      <!-- Phone step -->
+      <div x-show="loginStep === 'phone'"
+        class="bg-white/10 backdrop-blur-md border border-white/15 rounded-2xl p-6 shadow-2xl">
+        <h2 class="text-white font-semibold text-base mb-1">Welcome back</h2>
+        <p class="text-zinc-400 text-sm mb-5">Enter your phone number to continue</p>
+        <div class="space-y-3">
+          <input type="tel" x-model="loginPhone" placeholder="+1 (512) 555-0142"
+            @keydown.enter="loginStep = 'otp'"
+            class="w-full bg-white/10 border border-white/20 text-white placeholder-zinc-500 rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent transition" />
+          <button @click="loginStep = 'otp'"
+            class="w-full bg-indigo-600 hover:bg-indigo-500 active:bg-indigo-700 text-white font-semibold py-3 rounded-xl text-sm transition-colors shadow-lg shadow-indigo-900/30">
+            Continue →
+          </button>
+        </div>
+      </div>
+
+      <!-- OTP step -->
+      <div x-show="loginStep === 'otp'"
+        class="bg-white/10 backdrop-blur-md border border-white/15 rounded-2xl p-6 shadow-2xl">
+        <button @click="loginStep = 'phone'"
+          class="flex items-center gap-1 text-zinc-400 hover:text-white text-sm mb-4 transition-colors">
+          <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M15 19l-7-7 7-7"/>
+          </svg>
+          Back
+        </button>
+        <h2 class="text-white font-semibold text-base mb-1">Verify your number</h2>
+        <p class="text-zinc-400 text-sm mb-5">
+          Code sent to <span class="text-zinc-200" x-text="loginPhone || '+1 (512) 555-0142'"></span>
+        </p>
+        <div class="space-y-3">
+          <input type="text" x-model="loginOtp" placeholder="• • • • • •" maxlength="6"
+            @keydown.enter="doLogin()"
+            class="w-full bg-white/10 border border-white/20 text-white placeholder-zinc-500 rounded-xl px-4 py-3 text-sm text-center tracking-[0.4em] font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent transition" />
+          <button @click="doLogin()"
+            class="w-full bg-indigo-600 hover:bg-indigo-500 active:bg-indigo-700 text-white font-semibold py-3 rounded-xl text-sm transition-colors shadow-lg shadow-indigo-900/30">
+            Verify &amp; Sign In
+          </button>
+          <button class="w-full text-zinc-500 hover:text-zinc-300 text-xs py-1 transition-colors">
+            Resend code
+          </button>
+        </div>
+      </div>
+
+      <p class="text-center text-zinc-700 text-xs mt-5">Mockup — any credentials will work</p>
+    </div>
+  </div>
+
+  <!-- ================================================================
+       APP SHELL
+  ================================================================ -->
+  <div x-show="loggedIn" x-cloak class="flex h-screen overflow-hidden bg-gray-50">
+
+    <!-- Mobile overlay -->
+    <div x-show="sidebarOpen" x-cloak @click="sidebarOpen = false"
+      class="fixed inset-0 z-30 bg-black/60 lg:hidden"></div>
+
+    <!-- ==================== SIDEBAR ==================== -->
+    <aside id="app-sidebar"
+      class="fixed inset-y-0 left-0 z-40 w-64 bg-zinc-900 flex flex-col transition-transform duration-300 ease-in-out"
+      :class="sidebarOpen ? 'translate-x-0' : '-translate-x-full'">
+
+      <!-- Brand header -->
+      <div class="flex items-center gap-3 px-4 h-14 border-b border-zinc-800 shrink-0">
+        <div class="w-8 h-8 rounded-lg bg-indigo-600 flex items-center justify-center shrink-0">
+          <svg class="w-4 h-4 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M3.75 13.5l10.5-11.25L12 10.5h8.25L9.75 21.75 12 13.5H3.75z"/>
+          </svg>
+        </div>
+        <div class="flex-1 min-w-0">
+          <div class="text-white font-bold text-base leading-none">Sven</div>
+          <div class="text-zinc-500 text-xs mt-0.5">Fitness AI</div>
+        </div>
+        <button @click="sidebarOpen = false"
+          class="text-zinc-500 hover:text-zinc-300 transition-colors lg:hidden">
+          <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/>
+          </svg>
+        </button>
+      </div>
+
+      <!-- Nav label -->
+      <div class="px-4 pt-4 pb-1">
+        <span class="text-zinc-600 text-[10px] font-semibold uppercase tracking-wider">Navigation</span>
+      </div>
+
+      <!-- Navigation -->
+      <nav class="flex-1 px-3 pb-3 space-y-0.5 overflow-y-auto">
+
+        <!-- Home -->
+        <button @click="navigate('home')"
+          class="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-colors"
+          :class="currentScreen === 'home' ? 'bg-indigo-600 text-white' : 'text-zinc-400 hover:text-white hover:bg-zinc-800'">
+          <svg class="w-5 h-5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M2.25 12l8.954-8.955c.44-.439 1.152-.439 1.591 0L21.75 12M4.5 9.75v10.125c0 .621.504 1.125 1.125 1.125H9.75v-4.875c0-.621.504-1.125 1.125-1.125h2.25c.621 0 1.125.504 1.125 1.125V21h4.125c.621 0 1.125-.504 1.125-1.125V9.75M8.25 21h8.25"/>
+          </svg>
+          <span>Home</span>
+        </button>
+
+        <!-- Sven -->
+        <button @click="navigate('sven-personality')"
+          class="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-colors"
+          :class="currentScreen === 'sven-personality' ? 'bg-indigo-600 text-white' : 'text-zinc-400 hover:text-white hover:bg-zinc-800'">
+          <svg class="w-5 h-5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09zM18.259 8.715L18 9.75l-.259-1.035a3.375 3.375 0 00-2.455-2.456L14.25 6l1.036-.259a3.375 3.375 0 002.455-2.456L18 2.25l.259 1.035a3.375 3.375 0 002.456 2.456L21.75 6l-1.035.259a3.375 3.375 0 00-2.456 2.456zM16.894 20.567L16.5 21.75l-.394-1.183a2.25 2.25 0 00-1.423-1.423L13.5 18.75l1.183-.394a2.25 2.25 0 001.423-1.423l.394-1.183.394 1.183a2.25 2.25 0 001.423 1.423l1.183.394-1.183.394a2.25 2.25 0 00-1.423 1.423z"/>
+          </svg>
+          <span>Sven</span>
+        </button>
+
+        <!-- Plan -->
+        <button @click="navigate('plan-general')"
+          class="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-colors"
+          :class="['plan-general','plan-goals','plan-categories'].includes(currentScreen) ? 'bg-indigo-600 text-white' : 'text-zinc-400 hover:text-white hover:bg-zinc-800'">
+          <svg class="w-5 h-5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01"/>
+          </svg>
+          <span>Plan</span>
+        </button>
+
+        <!-- Account -->
+        <button @click="navigate('account')"
+          class="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-colors"
+          :class="['account','account-billing'].includes(currentScreen) ? 'bg-indigo-600 text-white' : 'text-zinc-400 hover:text-white hover:bg-zinc-800'">
+          <svg class="w-5 h-5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M15.75 6a3.75 3.75 0 11-7.5 0 3.75 3.75 0 017.5 0zM4.501 20.118a7.5 7.5 0 0114.998 0A17.933 17.933 0 0112 21.75c-2.676 0-5.216-.584-7.499-1.632z"/>
+          </svg>
+          <span>Account</span>
+        </button>
+
+        <!-- Settings -->
+        <button @click="navigate('settings')"
+          class="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-colors"
+          :class="['settings','settings-equipment','settings-integrations','settings-privacy'].includes(currentScreen) ? 'bg-indigo-600 text-white' : 'text-zinc-400 hover:text-white hover:bg-zinc-800'">
+          <svg class="w-5 h-5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.686.645.87.074.04.147.083.22.127.324.196.72.257 1.075.124l1.217-.456a1.125 1.125 0 011.37.49l1.296 2.247a1.125 1.125 0 01-.26 1.431l-1.003.827c-.293.24-.438.613-.431.992a6.759 6.759 0 010 .255c-.007.378.138.75.43.99l1.005.828c.424.35.534.954.26 1.43l-1.298 2.247a1.125 1.125 0 01-1.369.491l-1.217-.456c-.355-.133-.75-.072-1.076.124a6.57 6.57 0 01-.22.128c-.331.183-.581.495-.644.869l-.213 1.28c-.09.543-.56.941-1.11.941h-2.594c-.55 0-1.02-.398-1.11-.94l-.213-1.281c-.062-.374-.312-.686-.644-.87a6.52 6.52 0 01-.22-.127c-.325-.196-.72-.257-1.076-.124l-1.217.456a1.125 1.125 0 01-1.369-.49l-1.297-2.247a1.125 1.125 0 01.26-1.431l1.004-.827c.292-.24.437-.613.43-.992a6.932 6.932 0 010-.255c.007-.378-.138-.75-.43-.99l-1.004-.828a1.125 1.125 0 01-.26-1.43l1.297-2.247a1.125 1.125 0 011.37-.491l1.216.456c.356.133.751.072 1.076-.124.072-.044.146-.087.22-.128.332-.183.582-.495.644-.869l.214-1.281z"/>
+            <path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>
+          </svg>
+          <span>Settings</span>
+        </button>
+
+      </nav>
+
+      <!-- User footer -->
+      <div class="px-3 pb-4 border-t border-zinc-800 pt-3 shrink-0">
+        <div class="flex items-center gap-2.5 px-3 py-2.5 rounded-xl bg-zinc-800">
+          <div class="w-8 h-8 rounded-full bg-indigo-600 flex items-center justify-center text-white text-xs font-bold shrink-0">G</div>
+          <div class="min-w-0 flex-1">
+            <div class="text-white text-sm font-medium truncate">Garren</div>
+            <div class="text-zinc-500 text-xs truncate">Austin, TX</div>
+          </div>
+          <button @click="doLogout()" title="Sign out"
+            class="shrink-0 text-zinc-600 hover:text-zinc-300 transition-colors">
+            <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M15.75 9V5.25A2.25 2.25 0 0013.5 3h-6a2.25 2.25 0 00-2.25 2.25v13.5A2.25 2.25 0 007.5 21h6a2.25 2.25 0 002.25-2.25V15M12 9l-3 3m0 0l3 3m-3-3h12.75"/>
+            </svg>
+          </button>
+        </div>
+      </div>
+
+    </aside>
+
+    <!-- ==================== MAIN CONTENT ==================== -->
+    <div class="flex-1 flex flex-col min-w-0 overflow-hidden">
+
+      <!-- Top Header -->
+      <header class="bg-white border-b border-gray-200 h-14 flex items-center gap-3 px-4 lg:px-6 shrink-0">
+
+        <!-- Hamburger (mobile only) -->
+        <button @click="sidebarOpen = true"
+          class="lg:hidden text-gray-500 hover:text-gray-700 transition-colors -ml-1 shrink-0">
+          <svg class="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M3.75 6.75h16.5M3.75 12h16.5m-16.5 5.25h16.5"/>
+          </svg>
+        </button>
+
+        <!-- Page title + breadcrumb -->
+        <div class="flex-1 min-w-0">
+          <!-- Breadcrumb for nested screens -->
+          <div x-show="parentScreen !== null"
+            class="flex items-center gap-1 text-xs text-gray-400 leading-none mb-0.5">
+            <button
+              @click="parentScreen && navigate(parentScreen.screenId)"
+              class="hover:text-indigo-600 transition-colors"
+              x-text="parentScreen ? parentScreen.label : ''"></button>
+            <span class="text-gray-300 mx-0.5">›</span>
+            <span class="text-gray-500 truncate" x-text="currentScreenName"></span>
+          </div>
+          <h1 class="text-gray-900 font-semibold leading-tight truncate"
+            :class="parentScreen !== null ? 'text-sm' : 'text-base'"
+            x-text="currentScreenName"></h1>
+        </div>
+
+        <!-- Right: role badge + screen nav helper -->
+        <div class="flex items-center gap-3 shrink-0">
+
+          <!-- Quick screen jumper (reviewer convenience) -->
+          <div class="relative hidden md:block" x-data="{ open: false }">
+            <button @click="open = !open" @click.outside="open = false"
+              class="flex items-center gap-1.5 text-xs text-gray-500 hover:text-gray-700 border border-gray-200 rounded-lg px-2.5 py-1.5 transition-colors bg-gray-50 hover:bg-gray-100">
+              <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M3.75 6.75h16.5M3.75 12h16.5m-16.5 5.25h16.5"/>
+              </svg>
+              <span>All Screens</span>
+              <svg class="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7"/>
+              </svg>
+            </button>
+            <div x-show="open" x-cloak @click.outside="open = false"
+              class="absolute right-0 top-full mt-1.5 w-56 bg-white border border-gray-200 rounded-xl shadow-lg z-50 py-1.5 overflow-hidden">
+              <template x-for="[id, label] in Object.entries(screenNames).filter(([id]) => id !== 'login')" :key="id">
+                <button @click="navigate(id); open = false"
+                  class="w-full text-left px-3 py-1.5 text-xs hover:bg-gray-50 transition-colors flex items-center gap-2"
+                  :class="currentScreen === id ? 'text-indigo-600 font-medium' : 'text-gray-700'">
+                  <span class="w-1.5 h-1.5 rounded-full shrink-0"
+                    :class="currentScreen === id ? 'bg-indigo-500' : 'bg-gray-200'"></span>
+                  <span x-text="label"></span>
+                </button>
+              </template>
+            </div>
+          </div>
+
+          <!-- Role badge -->
+          <span class="inline-flex items-center gap-1.5 bg-indigo-50 text-indigo-700 text-xs font-medium px-2.5 py-1 rounded-full border border-indigo-200 shrink-0">
+            <span class="w-1.5 h-1.5 rounded-full bg-indigo-500 shrink-0"></span>
+            User
+          </span>
+
+        </div>
+      </header>
+
+      <!-- ==================== SCREEN AREA ==================== -->
+      <main class="flex-1 overflow-y-auto">
+
+        <!-- home -->
+        <div x-show="currentScreen === 'home'" x-cloak class="p-4 sm:p-6 lg:p-8">
+          <!-- SCREEN:home -->
+        </div>
+
+        <!-- intelligence-detail -->
+        <div x-show="currentScreen === 'intelligence-detail'" x-cloak class="p-4 sm:p-6 lg:p-8">
+          <!-- SCREEN:intelligence-detail -->
+        </div>
+
+        <!-- plan-general -->
+        <div x-show="currentScreen === 'plan-general'" x-cloak class="p-4 sm:p-6 lg:p-8">
+          <!-- SCREEN:plan-general -->
+        </div>
+
+        <!-- plan-goals -->
+        <div x-show="currentScreen === 'plan-goals'" x-cloak class="p-4 sm:p-6 lg:p-8">
+          <!-- SCREEN:plan-goals -->
+        </div>
+
+        <!-- plan-categories -->
+        <div x-show="currentScreen === 'plan-categories'" x-cloak class="p-4 sm:p-6 lg:p-8">
+          <!-- SCREEN:plan-categories -->
+        </div>
+
+        <!-- workout-runner-start -->
+        <div x-show="currentScreen === 'workout-runner-start'" x-cloak class="p-4 sm:p-6 lg:p-8">
+          <!-- SCREEN:workout-runner-start -->
+        </div>
+
+        <!-- workout-runner-active -->
+        <div x-show="currentScreen === 'workout-runner-active'" x-cloak class="p-4 sm:p-6 lg:p-8">
+          <!-- SCREEN:workout-runner-active -->
+        </div>
+
+        <!-- workout-runner-complete -->
+        <div x-show="currentScreen === 'workout-runner-complete'" x-cloak class="p-4 sm:p-6 lg:p-8">
+          <!-- SCREEN:workout-runner-complete -->
+        </div>
+
+        <!-- sven-personality -->
+        <div x-show="currentScreen === 'sven-personality'" x-cloak class="p-4 sm:p-6 lg:p-8">
+          <!-- SCREEN:sven-personality -->
+        </div>
+
+        <!-- account -->
+        <div x-show="currentScreen === 'account'" x-cloak class="p-4 sm:p-6 lg:p-8">
+          <!-- SCREEN:account -->
+        </div>
+
+        <!-- account-billing -->
+        <div x-show="currentScreen === 'account-billing'" x-cloak class="p-4 sm:p-6 lg:p-8">
+          <!-- SCREEN:account-billing -->
+        </div>
+
+        <!-- settings -->
+        <div x-show="currentScreen === 'settings'" x-cloak class="p-4 sm:p-6 lg:p-8">
+          <!-- SCREEN:settings -->
+        </div>
+
+        <!-- settings-equipment -->
+        <div x-show="currentScreen === 'settings-equipment'" x-cloak class="p-4 sm:p-6 lg:p-8">
+          <!-- SCREEN:settings-equipment -->
+        </div>
+
+        <!-- settings-integrations -->
+        <div x-show="currentScreen === 'settings-integrations'" x-cloak class="p-4 sm:p-6 lg:p-8">
+          <!-- SCREEN:settings-integrations -->
+        </div>
+
+        <!-- settings-privacy -->
+        <div x-show="currentScreen === 'settings-privacy'" x-cloak class="p-4 sm:p-6 lg:p-8">
+          <!-- SCREEN:settings-privacy -->
+        </div>
+
+      </main>
+    </div>
+  </div>
+
+  <!-- ================================================================
+       ALPINE.JS APP
+  ================================================================ -->
+  <script>
+    function app() {
+      return {
+        loggedIn: false,
+        currentScreen: 'home',
+        currentRole: 'user',
+        sidebarOpen: false,
+        loginStep: 'phone',
+        loginPhone: '',
+        loginOtp: '',
+
+        screenNames: {
+          'login':                   'Login',
+          'home':                    'Home Dashboard',
+          'intelligence-detail':     'Intelligence Score Detail',
+          'plan-general':            'Plan \u2014 Weekly Schedule',
+          'plan-goals':              'Plan \u2014 Goals',
+          'plan-categories':         'Plan \u2014 Exercise Categories',
+          'workout-runner-start':    'Workout \u2014 Pre-Start',
+          'workout-runner-active':   'Workout \u2014 Active',
+          'workout-runner-complete': 'Workout \u2014 Complete',
+          'sven-personality':        'Sven Configuration',
+          'account':                 'Account Profile',
+          'account-billing':         'Billing',
+          'settings':                'Settings',
+          'settings-equipment':      'Equipment Inventory',
+          'settings-integrations':   'Integrations',
+          'settings-privacy':        'Data & Privacy',
+        },
+
+        screenParentMap: {
+          'intelligence-detail':     { label: 'Home',     screenId: 'home' },
+          'plan-goals':              { label: 'Plan',     screenId: 'plan-general' },
+          'plan-categories':         { label: 'Plan',     screenId: 'plan-general' },
+          'workout-runner-active':   { label: 'Workout',  screenId: 'workout-runner-start' },
+          'workout-runner-complete': { label: 'Workout',  screenId: 'workout-runner-start' },
+          'account-billing':         { label: 'Account',  screenId: 'account' },
+          'settings-equipment':      { label: 'Settings', screenId: 'settings' },
+          'settings-integrations':   { label: 'Settings', screenId: 'settings' },
+          'settings-privacy':        { label: 'Settings', screenId: 'settings' },
+        },
+
+        get currentScreenName() {
+          return this.screenNames[this.currentScreen] || this.currentScreen;
+        },
+
+        get parentScreen() {
+          return this.screenParentMap[this.currentScreen] || null;
+        },
+
+        navigate(screenId) {
+          this.currentScreen = screenId;
+          window.location.hash = screenId;
+          this.sidebarOpen = false;
+        },
+
+        doLogin() {
+          this.loggedIn = true;
+          this.currentRole = 'user';
+          this.navigate('home');
+        },
+
+        doLogout() {
+          this.loggedIn = false;
+          this.loginStep = 'phone';
+          this.loginPhone = '';
+          this.loginOtp = '';
+          window.location.hash = 'login';
+        },
+
+        switchRole(role) {
+          this.currentRole = role;
+          this.navigate('home');
+        },
+
+        init() {
+          const hash = window.location.hash.replace('#', '');
+          if (hash && hash !== 'login' && this.screenNames[hash]) {
+            this.loggedIn = true;
+            this.currentScreen = hash;
+          }
+          window.addEventListener('hashchange', () => {
+            const h = window.location.hash.replace('#', '');
+            if (!h || h === 'login') {
+              this.loggedIn = false;
+              this.loginStep = 'phone';
+            } else if (this.screenNames[h]) {
+              this.loggedIn = true;
+              this.currentScreen = h;
+            }
+          });
+        },
+      };
+    }
+  </script>
+
+</body>
+</html>

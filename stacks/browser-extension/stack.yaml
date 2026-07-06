@@ -1,0 +1,57 @@
+---
+slug: browser-extension
+runtime_id: browser-extension
+name: Browser extension
+description: Chrome MV3 browser extension stack using WXT, TypeScript, popup/content/background
+  entrypoints, static popup preview, and packaged zip artifact.
+category: browser-extension
+v1_status: ship
+priority: 9
+language:
+  primary: typescript
+framework:
+  name: wxt
+  version: latest
+scaffold:
+  command: stacks/browser-extension/init.sh
+commands:
+  install: bun install
+  run: bun preview-server.ts
+  test: bun run build:extension
+  doctor: stacks/browser-extension/doctor.sh
+ports:
+  range:
+  - 4000
+  - 4099
+health_path: "/health.json"
+deploy:
+  preview_on_zo: durable-zo-http-service
+  default_external: chrome-web-store-manual
+mockup_analog:
+  primary: popup-html-preview
+public_preview_model:
+  type: download-artifact
+compatible_skills:
+  primary:
+  - wxt-config-skill
+  - content-script-helpers
+  universal:
+  - rds-context7-mount
+  - rds-mockup-fidelity
+  - rds-secrets-broker
+  - rds-eval-harness
+  - playwright-mcp
+agent_notes:
+  primary: claude-code
+  codex_role: Small entrypoint edits, permission minimization, and failing type-check
+    fixes.
+failure_modes:
+- id: excessive-permissions
+  summary: Host permissions or broad API permissions can trigger Chrome Web Store
+    manual review.
+  mitigation: Default to activeTab/storage and only add host permissions when the
+    PRD requires them.
+- id: worker-state-loss
+  summary: MV3 service workers terminate when idle.
+  mitigation: Use chrome.storage/session and event listeners instead of long-lived
+    module state.

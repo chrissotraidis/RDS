@@ -1,0 +1,829 @@
+{
+  "tasks": [
+    {
+      "title": "Bootstrap Rails 8 project with Tailwind CSS and Solid stack",
+      "description": "Initialize the project skeleton and install all zero-dependency defaults.\n\n1. Run `rails new . --force --database=sqlite3 --asset-pipeline=propshaft` in the current directory.\n2. Add Tailwind CSS: `bundle add tailwindcss-rails` then `bin/rails tailwindcss:install`.\n3. Install Solid stack:\n   - `bin/rails solid_queue:install`\n   - `bin/rails solid_cache:install`\n   - `bin/rails solid_cable:install`\n4. In `config/application.rb`, configure:\n   - `config.active_job.queue_adapter = :solid_queue`\n   - `config.cache_store = :solid_cache_store`\n5. In `config/cable.yml`, set the adapter to `solid_cable`.\n6. Create `Procfile.dev`:\n   ```\n   web: bin/rails server -p 3000\n   css: bin/rails tailwindcss:watch\n   ```\n7. Create `.env.example` with a comment block indicating no environment variables are required to boot.\n8. Generate a PagesController: `bin/rails generate controller Pages home --no-helper --no-assets --no-test-framework`.\n9. Set the root route in `config/routes.rb`: `root 'pages#home'`.\n10. Update `app/views/pages/home.html.erb` with a simple 'Leadership Coaching Portal' welcome heading using Tailwind classes (e.g., `text-2xl font-bold`).\n11. Run `bin/rails db:prepare` to initialize the database.\n12. Ensure `bin/setup` calls `bin/rails db:prepare` (it should by default; edit if not).",
+      "priority": 0,
+      "labels": ["setup", "backend", "frontend"],
+      "position": 0,
+      "depends_on": [],
+      "section_ref": "Overview",
+      "acceptance_criteria": [
+        {
+          "type": "file_exists",
+          "description": "Procfile.dev exists",
+          "params": "{\"pattern\": \"Procfile.dev\"}"
+        },
+        {
+          "type": "file_exists",
+          "description": ".env.example exists",
+          "params": "{\"pattern\": \".env.example\"}"
+        },
+        {
+          "type": "file_exists",
+          "description": "Pages controller exists",
+          "params": "{\"pattern\": \"app/controllers/pages_controller.rb\"}"
+        },
+        {
+          "type": "file_exists",
+          "description": "Home view exists",
+          "params": "{\"pattern\": \"app/views/pages/home.html.erb\"}"
+        },
+        {
+          "type": "route_exists",
+          "description": "Root route is defined",
+          "params": "{\"method\": \"GET\", \"path\": \"/\"}"
+        },
+        {
+          "type": "http",
+          "description": "Root route returns 200",
+          "params": "{\"method\": \"GET\", \"path\": \"/\", \"expected_status\": 200}"
+        },
+        {
+          "type": "http",
+          "description": "Health check endpoint returns 200",
+          "params": "{\"method\": \"GET\", \"path\": \"/up\", \"expected_status\": 200}"
+        },
+        {
+          "type": "command_exits",
+          "description": "Rails boots and prints version",
+          "params": "{\"command\": \"bin/rails runner 'puts Rails.version'\", \"expected_exit_code\": 0}"
+        }
+      ],
+      "verification": {
+        "commands": [
+          {"name": "Rails version", "command": "bin/rails runner 'puts Rails.version'", "required": true},
+          {"name": "Database prepared", "command": "bin/rails db:prepare", "required": true},
+          {"name": "Root route present", "command": "bin/rails routes | grep 'root'", "required": true},
+          {"name": "Tailwind in Gemfile", "command": "grep 'tailwindcss-rails' Gemfile", "required": true},
+          {"name": "Solid Queue in Gemfile", "command": "grep 'solid_queue' Gemfile", "required": true}
+        ]
+      },
+      "runbook": "## Task 0: Bootstrap\n\nThe Rails 8 project skeleton is in place with Tailwind CSS and the Solid stack (Queue, Cache, Cable).\n\n**Start the app:**\n```\nbin/setup\nbin/dev\n```\n\n**Verify:**\n- http://localhost:3000 — renders 'Leadership Coaching Portal' welcome page\n- http://localhost:3000/up — returns 200 OK\n\nNo authentication yet. Database is empty; seed data added in later tasks."
+    },
+    {
+      "title": "Authentication with coach and client roles",
+      "description": "Implement email/password authentication using the Rails 8 authentication generator, then layer a two-role system (coach vs client) on top.\n\n1. Run `bin/rails generate authentication`. This produces:\n   - `app/models/user.rb` with `has_secure_password`\n   - `app/models/session.rb`\n   - `app/controllers/sessions_controller.rb`\n   - `app/controllers/passwords_controller.rb`\n   - `app/controllers/concerns/authentication.rb`\n   - `app/models/current.rb` with `attribute :user`\n   - Routes: `resource :session`, `resources :passwords, param: :token`\n\n2. Generate a migration to add the role column:\n   ```\n   bin/rails generate migration AddRoleToUsers role:integer\n   ```\n   Edit the migration to set `null: false, default: 0` on the column.\n\n3. In `app/models/user.rb`, add:\n   ```ruby\n   enum :role, { coach: 0, client: 1 }, default: :coach\n   validates :email_address, presence: true, uniqueness: true\n   validates :role, presence: true\n   ```\n\n4. Create `app/controllers/coach/base_controller.rb`:\n   ```ruby\n   class Coach::BaseController < ApplicationController\n     before_action :require_authentication\n     before_action :require_coach_role!\n\n     private\n\n     def require_coach_role!\n       render file: Rails.root.join('public/404.html'), status: :not_found, layout: false unless Current.user&.coach?\n     end\n\n     def coach_client(id)\n       Current.user.clients.find(id)\n     rescue ActiveRecord::RecordNotFound\n       render file: Rails.root.join('public/404.html'), status: :not_found, layout: false\n     end\n   end\n   ```\n\n5. Create `app/controllers/client/base_controller.rb`:\n   ```ruby\n   class Client::BaseController < ApplicationController\n     before_action :require_authentication\n     before_action :require_client_role!\n\n     private\n\n     def require_client_role!\n       render file: Rails.root.join('public/404.html'), status: :not_found, layout: false unless Current.user&.client?\n     end\n\n     def current_client_profile\n       @current_client_profile ||= Client.find_by!(user_id: Current.user.id)\n     rescue ActiveRecord::RecordNotFound\n       render file: Rails.root.join('public/404.html'), status: :not_found, layout: false\n     end\n   end\n   ```\n\n6. Create stub dashboard controllers:\n   - `app/controllers/coach/dashboard_controller.rb` inheriting `Coach::BaseController` with `def index; end`\n   - `app/controllers/client/dashboard_controller.rb` inheriting `Client::BaseController` with `def index; end`\n\n7. Create stub views:\n   - `app/views/coach/dashboard/index.html.erb` — placeholder text\n   - `app/views/client/dashboard/index.html.erb` — placeholder text\n\n8. Update `config/routes.rb`:\n   ```ruby\n   namespace :coach do\n     root 'dashboard#index'\n   end\n   namespace :client do\n     root 'dashboard#index'\n   end\n   ```\n\n9. Override `SessionsController#create` to redirect by role after successful login. After `resume_session` or equivalent, add:\n   ```ruby\n   redirect_to Current.user.coach? ? coach_root_path : client_root_path\n   ```\n   (Locate the successful-login redirect in the generated `SessionsController#create` and replace it.)\n\n10. Update `db/seeds.rb`:\n    ```ruby\n    seed_sign_in_value = SecureRandom.base58(24)\n\n    coach = User.find_or_create_by(email_address: 'coach@example.com') do |u|\n      u.password = seed_sign_in_value\n      u.role = :coach\n    end\n    client_user = User.find_or_create_by(email_address: 'client@example.com') do |u|\n      u.password = seed_sign_in_value\n      u.role = :client\n    end\n    ```\n\n11. Run `bin/rails db:migrate && bin/rails db:seed`.",
+      "priority": 0,
+      "labels": ["backend", "authentication"],
+      "position": 1,
+      "depends_on": [0],
+      "section_ref": "Features > Authentication",
+      "acceptance_criteria": [
+        {
+          "type": "file_exists",
+          "description": "User model exists",
+          "params": "{\"pattern\": \"app/models/user.rb\"}"
+        },
+        {
+          "type": "file_exists",
+          "description": "Sessions controller exists",
+          "params": "{\"pattern\": \"app/controllers/sessions_controller.rb\"}"
+        },
+        {
+          "type": "file_exists",
+          "description": "Coach base controller exists",
+          "params": "{\"pattern\": \"app/controllers/coach/base_controller.rb\"}"
+        },
+        {
+          "type": "file_exists",
+          "description": "Client base controller exists",
+          "params": "{\"pattern\": \"app/controllers/client/base_controller.rb\"}"
+        },
+        {
+          "type": "model_has",
+          "description": "User has email_address, password_digest, and role columns",
+          "params": "{\"model\": \"User\", \"columns\": [\"email_address\", \"password_digest\", \"role\"]}"
+        },
+        {
+          "type": "route_exists",
+          "description": "POST /session route for login",
+          "params": "{\"method\": \"POST\", \"path\": \"/session\"}"
+        },
+        {
+          "type": "route_exists",
+          "description": "Coach root route",
+          "params": "{\"method\": \"GET\", \"path\": \"/coach\"}"
+        },
+        {
+          "type": "route_exists",
+          "description": "Client root route",
+          "params": "{\"method\": \"GET\", \"path\": \"/client\"}"
+        },
+        {
+          "type": "command_exits",
+          "description": "Seeds run without error",
+          "params": "{\"command\": \"bin/rails db:seed\", \"expected_exit_code\": 0}"
+        },
+        {
+          "type": "command_exits",
+          "description": "Coach user seeded with correct role",
+          "params": "{\"command\": \"bin/rails runner 'raise unless User.find_by(email_address: \\\"coach@example.com\\\").coach?'\", \"expected_exit_code\": 0}"
+        }
+      ],
+      "verification": {
+        "commands": [
+          {"name": "User columns", "command": "bin/rails runner 'puts User.column_names.sort'", "required": true},
+          {"name": "Role enum values", "command": "bin/rails runner 'puts User.roles.keys'", "required": true},
+          {"name": "Coach user seeded", "command": "bin/rails runner 'puts User.find_by(email_address: \"coach@example.com\").role'", "required": true},
+          {"name": "Client user seeded", "command": "bin/rails runner 'puts User.find_by(email_address: \"client@example.com\").role'", "required": true},
+          {"name": "Session route", "command": "bin/rails routes | grep 'session'", "required": true},
+          {"name": "Coach namespace route", "command": "bin/rails routes | grep 'coach'", "required": true}
+        ]
+      },
+      "runbook": "## Task 1: Authentication\n\n**Test credentials:**\n- Coach: `coach@example.com` / `password` → redirects to `/coach`\n- Client: `client@example.com` / `password` → redirects to `/client`\n\n**Verify:**\n1. Start the app: `bin/dev`\n2. Visit http://localhost:3000/session/new\n3. Log in as coach → redirected to http://localhost:3000/coach (placeholder dashboard)\n4. Log in as client → redirected to http://localhost:3000/client (placeholder dashboard)\n\nCross-role access (coach visiting `/client`, client visiting `/coach`) returns **404**."
+    },
+    {
+      "title": "Client model with coach and user account associations",
+      "description": "Create the Client entity that belongs to a coach (User with role: coach) and optionally links to a client user account for portal access.\n\n1. Create the migration manually:\n   ```\n   bin/rails generate migration CreateClients name:string company:string\n   ```\n   Edit the generated migration to add:\n   ```ruby\n   create_table :clients do |t|\n     t.string  :name,     null: false\n     t.string  :company\n     t.references :coach, null: false, foreign_key: { to_table: :users }, index: true\n     t.integer :user_id,  index: true   # links to User with role: client for portal access\n     t.timestamps\n   end\n   ```\n\n2. Run `bin/rails db:migrate`.\n\n3. Create `app/models/client.rb`:\n   ```ruby\n   class Client < ApplicationRecord\n     belongs_to :coach, class_name: 'User', foreign_key: :coach_id\n     belongs_to :user_account, class_name: 'User', foreign_key: :user_id, optional: true\n\n     validates :name, presence: true\n     validates :coach, presence: true\n\n     scope :for_coach, ->(user) { where(coach_id: user.id) }\n   end\n   ```\n\n4. In `app/models/user.rb`, add:\n   ```ruby\n   has_many :clients, foreign_key: :coach_id, dependent: :destroy\n   ```\n\n5. Update `db/seeds.rb` to create 2–3 seed clients associated with the coach user, and link one client record to the `client@example.com` user account:\n   ```ruby\n   coach      = User.find_by(email_address: 'coach@example.com')\n   client_user = User.find_by(email_address: 'client@example.com')\n\n   jane = Client.find_or_create_by(name: 'Jane Doe', coach: coach) do |c|\n     c.company    = 'Acme Corp'\n     c.user_id    = client_user.id\n   end\n   Client.find_or_create_by(name: 'John Smith', coach: coach) { |c| c.company = 'Globex Inc' }\n   ```\n\n6. Run `bin/rails db:seed`.",
+      "priority": 0,
+      "labels": ["backend", "database"],
+      "position": 2,
+      "depends_on": [1],
+      "section_ref": "Entities > Client",
+      "acceptance_criteria": [
+        {
+          "type": "file_exists",
+          "description": "Client model file exists",
+          "params": "{\"pattern\": \"app/models/client.rb\"}"
+        },
+        {
+          "type": "model_has",
+          "description": "Client has name, company, coach_id, user_id columns and correct associations",
+          "params": "{\"model\": \"Client\", \"columns\": [\"name\", \"company\", \"coach_id\", \"user_id\"], \"associations\": [\"belongs_to :coach\"]}"
+        },
+        {
+          "type": "command_exits",
+          "description": "Client records created by seeds",
+          "params": "{\"command\": \"bin/rails runner 'raise if Client.count == 0'\", \"expected_exit_code\": 0}"
+        },
+        {
+          "type": "command_exits",
+          "description": "Coach-to-clients association works",
+          "params": "{\"command\": \"bin/rails runner 'raise unless User.find_by(email_address: \\\"coach@example.com\\\").clients.any?'\", \"expected_exit_code\": 0}"
+        }
+      ],
+      "verification": {
+        "commands": [
+          {"name": "Client columns", "command": "bin/rails runner 'puts Client.column_names'", "required": true},
+          {"name": "Clients seeded", "command": "bin/rails runner 'puts Client.count'", "required": true},
+          {"name": "Coach-client link", "command": "bin/rails runner 'puts User.find_by(email_address: \"coach@example.com\").clients.pluck(:name)'", "required": true},
+          {"name": "Client user account linked", "command": "bin/rails runner 'puts Client.where.not(user_id: nil).count'", "required": true}
+        ]
+      },
+      "runbook": "## Task 2: Client Model\n\nThe `clients` table is live.\n\n**Seed data:**\n- Jane Doe (Acme Corp) — linked to `client@example.com` user account\n- John Smith (Globex Inc) — no portal user yet\n\n**Verify:**\n```\nbin/rails runner 'puts Client.all.map { |c| \"#{c.name} | #{c.company}\" }'\n```"
+    },
+    {
+      "title": "Session Notes model with ActionText rich content",
+      "description": "Create the SessionNote entity with two rich-text fields (private coach notes and shareable sections) using ActionText.\n\n1. Install ActionText and ActiveStorage:\n   ```\n   bin/rails action_text:install\n   bin/rails db:migrate\n   ```\n\n2. Generate the session_notes table migration:\n   ```\n   bin/rails generate migration CreateSessionNotes client_id:references shared:boolean\n   ```\n   Edit to set `null: false` on `client_id` and `null: false, default: false` on `shared`.\n\n3. Run `bin/rails db:migrate`.\n\n4. Create `app/models/session_note.rb`:\n   ```ruby\n   class SessionNote < ApplicationRecord\n     include Auditable\n\n     belongs_to :client\n     has_rich_text :content          # PRIVATE — coach eyes only\n     has_rich_text :shared_sections  # shown to client when shared: true\n\n     validates :client, presence: true\n\n     scope :shared, -> { where(shared: true) }\n     scope :recent, -> { order(created_at: :desc) }\n   end\n   ```\n   Note: `Auditable` will be defined in task 6; add the include now and it will load once the concern exists.\n\n5. In `app/models/client.rb`, add:\n   ```ruby\n   has_many :session_notes, dependent: :destroy\n   ```\n\n6. Update `db/seeds.rb` to add one session note per seed client:\n   ```ruby\n   SessionNote.find_or_create_by(client: jane) do |n|\n     n.shared = false\n     n.content = ActionText::Content.new('<p>Private coaching notes for Jane - session 1.</p>')\n     n.shared_sections = ActionText::Content.new('<p>Great progress on communication goals.</p>')\n   end\n   ```\n\n7. Run `bin/rails db:seed`.\n\n**Security invariant:** The `content` field is ALWAYS private to the coach. It must NEVER appear in client-facing views or API responses. Only `shared_sections` is visible to clients when `shared: true`.",
+      "priority": 0,
+      "labels": ["backend", "database"],
+      "position": 3,
+      "depends_on": [2],
+      "section_ref": "Features > Session Notes",
+      "acceptance_criteria": [
+        {
+          "type": "file_exists",
+          "description": "SessionNote model exists",
+          "params": "{\"pattern\": \"app/models/session_note.rb\"}"
+        },
+        {
+          "type": "model_has",
+          "description": "SessionNote has client_id and shared columns",
+          "params": "{\"model\": \"SessionNote\", \"columns\": [\"client_id\", \"shared\"], \"associations\": [\"belongs_to :client\"]}"
+        },
+        {
+          "type": "command_exits",
+          "description": "ActionText rich text fields respond correctly",
+          "params": "{\"command\": \"bin/rails runner 'n = SessionNote.new; raise unless n.respond_to?(:content) && n.respond_to?(:shared_sections)'\", \"expected_exit_code\": 0}"
+        },
+        {
+          "type": "command_exits",
+          "description": "ActionText tables exist in the database",
+          "params": "{\"command\": \"bin/rails runner 'raise unless ActionText::RichText.table_exists?'\", \"expected_exit_code\": 0}"
+        }
+      ],
+      "verification": {
+        "commands": [
+          {"name": "SessionNote columns", "command": "bin/rails runner 'puts SessionNote.column_names'", "required": true},
+          {"name": "ActionText installed", "command": "bin/rails runner 'puts ActionText::RichText.table_exists?'", "required": true},
+          {"name": "Rich text methods available", "command": "bin/rails runner 'n = SessionNote.new; puts n.respond_to?(:content) && n.respond_to?(:shared_sections)'", "required": true},
+          {"name": "Session notes seeded", "command": "bin/rails runner 'puts SessionNote.count'", "required": true}
+        ]
+      },
+      "runbook": "## Task 3: Session Notes Model\n\nSessionNote is live with two ActionText rich-text fields:\n- `content` — private coach notes (never shown to clients)\n- `shared_sections` — visible to clients when `shared: true`\n\n**Verify:**\n```\nbin/rails runner 'puts SessionNote.count'\nbin/rails runner 'puts SessionNote.first.shared'\n```"
+    },
+    {
+      "title": "Survey model with delta calculation",
+      "description": "Create the Survey entity for tracking competency scores over time, with a `delta` method that calculates score change vs the previous survey for the same client and competency.\n\n1. Generate migration:\n   ```\n   bin/rails generate migration CreateSurveys client_id:references competency:string score:decimal administered_at:datetime\n   ```\n   Edit to set `null: false` on all columns; add `precision: 5, scale: 2` to `score`; add index on `[client_id, competency, administered_at]`.\n\n2. Run `bin/rails db:migrate`.\n\n3. Create `app/models/survey.rb`:\n   ```ruby\n   class Survey < ApplicationRecord\n     include Auditable\n\n     belongs_to :client\n\n     validates :competency,     presence: true\n     validates :score,          presence: true, numericality: { greater_than_or_equal_to: 0 }\n     validates :administered_at, presence: true\n\n     scope :ordered,         -> { order(administered_at: :asc) }\n     scope :for_competency,  ->(c) { where(competency: c) }\n\n     # Returns score change vs. previous survey for same client+competency.\n     # Returns nil if no prior survey exists (spec: delta = latest_score - previous_score).\n     def delta\n       previous = client.surveys\n                        .for_competency(competency)\n                        .ordered\n                        .where('administered_at < ?', administered_at)\n                        .last\n       return nil if previous.nil?\n       (score - previous.score).round(1)\n     end\n   end\n   ```\n\n4. In `app/models/client.rb`, add:\n   ```ruby\n   has_many :surveys, dependent: :destroy\n   ```\n\n5. Update `db/seeds.rb` to create at least 2 surveys for the same competency on different dates per client (so delta can be computed for the second one):\n   ```ruby\n   Survey.find_or_create_by(client: jane, competency: 'Communication', administered_at: 3.months.ago) { |s| s.score = 6.5 }\n   Survey.find_or_create_by(client: jane, competency: 'Communication', administered_at: 1.month.ago)  { |s| s.score = 7.0 }\n   Survey.find_or_create_by(client: jane, competency: 'Leadership',    administered_at: 2.months.ago) { |s| s.score = 5.8 }\n   ```\n\n6. Run `bin/rails db:seed`.",
+      "priority": 0,
+      "labels": ["backend", "database"],
+      "position": 4,
+      "depends_on": [2],
+      "section_ref": "Features > Surveys",
+      "acceptance_criteria": [
+        {
+          "type": "file_exists",
+          "description": "Survey model exists",
+          "params": "{\"pattern\": \"app/models/survey.rb\"}"
+        },
+        {
+          "type": "model_has",
+          "description": "Survey has required columns and belongs_to client",
+          "params": "{\"model\": \"Survey\", \"columns\": [\"client_id\", \"competency\", \"score\", \"administered_at\"], \"associations\": [\"belongs_to :client\"]}"
+        },
+        {
+          "type": "command_exits",
+          "description": "Delta method is defined on Survey",
+          "params": "{\"command\": \"bin/rails runner 'raise unless Survey.new.respond_to?(:delta)'\", \"expected_exit_code\": 0}"
+        },
+        {
+          "type": "command_exits",
+          "description": "Delta is nil for the first survey in a competency",
+          "params": "{\"command\": \"bin/rails runner 'c = Client.first; s = c.surveys.for_competency(c.surveys.first.competency).ordered.first; raise \\\"expected nil delta\\\" unless s.delta.nil?'\", \"expected_exit_code\": 0}"
+        },
+        {
+          "type": "command_exits",
+          "description": "Delta is numeric and rounded for a subsequent survey",
+          "params": "{\"command\": \"bin/rails runner 'c = Client.first; surveys = c.surveys.for_competency(\\\"Communication\\\").ordered; raise \\\"need 2 surveys\\\" unless surveys.count >= 2; d = surveys.last.delta; raise \\\"expected numeric delta\\\" unless d.is_a?(Numeric)'\", \"expected_exit_code\": 0}"
+        }
+      ],
+      "verification": {
+        "commands": [
+          {"name": "Survey columns", "command": "bin/rails runner 'puts Survey.column_names'", "required": true},
+          {"name": "Surveys seeded", "command": "bin/rails runner 'puts Survey.count'", "required": true},
+          {"name": "Delta returns nil for first", "command": "bin/rails runner 'puts Client.first.surveys.ordered.first.delta.inspect'", "required": true},
+          {"name": "Delta computed for second", "command": "bin/rails runner 'puts Client.first.surveys.for_competency(\"Communication\").ordered.last.delta'", "required": true}
+        ]
+      },
+      "runbook": "## Task 4: Survey Model\n\nThe `surveys` table is live. Each survey tracks a competency score at a point in time.\n\n**Delta formula:** `latest_score - previous_score` for same client + competency, rounded to 1 decimal. Returns `nil` if no previous survey.\n\n**Verify:**\n```\nbin/rails runner 'Client.first.surveys.ordered.each { |s| puts \"#{s.competency}: #{s.score} (Δ #{s.delta.inspect})\" }'\n```\nExpected output: first survey in each competency shows `nil` delta; subsequent surveys show the numeric difference."
+    },
+    {
+      "title": "Goals, Key Results, and Action Items models",
+      "description": "Create the Goal, KeyResult, and ActionItem entities with appropriate associations, validations, and the goal progress calculation.\n\n1. Generate migrations:\n   ```\n   bin/rails generate migration CreateGoals client_id:references title:string description:text status:string\n   bin/rails generate migration CreateKeyResults goal_id:references title:string progress_percent:decimal\n   bin/rails generate migration CreateActionItems goal_id:references title:string status:string due_date:date\n   ```\n\n   Edit Goals migration: `null: false` on `client_id`, `title`; `default: 'active'` on `status`.\n   Edit KeyResults migration: `null: false` on `goal_id`, `title`; `default: 0, precision: 5, scale: 2` on `progress_percent`.\n   Edit ActionItems migration: `null: false` on `goal_id`, `title`; `default: 'pending'` on `status`.\n\n2. Run `bin/rails db:migrate`.\n\n3. Create `app/models/goal.rb`:\n   ```ruby\n   class Goal < ApplicationRecord\n     include Auditable\n\n     belongs_to :client\n     has_many :key_results,  dependent: :destroy\n     has_many :action_items, dependent: :destroy\n\n     validates :title,  presence: true\n     validates :status, inclusion: { in: %w[active completed on_hold] }\n\n     # spec: progress = average of key_results' progress_percent\n     def progress_percent\n       avg = key_results.average(:progress_percent)\n       return 0.0 if avg.nil?\n       avg.to_f.round(1)\n     end\n   end\n   ```\n\n4. Create `app/models/key_result.rb`:\n   ```ruby\n   class KeyResult < ApplicationRecord\n     include Auditable\n\n     belongs_to :goal\n     validates :title, presence: true\n     validates :progress_percent, numericality: { greater_than_or_equal_to: 0, less_than_or_equal_to: 100 }\n   end\n   ```\n\n5. Create `app/models/action_item.rb`:\n   ```ruby\n   class ActionItem < ApplicationRecord\n     include Auditable\n\n     belongs_to :goal\n     validates :title, presence: true\n     validates :status, inclusion: { in: %w[pending in_progress completed] }\n   end\n   ```\n\n6. In `app/models/client.rb`, add:\n   ```ruby\n   has_many :goals, dependent: :destroy\n   ```\n\n7. Update `db/seeds.rb` to create 1–2 goals with key results and action items per seed client:\n   ```ruby\n   goal = Goal.find_or_create_by(client: jane, title: 'Improve Executive Presence') do |g|\n     g.description = 'Build gravitas and communication confidence'\n     g.status = 'active'\n   end\n   KeyResult.find_or_create_by(goal: goal, title: 'Complete public speaking course') { |kr| kr.progress_percent = 60 }\n   KeyResult.find_or_create_by(goal: goal, title: 'Lead 3 all-hands meetings')       { |kr| kr.progress_percent = 33 }\n   ActionItem.find_or_create_by(goal: goal, title: 'Enroll in Toastmasters') { |ai| ai.status = 'completed'; ai.due_date = 2.weeks.from_now }\n   ```\n\n8. Run `bin/rails db:seed`.",
+      "priority": 0,
+      "labels": ["backend", "database"],
+      "position": 5,
+      "depends_on": [2],
+      "section_ref": "Entities > Goal, KeyResult, ActionItem",
+      "acceptance_criteria": [
+        {
+          "type": "file_exists",
+          "description": "Goal model exists",
+          "params": "{\"pattern\": \"app/models/goal.rb\"}"
+        },
+        {
+          "type": "file_exists",
+          "description": "KeyResult model exists",
+          "params": "{\"pattern\": \"app/models/key_result.rb\"}"
+        },
+        {
+          "type": "file_exists",
+          "description": "ActionItem model exists",
+          "params": "{\"pattern\": \"app/models/action_item.rb\"}"
+        },
+        {
+          "type": "model_has",
+          "description": "Goal has required columns and associations",
+          "params": "{\"model\": \"Goal\", \"columns\": [\"client_id\", \"title\", \"status\"], \"associations\": [\"belongs_to :client\", \"has_many :key_results\", \"has_many :action_items\"]}"
+        },
+        {
+          "type": "model_has",
+          "description": "KeyResult has required columns",
+          "params": "{\"model\": \"KeyResult\", \"columns\": [\"goal_id\", \"title\", \"progress_percent\"]}"
+        },
+        {
+          "type": "model_has",
+          "description": "ActionItem has required columns",
+          "params": "{\"model\": \"ActionItem\", \"columns\": [\"goal_id\", \"title\", \"status\", \"due_date\"]}"
+        },
+        {
+          "type": "command_exits",
+          "description": "Goal#progress_percent returns 0.0 when no key results exist",
+          "params": "{\"command\": \"bin/rails runner 'g = Goal.new; def g.key_results; Goal.none; end; raise unless g.progress_percent == 0.0'\", \"expected_exit_code\": 0}"
+        },
+        {
+          "type": "command_exits",
+          "description": "Goal#progress_percent returns numeric average from seeded data",
+          "params": "{\"command\": \"bin/rails runner 'raise unless Goal.first.progress_percent.is_a?(Numeric)'\", \"expected_exit_code\": 0}"
+        }
+      ],
+      "verification": {
+        "commands": [
+          {"name": "Goal columns", "command": "bin/rails runner 'puts Goal.column_names'", "required": true},
+          {"name": "KeyResult columns", "command": "bin/rails runner 'puts KeyResult.column_names'", "required": true},
+          {"name": "ActionItem columns", "command": "bin/rails runner 'puts ActionItem.column_names'", "required": true},
+          {"name": "Goals seeded", "command": "bin/rails runner 'puts Goal.count'", "required": true},
+          {"name": "Progress percent from seed data", "command": "bin/rails runner 'puts Goal.first.progress_percent'", "required": true}
+        ]
+      },
+      "runbook": "## Task 5: Goals, Key Results, Action Items\n\nThree new models are live:\n- `Goal`: `active/completed/on_hold` status; `progress_percent` = average of key results\n- `KeyResult`: 0–100% progress tracks each measurable outcome\n- `ActionItem`: `pending/in_progress/completed` with optional `due_date`\n\n**Verify progress calculation:**\n```\nbin/rails runner 'Goal.includes(:key_results).each { |g| puts \"#{g.title}: #{g.progress_percent}%\" }'\n```\nExpected: 'Improve Executive Presence: 46.5%' (average of 60 and 33)"
+    },
+    {
+      "title": "Audit logging for all data changes",
+      "description": "Create an `AuditLog` model and `Auditable` concern to record create/update/destroy events on all core models.\n\n1. Generate migration:\n   ```\n   bin/rails generate migration CreateAuditLogs\n   ```\n   Edit to:\n   ```ruby\n   create_table :audit_logs do |t|\n     t.integer :user_id\n     t.string  :action,         null: false\n     t.string  :auditable_type, null: false\n     t.integer :auditable_id,   null: false\n     t.text    :changes_json\n     t.string  :ip_address\n     t.datetime :created_at, null: false\n   end\n   add_index :audit_logs, [:auditable_type, :auditable_id]\n   add_index :audit_logs, :user_id\n   ```\n\n2. Run `bin/rails db:migrate`.\n\n3. Create `app/models/audit_log.rb`:\n   ```ruby\n   class AuditLog < ApplicationRecord\n     self.record_timestamps = false\n     belongs_to :user, optional: true\n     validates :action, :auditable_type, :auditable_id, presence: true\n     scope :recent, -> { order(created_at: :desc) }\n   end\n   ```\n\n4. Create `app/models/concerns/auditable.rb`:\n   ```ruby\n   module Auditable\n     extend ActiveSupport::Concern\n     included do\n       after_create  { write_audit('create') }\n       after_update  { write_audit('update') }\n       after_destroy { write_audit('destroy') }\n     end\n     private\n     def write_audit(action)\n       AuditLog.create!(\n         user_id:        Current.user&.id,\n         action:         action,\n         auditable_type: self.class.name,\n         auditable_id:   id,\n         changes_json:   saved_changes.to_json,\n         created_at:     Time.current\n       )\n     rescue => e\n       Rails.logger.warn(\"[Auditable] #{e.message}\")\n     end\n   end\n   ```\n\n5. Add `include Auditable` to: `Client`, `SessionNote`, `Survey`, `Goal`, `KeyResult`, `ActionItem`.\n   (SessionNote, Survey, Goal, KeyResult, ActionItem already have the include stub from their model tasks; now the concern file exists.)\n\n6. Verify `app/models/current.rb` has `attribute :user` (generated by Rails 8 auth generator).",
+      "priority": 1,
+      "labels": ["backend", "database", "security"],
+      "position": 6,
+      "depends_on": [3, 4, 5],
+      "section_ref": "Security > Audit Logging",
+      "acceptance_criteria": [
+        {
+          "type": "file_exists",
+          "description": "AuditLog model exists",
+          "params": "{\"pattern\": \"app/models/audit_log.rb\"}"
+        },
+        {
+          "type": "file_exists",
+          "description": "Auditable concern exists",
+          "params": "{\"pattern\": \"app/models/concerns/auditable.rb\"}"
+        },
+        {
+          "type": "model_has",
+          "description": "AuditLog has required columns",
+          "params": "{\"model\": \"AuditLog\", \"columns\": [\"user_id\", \"action\", \"auditable_type\", \"auditable_id\", \"changes_json\"]}"
+        },
+        {
+          "type": "command_exits",
+          "description": "Auditable included in Client",
+          "params": "{\"command\": \"bin/rails runner 'raise unless Client.ancestors.map(&:name).include?(\\\"Auditable\\\")'\", \"expected_exit_code\": 0}"
+        },
+        {
+          "type": "command_exits",
+          "description": "Modifying a record creates an audit log entry",
+          "params": "{\"command\": \"bin/rails runner 'before = AuditLog.count; Client.first.update!(company: \\\"Audit Test\\\"); raise \\\"no audit log written\\\" unless AuditLog.count > before'\", \"expected_exit_code\": 0}"
+        }
+      ],
+      "verification": {
+        "commands": [
+          {"name": "AuditLog table exists", "command": "bin/rails runner 'puts AuditLog.table_exists?'", "required": true},
+          {"name": "Auditable in Client ancestors", "command": "bin/rails runner 'puts Client.ancestors.map(&:name).include?(\"Auditable\")'", "required": true},
+          {"name": "Audit written on update", "command": "bin/rails runner 'b = AuditLog.count; Client.first.update!(company: \"Test Audit\"); puts AuditLog.count > b'", "required": true},
+          {"name": "Audit entry structure", "command": "bin/rails runner 'puts AuditLog.last.slice(:action, :auditable_type).inspect'", "required": true}
+        ]
+      },
+      "runbook": "## Task 6: Audit Logging\n\nAll create/update/destroy operations on `Client`, `SessionNote`, `Survey`, `Goal`, `KeyResult`, and `ActionItem` are now written to `audit_logs`.\n\n**Verify:**\n```\nbin/rails runner 'Client.first.update!(company: \"Changed\"); puts AuditLog.last.inspect'\n```\nEach entry records: `action`, `auditable_type`, `auditable_id`, `changes_json`, `user_id` (if a user session is active), `created_at`."
+    },
+    {
+      "title": "Authorization layer — role guards and 404 policy",
+      "description": "Harden the authorization layer so unauthorized access always returns 404 (never 403), and coaches are scoped to their own clients.\n\nThis task consolidates the role-guard logic already stubbed in task 1 into a reusable concern and verifies the 404 behavior for all cross-role and out-of-scope scenarios.\n\n1. Create `app/controllers/concerns/role_authorization.rb`:\n   ```ruby\n   module RoleAuthorization\n     extend ActiveSupport::Concern\n     included do\n       # Ensure unauthorized access surfaces as 404, not 403\n       rescue_from ActiveRecord::RecordNotFound, with: :render_not_found\n     end\n     def render_not_found\n       render file: Rails.root.join('public/404.html'), status: :not_found, layout: false\n     end\n   end\n   ```\n\n2. Include `RoleAuthorization` in `ApplicationController` (in addition to the `Authentication` concern already present):\n   ```ruby\n   include RoleAuthorization\n   ```\n\n3. Update `app/controllers/coach/base_controller.rb` to use `render_not_found` consistently:\n   - Replace any inline 404 renders with calls to `render_not_found`\n   - `coach_client(id)` should rescue `ActiveRecord::RecordNotFound` and call `render_not_found`\n   - The `require_coach_role!` guard should call `render_not_found`\n\n4. Update `app/controllers/client/base_controller.rb` similarly:\n   - `require_client_role!` calls `render_not_found`\n   - `current_client_profile` calls `render_not_found` if no matching Client record\n\n5. Verify `public/404.html` exists (Rails generates it by default; create a minimal one if absent).\n\n6. Ensure `ApplicationController` correctly chains `require_authentication` as a `before_action` so unauthenticated requests redirect to the login page rather than 404.",
+      "priority": 0,
+      "labels": ["backend", "security"],
+      "position": 7,
+      "depends_on": [1],
+      "section_ref": "Security",
+      "acceptance_criteria": [
+        {
+          "type": "file_exists",
+          "description": "RoleAuthorization concern exists",
+          "params": "{\"pattern\": \"app/controllers/concerns/role_authorization.rb\"}"
+        },
+        {
+          "type": "file_exists",
+          "description": "Public 404 page exists",
+          "params": "{\"pattern\": \"public/404.html\"}"
+        },
+        {
+          "type": "command_exits",
+          "description": "RoleAuthorization included in ApplicationController",
+          "params": "{\"command\": \"bin/rails runner 'raise unless ApplicationController.ancestors.map(&:name).include?(\\\"RoleAuthorization\\\")'\", \"expected_exit_code\": 0}"
+        },
+        {
+          "type": "command_exits",
+          "description": "require_coach_role! is defined in Coach::BaseController",
+          "params": "{\"command\": \"grep -q 'require_coach_role!' app/controllers/coach/base_controller.rb\", \"expected_exit_code\": 0}"
+        }
+      ],
+      "verification": {
+        "commands": [
+          {"name": "RoleAuthorization in ancestry", "command": "bin/rails runner 'puts ApplicationController.ancestors.map(&:name).include?(\"RoleAuthorization\")'", "required": true},
+          {"name": "Coach base uses render_not_found", "command": "grep 'render_not_found' app/controllers/coach/base_controller.rb", "required": true},
+          {"name": "Client base uses render_not_found", "command": "grep 'render_not_found' app/controllers/client/base_controller.rb", "required": true},
+          {"name": "404 page present", "command": "test -f public/404.html && echo EXISTS", "required": true}
+        ]
+      },
+      "runbook": "## Task 7: Authorization Layer\n\nAll unauthorized access returns **404** (never 403):\n- Coach accessing `/client/` paths → 404\n- Client accessing `/coach/` paths → 404\n- Coach requesting another coach's client by ID → 404\n- Client with no linked Client profile → 404\n\nThe `ActiveRecord::RecordNotFound` rescue in `RoleAuthorization` handles the ownership scoping automatically when `coach_client(id)` is used."
+    },
+    {
+      "title": "Coach dashboard layout and navigation",
+      "description": "Build the shared coach application layout with navigation and the coach dashboard home page that summarizes all clients.\n\n1. Create `app/views/layouts/coach.html.erb` (a dedicated coach layout) with:\n   - `<head>` including Tailwind stylesheet tags\n   - A top navigation bar (Tailwind `bg-indigo-700 text-white`) containing:\n     - Brand: 'Leadership Coaching Portal'\n     - Links: 'Dashboard' (`coach_root_path`), 'Clients' (`coach_clients_path`)\n     - Right side: current user email + 'Sign Out' button (`button_to session_path, method: :delete`)\n   - A `<main>` content area with `<%= yield %>`\n   - Flash message rendering partial (`app/views/shared/_flash.html.erb`)\n\n2. Create `app/views/shared/_flash.html.erb` for success/alert flash messages with dismissible Tailwind styling.\n\n3. Update `app/controllers/coach/base_controller.rb` to set layout:\n   ```ruby\n   layout 'coach'\n   ```\n\n4. Update `app/controllers/coach/dashboard_controller.rb`:\n   ```ruby\n   class Coach::DashboardController < Coach::BaseController\n     def index\n       @clients = Current.user.clients\n                         .includes(:goals, :surveys, :session_notes)\n                         .order(:name)\n     end\n   end\n   ```\n\n5. Build `app/views/coach/dashboard/index.html.erb`:\n   - Heading: 'Welcome, [email]'\n   - Client summary cards (Tailwind card style) or table rows showing:\n     - Client name + company\n     - Count of goals, surveys, and session notes\n     - 'View Client' link to `coach_client_path(client)`\n   - 'Add New Client' button linking to `new_coach_client_path`\n\n6. Update `config/routes.rb` to define the full coach namespace (clients will be expanded in the next task):\n   ```ruby\n   namespace :coach do\n     root 'dashboard#index'\n     resources :clients\n   end\n   ```",
+      "priority": 0,
+      "labels": ["frontend", "backend"],
+      "position": 8,
+      "depends_on": [2, 7],
+      "section_ref": "Views & Interfaces",
+      "acceptance_criteria": [
+        {
+          "type": "file_exists",
+          "description": "Coach layout exists",
+          "params": "{\"pattern\": \"app/views/layouts/coach.html.erb\"}"
+        },
+        {
+          "type": "file_exists",
+          "description": "Flash partial exists",
+          "params": "{\"pattern\": \"app/views/shared/_flash.html.erb\"}"
+        },
+        {
+          "type": "file_exists",
+          "description": "Coach dashboard view exists",
+          "params": "{\"pattern\": \"app/views/coach/dashboard/index.html.erb\"}"
+        },
+        {
+          "type": "route_exists",
+          "description": "Coach root route",
+          "params": "{\"method\": \"GET\", \"path\": \"/coach\"}"
+        },
+        {
+          "type": "route_exists",
+          "description": "Coach clients index route",
+          "params": "{\"method\": \"GET\", \"path\": \"/coach/clients\"}"
+        }
+      ],
+      "verification": {
+        "commands": [
+          {"name": "Coach layout file", "command": "test -f app/views/layouts/coach.html.erb && echo OK", "required": true},
+          {"name": "Dashboard route", "command": "bin/rails routes | grep 'GET.*coach.*root\\|coach_root'", "required": true},
+          {"name": "DashboardController inherits base", "command": "grep 'Coach::BaseController' app/controllers/coach/dashboard_controller.rb", "required": true},
+          {"name": "Layout set in base", "command": "grep 'layout' app/controllers/coach/base_controller.rb", "required": true}
+        ]
+      },
+      "runbook": "## Task 8: Coach Dashboard\n\n**Access:**\n1. Log in as `coach@example.com` / `password` at http://localhost:3000/session/new\n2. Redirected to http://localhost:3000/coach\n3. See client summary cards for Jane Doe and John Smith\n\n**Navigation bar includes:**\n- Dashboard link\n- Clients link\n- Sign Out button\n\n**Each client card shows:** name, company, goal count, survey count, session note count."
+    },
+    {
+      "title": "Coach client management (full CRUD)",
+      "description": "Implement full CRUD for clients from the coach's perspective with Turbo Frame inline form support.\n\n1. Create `app/controllers/coach/clients_controller.rb`:\n   ```ruby\n   class Coach::ClientsController < Coach::BaseController\n     before_action :set_client, only: [:show, :edit, :update, :destroy]\n\n     def index\n       @clients = Current.user.clients.order(:name)\n     end\n\n     def show\n       # @client set by before_action\n     end\n\n     def new\n       @client = Client.new\n     end\n\n     def create\n       @client = Current.user.clients.build(client_params)\n       if @client.save\n         redirect_to coach_client_path(@client), notice: 'Client created.'\n       else\n         render :new, status: :unprocessable_entity\n       end\n     end\n\n     def edit; end\n\n     def update\n       if @client.update(client_params)\n         redirect_to coach_client_path(@client), notice: 'Client updated.'\n       else\n         render :edit, status: :unprocessable_entity\n       end\n     end\n\n     def destroy\n       @client.destroy\n       redirect_to coach_clients_path, notice: 'Client removed.'\n     end\n\n     private\n\n     def set_client\n       @client = coach_client(params[:id])\n     end\n\n     def client_params\n       params.require(:client).permit(:name, :company)\n     end\n   end\n   ```\n\n2. Create views in `app/views/coach/clients/`:\n   - `index.html.erb`: table of all coach clients with name, company, edit/delete links, and 'New Client' button\n   - `show.html.erb`: client detail page with name, company; navigation tabs/links to Session Notes, Surveys, Goals, and the PDF report\n   - `_form.html.erb`: form fields for `:name` and `:company`, wrapped in `turbo_frame_tag 'client_form'`\n   - `new.html.erb`: heading + render `_form`\n   - `edit.html.erb`: heading + render `_form`\n   - `_client.html.erb`: single client row partial for Turbo Stream updates\n\n3. Turbo Frame for inline new client form on the index page: wrap the 'New Client' button in a `turbo_frame_tag 'client_form'` that lazily loads `new_coach_client_path`.\n\n4. Add delete confirmation using `data: { turbo_confirm: 'Delete this client?' }` on destroy links.",
+      "priority": 0,
+      "labels": ["backend", "frontend"],
+      "position": 9,
+      "depends_on": [8],
+      "section_ref": "Views & Interfaces > Coach Client Management",
+      "acceptance_criteria": [
+        {
+          "type": "file_exists",
+          "description": "Coach clients controller exists",
+          "params": "{\"pattern\": \"app/controllers/coach/clients_controller.rb\"}"
+        },
+        {
+          "type": "file_exists",
+          "description": "Client show view exists",
+          "params": "{\"pattern\": \"app/views/coach/clients/show.html.erb\"}"
+        },
+        {
+          "type": "file_exists",
+          "description": "Client form partial exists",
+          "params": "{\"pattern\": \"app/views/coach/clients/_form.html.erb\"}"
+        },
+        {
+          "type": "route_exists",
+          "description": "Coach clients index",
+          "params": "{\"method\": \"GET\", \"path\": \"/coach/clients\"}"
+        },
+        {
+          "type": "route_exists",
+          "description": "Coach client create",
+          "params": "{\"method\": \"POST\", \"path\": \"/coach/clients\"}"
+        },
+        {
+          "type": "route_exists",
+          "description": "Coach client update",
+          "params": "{\"method\": \"PATCH\", \"path\": \"/coach/clients/:id\"}"
+        },
+        {
+          "type": "route_exists",
+          "description": "Coach client destroy",
+          "params": "{\"method\": \"DELETE\", \"path\": \"/coach/clients/:id\"}"
+        }
+      ],
+      "verification": {
+        "commands": [
+          {"name": "Client CRUD routes", "command": "bin/rails routes | grep 'coach/clients'", "required": true},
+          {"name": "Controller actions defined", "command": "grep -E 'def (index|show|new|create|edit|update|destroy)' app/controllers/coach/clients_controller.rb", "required": true},
+          {"name": "Strong params present", "command": "grep 'permit' app/controllers/coach/clients_controller.rb", "required": true},
+          {"name": "Ownership enforced via coach_client", "command": "grep 'coach_client' app/controllers/coach/clients_controller.rb", "required": true}
+        ]
+      },
+      "runbook": "## Task 9: Coach Client Management\n\n**Access:** http://localhost:3000/coach/clients\n\n**Operations:**\n- View all clients in a table\n- Create new client (name + company) — inline form via Turbo Frame\n- Edit client details\n- Delete client (with confirmation)\n\n**Ownership:** `coach_client(id)` ensures a coach can only access their own clients. Attempting another coach's client ID returns 404."
+    },
+    {
+      "title": "Session notes management for coaches",
+      "description": "Implement CRUD for session notes from the coach perspective, with rich-text editing and the ability to toggle sharing with the client.\n\n1. Add nested routes under coach clients:\n   ```ruby\n   namespace :coach do\n     root 'dashboard#index'\n     resources :clients do\n       resources :session_notes\n     end\n   end\n   ```\n\n2. Create `app/controllers/coach/session_notes_controller.rb`:\n   ```ruby\n   class Coach::SessionNotesController < Coach::BaseController\n     before_action :set_client\n     before_action :set_note, only: [:show, :edit, :update, :destroy, :toggle_shared]\n\n     def index\n       @session_notes = @client.session_notes.recent\n     end\n\n     def show; end\n     def new;  @session_note = @client.session_notes.build; end\n\n     def create\n       @session_note = @client.session_notes.build(session_note_params)\n       @session_note.shared = false  # always private by default\n       if @session_note.save\n         redirect_to coach_client_session_note_path(@client, @session_note), notice: 'Note created.'\n       else\n         render :new, status: :unprocessable_entity\n       end\n     end\n\n     def edit; end\n\n     def update\n       if @session_note.update(session_note_params)\n         redirect_to coach_client_session_note_path(@client, @session_note), notice: 'Note updated.'\n       else\n         render :edit, status: :unprocessable_entity\n       end\n     end\n\n     def destroy\n       @session_note.destroy\n       redirect_to coach_client_session_notes_path(@client), notice: 'Note deleted.'\n     end\n\n     private\n\n     def set_client\n       @client = coach_client(params[:client_id])\n     end\n\n     def set_note\n       @session_note = @client.session_notes.find(params[:id])\n     end\n\n     def session_note_params\n       params.require(:session_note).permit(:shared, :content, :shared_sections)\n     end\n   end\n   ```\n\n3. Create views in `app/views/coach/session_notes/`:\n   - `index.html.erb`: list of notes with date, shared/private badge (Tailwind colored pill), links to show/edit/delete\n   - `show.html.erb`:\n     - Section 'Private Notes': `@session_note.content` (rendered rich text)\n     - Section 'Shared Sections': `@session_note.shared_sections`\n     - Shared status badge + a toggle form (`button_to` PATCH with `shared: !@session_note.shared`)\n   - `_form.html.erb`: `rich_text_area :content` and `rich_text_area :shared_sections`; `check_box :shared`\n   - `new.html.erb`, `edit.html.erb`: standard form wrappers\n\n4. The 'Toggle Shared' button on the show page sends a PATCH update and redirects back. Respond with Turbo Stream to update the badge span in-place if you want the inline experience.",
+      "priority": 0,
+      "labels": ["backend", "frontend"],
+      "position": 10,
+      "depends_on": [9, 3],
+      "section_ref": "Features > Session Notes",
+      "acceptance_criteria": [
+        {
+          "type": "file_exists",
+          "description": "Session notes controller exists",
+          "params": "{\"pattern\": \"app/controllers/coach/session_notes_controller.rb\"}"
+        },
+        {
+          "type": "file_exists",
+          "description": "Session notes index view exists",
+          "params": "{\"pattern\": \"app/views/coach/session_notes/index.html.erb\"}"
+        },
+        {
+          "type": "file_exists",
+          "description": "Session notes form partial exists",
+          "params": "{\"pattern\": \"app/views/coach/session_notes/_form.html.erb\"}"
+        },
+        {
+          "type": "route_exists",
+          "description": "Session notes index route",
+          "params": "{\"method\": \"GET\", \"path\": \"/coach/clients/:client_id/session_notes\"}"
+        },
+        {
+          "type": "route_exists",
+          "description": "Session notes create route",
+          "params": "{\"method\": \"POST\", \"path\": \"/coach/clients/:client_id/session_notes\"}"
+        },
+        {
+          "type": "command_exits",
+          "description": "New note is private by default (shared: false hardcoded in create)",
+          "params": "{\"command\": \"grep -q 'shared = false' app/controllers/coach/session_notes_controller.rb\", \"expected_exit_code\": 0}"
+        }
+      ],
+      "verification": {
+        "commands": [
+          {"name": "Session note routes", "command": "bin/rails routes | grep session_note", "required": true},
+          {"name": "All CRUD actions defined", "command": "grep -E 'def (index|show|new|create|edit|update|destroy)' app/controllers/coach/session_notes_controller.rb", "required": true},
+          {"name": "Private by default in create", "command": "grep 'shared.*false' app/controllers/coach/session_notes_controller.rb", "required": true},
+          {"name": "Rich text area in form", "command": "grep 'rich_text_area' app/views/coach/session_notes/_form.html.erb", "required": true}
+        ]
+      },
+      "runbook": "## Task 10: Session Notes (Coach)\n\n**Access:**\n- http://localhost:3000/coach/clients/1/session_notes\n\n**Scenario verified:** GIVEN logged-in coach WHEN creating a session note THEN `shared` is `false` by default (private).\n\n**Operations:**\n- View all notes with shared/private badge\n- Create note: two ActionText editors (Private Notes + Shared Sections) + Shared checkbox\n- Edit and delete notes\n- Toggle shared on show page — enables client to see `shared_sections`\n\n**Privacy rule enforced in coach views:** Both fields are visible to the coach. Client exposure is controlled in the client portal (task 13)."
+    },
+    {
+      "title": "Survey management for coaches with delta display",
+      "description": "Implement CRUD for surveys from the coach perspective, displaying score deltas with color coding.\n\n1. Add nested routes:\n   ```ruby\n   namespace :coach do\n     resources :clients do\n       resources :session_notes\n       resources :surveys\n     end\n   end\n   ```\n\n2. Create `app/controllers/coach/surveys_controller.rb`:\n   ```ruby\n   class Coach::SurveysController < Coach::BaseController\n     before_action :set_client\n     before_action :set_survey, only: [:edit, :update, :destroy]\n\n     def index\n       @surveys = @client.surveys.ordered\n       @grouped = @surveys.group_by(&:competency)\n     end\n\n     def new\n       @survey = @client.surveys.build\n     end\n\n     def create\n       @survey = @client.surveys.build(survey_params)\n       if @survey.save\n         redirect_to coach_client_surveys_path(@client), notice: 'Survey saved.'\n       else\n         render :new, status: :unprocessable_entity\n       end\n     end\n\n     def edit; end\n\n     def update\n       if @survey.update(survey_params)\n         redirect_to coach_client_surveys_path(@client), notice: 'Survey updated.'\n       else\n         render :edit, status: :unprocessable_entity\n       end\n     end\n\n     def destroy\n       @survey.destroy\n       redirect_to coach_client_surveys_path(@client), notice: 'Survey deleted.'\n     end\n\n     private\n\n     def set_client\n       @client = coach_client(params[:client_id])\n     end\n\n     def set_survey\n       @survey = @client.surveys.find(params[:id])\n     end\n\n     def survey_params\n       params.require(:survey).permit(:competency, :score, :administered_at)\n     end\n   end\n   ```\n\n3. Create views in `app/views/coach/surveys/`:\n   - `index.html.erb`: group surveys by competency, render `_competency_group.html.erb` partial per group\n   - `_competency_group.html.erb`: table of scores + dates + delta column.\n     Delta display logic:\n     - `nil` → render `'—'` (em dash) in gray\n     - positive delta → render `'+N.N'` in green (`text-green-600`)\n     - negative delta → render `'N.N'` in red (`text-red-600`)\n   - `_form.html.erb`: text field for `competency`, number field for `score` (`step: '0.1'`), date field for `administered_at`\n   - `new.html.erb`, `edit.html.erb`\n\n4. Wrap the new survey form in a `turbo_frame_tag 'new_survey'` on the index page for inline expansion.",
+      "priority": 0,
+      "labels": ["backend", "frontend"],
+      "position": 11,
+      "depends_on": [9, 4],
+      "section_ref": "Features > Surveys",
+      "acceptance_criteria": [
+        {
+          "type": "file_exists",
+          "description": "Surveys controller exists",
+          "params": "{\"pattern\": \"app/controllers/coach/surveys_controller.rb\"}"
+        },
+        {
+          "type": "file_exists",
+          "description": "Surveys index view exists",
+          "params": "{\"pattern\": \"app/views/coach/surveys/index.html.erb\"}"
+        },
+        {
+          "type": "route_exists",
+          "description": "Surveys index route",
+          "params": "{\"method\": \"GET\", \"path\": \"/coach/clients/:client_id/surveys\"}"
+        },
+        {
+          "type": "route_exists",
+          "description": "Surveys create route",
+          "params": "{\"method\": \"POST\", \"path\": \"/coach/clients/:client_id/surveys\"}"
+        },
+        {
+          "type": "command_exits",
+          "description": "Delta color coding present in views",
+          "params": "{\"command\": \"grep -r 'delta' app/views/coach/surveys/\", \"expected_exit_code\": 0}"
+        }
+      ],
+      "verification": {
+        "commands": [
+          {"name": "Survey routes", "command": "bin/rails routes | grep surveys", "required": true},
+          {"name": "Delta rendered in views", "command": "grep -r 'delta' app/views/coach/surveys/", "required": true},
+          {"name": "Color coding for delta", "command": "grep -r 'text-green\\|text-red' app/views/coach/surveys/", "required": true},
+          {"name": "Surveys controller actions", "command": "grep -E 'def (index|new|create|edit|update|destroy)' app/controllers/coach/surveys_controller.rb", "required": true}
+        ]
+      },
+      "runbook": "## Task 11: Survey Management (Coach)\n\n**Access:** http://localhost:3000/coach/clients/1/surveys\n\n**Features:**\n- Surveys grouped by competency\n- Delta column: `+0.5` green, `-1.2` red, `—` gray (first survey in competency)\n- Add new survey inline (Turbo Frame) or via form page\n\n**Seeded data for Jane Doe:**\n- Communication: 6.5 (—) → 7.0 (+0.5)\n- Leadership: 5.8 (—)"
+    },
+    {
+      "title": "Goals and action plans management for coaches",
+      "description": "Implement CRUD for Goals, Key Results, and Action Items with inline Turbo Stream updates for progress.\n\n1. Expand routes:\n   ```ruby\n   namespace :coach do\n     resources :clients do\n       resources :session_notes\n       resources :surveys\n       resources :goals do\n         resources :key_results,  only: [:create, :update, :destroy]\n         resources :action_items, only: [:create, :update, :destroy]\n       end\n     end\n   end\n   ```\n\n2. Create `app/controllers/coach/goals_controller.rb` (full CRUD, owner-scoped through `@client`).\n   Strong params: `permit(:title, :description, :status)`.\n\n3. Create `app/controllers/coach/key_results_controller.rb` (create/update/destroy).\n   - Load: `@client = coach_client(params[:client_id]); @goal = @client.goals.find(params[:goal_id])`\n   - Strong params: `permit(:title, :progress_percent)`\n   - After create/update/destroy, respond with Turbo Stream that re-renders the goal's progress bar partial.\n\n4. Create `app/controllers/coach/action_items_controller.rb` (create/update/destroy).\n   - Load as above.\n   - Strong params: `permit(:title, :status, :due_date)`\n   - After update, respond with Turbo Stream updating the action item row.\n\n5. Create views in `app/views/coach/goals/`:\n   - `index.html.erb`: card grid; each card shows goal title, status badge, Tailwind progress bar (`style=\"width: <%=goal.progress_percent%>%\"`), key result count, action item count, and 'View' link\n   - `show.html.erb`:\n     - Goal title + description + status selector form\n     - **Key Results section**: table listing each key result with an inline progress input; 'Add Key Result' form below\n     - **Action Items section**: table with title, status select, due date; 'Add Action Item' form below\n     - A `turbo_frame_tag 'goal_progress'` wraps the progress bar so Turbo Stream updates refresh it\n   - `_form.html.erb`, `new.html.erb`, `edit.html.erb`\n   - `_key_result.html.erb`: single row partial for Turbo Stream targeting\n   - `_action_item.html.erb`: single row partial for Turbo Stream targeting\n\n6. Progress bar HTML pattern:\n   ```erb\n   <%= turbo_frame_tag 'goal_progress' do %>\n     <div class=\"w-full bg-gray-200 rounded h-2\">\n       <div class=\"bg-blue-500 h-2 rounded\" style=\"width: <%= @goal.progress_percent %>%\"></div>\n     </div>\n     <span><%= @goal.progress_percent %>%</span>\n   <% end %>\n   ```",
+      "priority": 0,
+      "labels": ["backend", "frontend"],
+      "position": 12,
+      "depends_on": [9, 5],
+      "section_ref": "Features > Goals & Action Plans",
+      "acceptance_criteria": [
+        {
+          "type": "file_exists",
+          "description": "Goals controller exists",
+          "params": "{\"pattern\": \"app/controllers/coach/goals_controller.rb\"}"
+        },
+        {
+          "type": "file_exists",
+          "description": "Key results controller exists",
+          "params": "{\"pattern\": \"app/controllers/coach/key_results_controller.rb\"}"
+        },
+        {
+          "type": "file_exists",
+          "description": "Action items controller exists",
+          "params": "{\"pattern\": \"app/controllers/coach/action_items_controller.rb\"}"
+        },
+        {
+          "type": "file_exists",
+          "description": "Goals index view exists",
+          "params": "{\"pattern\": \"app/views/coach/goals/index.html.erb\"}"
+        },
+        {
+          "type": "route_exists",
+          "description": "Goals index route",
+          "params": "{\"method\": \"GET\", \"path\": \"/coach/clients/:client_id/goals\"}"
+        },
+        {
+          "type": "route_exists",
+          "description": "Key results create route",
+          "params": "{\"method\": \"POST\", \"path\": \"/coach/clients/:client_id/goals/:goal_id/key_results\"}"
+        },
+        {
+          "type": "route_exists",
+          "description": "Action items create route",
+          "params": "{\"method\": \"POST\", \"path\": \"/coach/clients/:client_id/goals/:goal_id/action_items\"}"
+        },
+        {
+          "type": "command_exits",
+          "description": "Progress bar references progress_percent in views",
+          "params": "{\"command\": \"grep -r 'progress_percent' app/views/coach/goals/\", \"expected_exit_code\": 0}"
+        }
+      ],
+      "verification": {
+        "commands": [
+          {"name": "Goals routes", "command": "bin/rails routes | grep 'coach.*goal'", "required": true},
+          {"name": "Key results routes", "command": "bin/rails routes | grep key_result", "required": true},
+          {"name": "Action items routes", "command": "bin/rails routes | grep action_item", "required": true},
+          {"name": "Progress bar in goals view", "command": "grep -r 'progress_percent' app/views/coach/goals/", "required": true},
+          {"name": "Turbo stream in key results controller", "command": "grep -r 'turbo_stream\\|format.turbo_stream' app/controllers/coach/key_results_controller.rb", "required": false}
+        ]
+      },
+      "runbook": "## Task 12: Goals & Action Plans (Coach)\n\n**Access:** http://localhost:3000/coach/clients/1/goals\n\n**Features:**\n- Goal cards with live progress bar (avg of key results)\n- Drill into a goal to manage key results and action items inline\n- Key result progress updates → Turbo Stream refreshes the progress bar\n- Action item status updates in-place\n\n**Seeded data:** 'Improve Executive Presence' goal at ~46.5% progress (two key results at 60% and 33%)."
+    },
+    {
+      "title": "Client portal showing only shared content",
+      "description": "Build the client-facing portal that shows ONLY items the coach has explicitly shared. The private `content` field of SessionNote MUST NEVER appear in any client view.\n\n1. Create `app/views/layouts/client.html.erb` — a minimal layout with:\n   - Brand header: 'My Coaching Portal'\n   - Current user email + Sign Out button\n   - `<%= yield %>`\n\n2. Update `app/controllers/client/base_controller.rb` to set `layout 'client'`.\n\n3. Update `app/controllers/client/dashboard_controller.rb`:\n   ```ruby\n   class Client::DashboardController < Client::BaseController\n     def index\n       @profile       = current_client_profile\n       @shared_notes  = @profile.session_notes.shared.recent\n       @goals         = @profile.goals.includes(:key_results, :action_items)\n       @surveys       = @profile.surveys.ordered\n     end\n   end\n   ```\n\n4. Build `app/views/client/dashboard/index.html.erb` with three sections:\n\n   **Shared Session Notes section:**\n   ```erb\n   <% @shared_notes.each do |note| %>\n     <div class=\"card\">\n       <p class=\"text-sm text-gray-500\"><%= note.created_at.strftime('%B %d, %Y') %></p>\n       <%= note.shared_sections %>  <%# ONLY shared_sections — never note.content %>\n     </div>\n   <% end %>\n   ```\n   `note.content` must NOT be referenced anywhere in `app/views/client/`.\n\n   **Goals & Progress section:**\n   - Read-only goal cards with progress bar and action items list (status badges only — no edit controls)\n\n   **Survey Scores section:**\n   - Read-only table: competency, score, date (no delta shown to client — coach-only metric)\n\n5. Create `app/views/client/dashboard/_shared_note.html.erb`, `_goal.html.erb`, `_survey_row.html.erb` partials for clean separation.\n\n6. Update `config/routes.rb`:\n   ```ruby\n   namespace :client do\n     root 'dashboard#index'\n   end\n   ```\n\n7. Update seeds so `client@example.com` user is linked to Jane Doe's client record (set `jane.update!(user_id: client_user.id)`) and mark the seed note as shared:\n   ```ruby\n   jane.session_notes.first&.update!(shared: true)\n   ```\n\n8. **Final security check:** Run `grep -rn 'session_note\\.content\\b\\|note\\.content\\b' app/views/client/` and confirm zero matches.",
+      "priority": 0,
+      "labels": ["backend", "frontend", "security"],
+      "position": 13,
+      "depends_on": [8, 10, 11, 12],
+      "section_ref": "Target Users > Clients",
+      "acceptance_criteria": [
+        {
+          "type": "file_exists",
+          "description": "Client layout exists",
+          "params": "{\"pattern\": \"app/views/layouts/client.html.erb\"}"
+        },
+        {
+          "type": "file_exists",
+          "description": "Client dashboard controller exists",
+          "params": "{\"pattern\": \"app/controllers/client/dashboard_controller.rb\"}"
+        },
+        {
+          "type": "file_exists",
+          "description": "Client dashboard view exists",
+          "params": "{\"pattern\": \"app/views/client/dashboard/index.html.erb\"}"
+        },
+        {
+          "type": "route_exists",
+          "description": "Client root route",
+          "params": "{\"method\": \"GET\", \"path\": \"/client\"}"
+        },
+        {
+          "type": "model_has",
+          "description": "Client model has user_id to link portal users",
+          "params": "{\"model\": \"Client\", \"columns\": [\"user_id\"]}"
+        },
+        {
+          "type": "command_exits",
+          "description": "No reference to private note.content in client views",
+          "params": "{\"command\": \"! grep -rqE '(session_note|note)\\.content\\b' app/views/client/\", \"expected_exit_code\": 0}"
+        },
+        {
+          "type": "command_exits",
+          "description": "Client-linked user can load their profile",
+          "params": "{\"command\": \"bin/rails runner 'u = User.find_by(email_address: \\\"client@example.com\\\"); raise \\\"no profile\\\" unless Client.find_by(user_id: u.id)'\", \"expected_exit_code\": 0}"
+        }
+      ],
+      "verification": {
+        "commands": [
+          {"name": "Client routes", "command": "bin/rails routes | grep '^.*client'", "required": true},
+          {"name": "No private content in client views", "command": "grep -rn 'note\\.content\\b' app/views/client/ || echo CLEAN", "required": true},
+          {"name": "Client user has linked profile", "command": "bin/rails runner 'puts Client.where.not(user_id: nil).count'", "required": true},
+          {"name": "Shared note exists", "command": "bin/rails runner 'puts SessionNote.shared.count'", "required": true}
+        ]
+      },
+      "runbook": "## Task 13: Client Portal\n\n**Access:**\n1. Log in as `client@example.com` / `password`\n2. Redirected to http://localhost:3000/client\n\n**Client sees (read-only):**\n- Shared session notes → only `shared_sections` content\n- Goals with progress bars and action item statuses\n- Survey competency scores\n\n**Security verified:** `grep -rn 'note\\.content' app/views/client/` returns zero matches. Private coaching notes are structurally inaccessible from client views."
+    },
+    {
+      "title": "PDF report generation for coaching engagements",
+      "description": "Generate downloadable PDF coaching reports using the `prawn` gem (pure Ruby, no external binaries required).\n\n1. Add gems:\n   ```\n   bundle add prawn prawn-table\n   ```\n\n2. Create `app/services/coaching_report_pdf.rb`:\n   ```ruby\n   class CoachingReportPdf\n     def initialize(client)\n       @client = client\n     end\n\n     def render\n       Prawn::Document.new do |pdf|\n         # --- Header ---\n         pdf.font_size(22) { pdf.text \"Coaching Report: #{@client.name}\", style: :bold }\n         pdf.text \"Company: #{@client.company || '—'}\"\n         pdf.text \"Generated: #{Date.today.strftime('%B %d, %Y')}\"\n         pdf.move_down 16\n\n         # --- Survey Scores ---\n         pdf.font_size(14) { pdf.text 'Survey Scores', style: :bold }\n         pdf.move_down 4\n         surveys = @client.surveys.ordered\n         if surveys.any?\n           survey_data = [['Competency', 'Score', 'Delta', 'Date']] +\n             surveys.map do |s|\n               delta_str = s.delta.nil? ? '—' : (s.delta >= 0 ? \"+#{s.delta}\" : s.delta.to_s)\n               [s.competency, s.score.to_s, delta_str, s.administered_at.strftime('%b %Y')]\n             end\n           pdf.table(survey_data, header: true, width: pdf.bounds.width)\n         else\n           pdf.text 'No surveys recorded.', color: '999999'\n         end\n         pdf.move_down 16\n\n         # --- Goals ---\n         pdf.font_size(14) { pdf.text 'Goals & Progress', style: :bold }\n         pdf.move_down 4\n         @client.goals.includes(:key_results).each do |goal|\n           pdf.text \"#{goal.title} — #{goal.status} (#{goal.progress_percent}%)\", style: :bold\n           goal.key_results.each { |kr| pdf.text \"  • #{kr.title}: #{kr.progress_percent}%\" }\n           pdf.move_down 6\n         end\n\n         # --- Shared Session Notes ---\n         pdf.font_size(14) { pdf.text 'Session Notes (Shared)', style: :bold }\n         pdf.move_down 4\n         shared = @client.session_notes.shared.recent\n         if shared.any?\n           shared.each do |note|\n             pdf.text note.created_at.strftime('%B %d, %Y'), style: :italic, color: '666666'\n             # Use .to_plain_text — NEVER include note.content (private)\n             pdf.text note.shared_sections.to_plain_text\n             pdf.move_down 8\n           end\n         else\n           pdf.text 'No shared notes.', color: '999999'\n         end\n       end.render\n     end\n   end\n   ```\n\n3. Create `app/controllers/coach/reports_controller.rb`:\n   ```ruby\n   class Coach::ReportsController < Coach::BaseController\n     def show\n       @client = coach_client(params[:client_id])\n       report = CoachingReportPdf.new(@client)\n       send_data report.render,\n                 filename: \"coaching-report-#{@client.name.parameterize}-#{Date.today}.pdf\",\n                 type: 'application/pdf',\n                 disposition: 'inline'\n     end\n   end\n   ```\n\n4. Add route nested under coach clients:\n   ```ruby\n   resources :clients do\n     # ... other nested resources\n     resource :report, only: [:show], controller: 'reports'\n   end\n   ```\n\n5. Add 'Download PDF Report' link on `app/views/coach/clients/show.html.erb`:\n   ```erb\n   <%= link_to 'Download PDF Report', coach_client_report_path(@client),\n         class: 'btn btn-secondary', target: '_blank' %>\n   ```",
+      "priority": 1,
+      "labels": ["backend", "frontend"],
+      "position": 14,
+      "depends_on": [9, 10, 11, 12],
+      "section_ref": "Key Goals > Generate PDF reports",
+      "acceptance_criteria": [
+        {
+          "type": "file_exists",
+          "description": "CoachingReportPdf service exists",
+          "params": "{\"pattern\": \"app/services/coaching_report_pdf.rb\"}"
+        },
+        {
+          "type": "file_exists",
+          "description": "Reports controller exists",
+          "params": "{\"pattern\": \"app/controllers/coach/reports_controller.rb\"}"
+        },
+        {
+          "type": "route_exists",
+          "description": "Report download route exists",
+          "params": "{\"method\": \"GET\", \"path\": \"/coach/clients/:client_id/report\"}"
+        },
+        {
+          "type": "command_exits",
+          "description": "Prawn gem is loadable",
+          "params": "{\"command\": \"bin/rails runner 'require \\\"prawn\\\"; puts Prawn::VERSION'\", \"expected_exit_code\": 0}"
+        },
+        {
+          "type": "command_exits",
+          "description": "PDF renders without error for seeded client",
+          "params": "{\"command\": \"bin/rails runner 'pdf = CoachingReportPdf.new(Client.first).render; raise \\\"empty PDF\\\" unless pdf.bytesize > 100'\", \"expected_exit_code\": 0}"
+        },
+        {
+          "type": "command_exits",
+          "description": "Private content not referenced in PDF service",
+          "params": "{\"command\": \"! grep -q '\\.content\\b' app/services/coaching_report_pdf.rb\", \"expected_exit_code\": 0}"
+        }
+      ],
+      "verification": {
+        "commands": [
+          {"name": "Prawn gem loads", "command": "bin/rails runner 'require \"prawn\"; puts Prawn::VERSION'", "required": true},
+          {"name": "Report route", "command": "bin/rails routes | grep report", "required": true},
+          {"name": "PDF renders for seed client", "command": "bin/rails runner 'puts CoachingReportPdf.new(Client.first).render.bytesize'", "required": true},
+          {"name": "Private content excluded from PDF", "command": "! grep -q '\\.content\\b' app/services/coaching_report_pdf.rb && echo CLEAN", "required": true}
+        ]
+      },
+      "runbook": "## Task 14: PDF Reports\n\n**Generate a report:**\n1. Log in as `coach@example.com` / `password`\n2. Navigate to any client page (e.g. http://localhost:3000/coach/clients/1)\n3. Click 'Download PDF Report' — PDF renders inline in the browser\n\n**Report contents:**\n- Client name + company + generation date\n- Survey scores table with deltas\n- Goals list with per-key-result progress\n- Shared session notes (plain text from `shared_sections`)\n\n**No external binaries required** — Prawn is pure Ruby. Private `note.content` is never included."
+    },
+    {
+      "title": "Integration and system tests",
+      "description": "Write the full test suite covering all spec GIVEN/WHEN/THEN scenarios. All tests must pass with `bin/rails test:all` using only local resources.\n\n**Fixtures** (`test/fixtures/`):\n- `users.yml`: one coach user, one client user (with `has_secure_password`-compatible fixture using BCrypt digest)\n- `clients.yml`: two clients for the coach; one linked to the client user\n- `session_notes.yml`: one private note, one shared note\n- `surveys.yml`: two surveys for the same competency (different dates/scores) to exercise delta\n- `goals.yml`: one active goal\n- `key_results.yml`: two key results (50% and 100%) for the goal\n- `action_items.yml`: one pending action item\n\n**Model tests** (`test/models/`):\n\n`test/models/user_test.rb`:\n- Email presence and uniqueness\n- Role enum: coach? and client? predicates\n- Password digest set by has_secure_password\n\n`test/models/survey_test.rb`:\n- `delta` returns `nil` for first survey in competency\n- `delta` returns `(score2 - score1).round(1)` for second survey (spec formula)\n- Rounding: a delta of 3.25 rounds to 3.3, not 3.25\n- `validates :competency, :score, :administered_at` presence\n\n`test/models/goal_test.rb`:\n- `progress_percent` returns `0.0` for goal with no key results\n- `progress_percent` returns average of key results' `progress_percent` values\n- Status validation rejects values outside `active/completed/on_hold`\n\n`test/models/session_note_test.rb`:\n- Default `shared` is `false`\n- `content` and `shared_sections` are ActionText rich text associations\n\n**System tests** (`test/system/`) — all use `driven_by :selenium, using: :headless_chrome`:\n\n`test/system/coach_login_test.rb`:\n- GIVEN a coach with valid credentials WHEN they submit the login form THEN they are redirected to `/coach`\n- GIVEN invalid credentials WHEN login submitted THEN error message shown, stays on login page\n\n`test/system/session_notes_test.rb`:\n- GIVEN logged-in coach WHEN they create a new session note THEN the note is saved with `shared: false` by default\n\n`test/system/client_portal_test.rb`:\n- GIVEN client logs in WHEN they view the portal THEN shared session notes' `shared_sections` content is visible\n- GIVEN a note has `shared: false` THEN it does NOT appear in the client portal\n- GIVEN a note has `shared: true` THEN the note's private `content` does NOT appear in the portal (only `shared_sections`)\n\n`test/system/authorization_test.rb`:\n- GIVEN a client user WHEN they visit `/coach/` path THEN response is 404\n- GIVEN a coach user WHEN they visit `/client/` path THEN response is 404\n\n`test/models/audit_log_test.rb`:\n- Creating a Client record writes an audit log with `action: 'create'`\n- Updating a Client record writes an audit log with `action: 'update'`\n\n**Test helper setup:**\n- In `test/test_helper.rb`, ensure `Current.user` can be set without a real request context\n- In `test/application_system_test_case.rb`, confirm `driven_by :selenium, using: :headless_chrome`",
+      "priority": 1,
+      "labels": ["testing"],
+      "position": 15,
+      "depends_on": [13, 14],
+      "section_ref": "Features > All",
+      "acceptance_criteria": [
+        {
+          "type": "test_exists",
+          "description": "Survey model test with delta assertions",
+          "params": "{\"pattern\": \"test/models/survey_test.rb\", \"min_assertions\": 3}"
+        },
+        {
+          "type": "test_exists",
+          "description": "Goal model test with progress_percent assertions",
+          "params": "{\"pattern\": \"test/models/goal_test.rb\", \"min_assertions\": 2}"
+        },
+        {
+          "type": "test_exists",
+          "description": "Session note model test",
+          "params": "{\"pattern\": \"test/models/session_note_test.rb\", \"min_assertions\": 2}"
+        },
+        {
+          "type": "test_exists",
+          "description": "Coach login system test",
+          "params": "{\"pattern\": \"test/system/coach_login_test.rb\", \"min_assertions\": 1}"
+        },
+        {
+          "type": "test_exists",
+          "description": "Client portal system test covering shared content visibility",
+          "params": "{\"pattern\": \"test/system/client_portal_test.rb\", \"min_assertions\": 2}"
+        },
+        {
+          "type": "test_exists",
+          "description": "Authorization 404 system test",
+          "params": "{\"pattern\": \"test/system/authorization_test.rb\", \"min_assertions\": 2}"
+        },
+        {
+          "type": "test_exists",
+          "description": "Audit log model test",
+          "params": "{\"pattern\": \"test/models/audit_log_test.rb\", \"min_assertions\": 2}"
+        },
+        {
+          "type": "command_exits",
+          "description": "Full test suite passes",
+          "params": "{\"command\": \"bin/rails test:all\", \"expected_exit_code\": 0}"
+        }
+      ],
+      "verification": {
+        "commands": [
+          {"name": "Model tests pass", "command": "bin/rails test test/models/", "required": true},
+          {"name": "System tests pass", "command": "bin/rails test test/system/", "required": true},
+          {"name": "Full suite passes", "command": "bin/rails test:all", "required": true},
+          {"name": "Headless Chrome configured", "command": "grep 'headless_chrome' test/application_system_test_case.rb", "required": true}
+        ]
+      },
+      "runbook": "## Task 15: Tests\n\n**Run the full suite:**\n```\nbin/rails test:all\n```\n\n**Test coverage by scenario:**\n- Coach login → coach dashboard (GIVEN/WHEN/THEN from spec)\n- Session note created as private by default\n- Client portal shows shared_sections, hides private content\n- Cross-role access returns 404\n- Survey delta: nil for first, numeric for subsequent (formula verified)\n- Goal progress: 0 for empty, average for populated\n- Audit log written on create/update\n\n**Requirements:**\n- All tests use local SQLite — no network access\n- System tests use headless Chrome (`driven_by :selenium, using: :headless_chrome`)"
+    }
+  ]
+}

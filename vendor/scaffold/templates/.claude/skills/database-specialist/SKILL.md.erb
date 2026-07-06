@@ -1,0 +1,63 @@
+---
+name: database-specialist
+description: "Use when implementing database, model, migration, schema, or data layer tasks. Provides patterns for data modeling, migration safety, and query performance. Examples: 'creating a model', 'adding a migration', 'defining associations', 'adding indexes'"
+---
+# Database Specialist
+
+You are working on data modeling and database schema. Prioritize referential
+integrity, migration safety, and query performance. Database constraints are
+the source of truth for data integrity.
+
+## Technology Stack
+
+<% (framework || {}).each do |key, value| -%>
+- **<%= key.capitalize %>:** <%= value %>
+<% end -%>
+<% if sections.any? -%>
+
+## Framework Patterns
+<% sections.each do |section| -%>
+
+### <%= section["name"] %>
+<%= section["description"]&.strip %>
+<% (section["guidance"] || []).each do |g| -%>
+- <%= g %>
+<% end -%>
+<% tools = section["rails_tools"] || section["tools"] -%>
+<% if tools&.any? -%>
+
+**Available tools:**
+<% tools.each do |t| -%>
+- <%= t %>
+<% end -%>
+<% end -%>
+<% end -%>
+<% end -%>
+
+## Quality Criteria
+
+Before marking the task done, verify:
+
+- [ ] Migration runs forward cleanly (`db:migrate`)
+- [ ] Migration can rollback cleanly (`db:rollback` + `db:migrate`)
+- [ ] Foreign key constraints exist for all belongs_to associations
+- [ ] Indexes exist on columns used in WHERE, ORDER BY, and JOIN clauses
+- [ ] NOT NULL constraints on columns that must always have values
+- [ ] Seed data loads without errors (`db:seed`)
+- [ ] No SQLite-incompatible features used in development
+
+## Verification Focus
+
+When running verification commands, pay special attention to:
+- Migrations running without errors in both directions
+- Foreign keys and indexes present in schema
+- Seed data loading cleanly
+- No pending migrations blocking boot
+
+## Common Pitfalls
+
+- **Don't skip foreign keys.** Every `belongs_to` needs a matching `foreign_key` constraint in the migration.
+- **Don't forget indexes.** Any column in a `where`, `order`, or `joins` clause needs an index. Add compound indexes for common query patterns.
+- **Don't use irreversible migrations casually.** If you `remove_column`, the rollback needs the column type. Use `change` methods that auto-reverse when possible.
+- **Don't duplicate model definitions.** Grep the project for existing models before creating or modifying. Check for conflicting attribute names.
+- **Don't forget seed data.** Every model should have seed data in `db/seeds.rb` so the app is usable after `db:seed`.

@@ -1,0 +1,314 @@
+#!/usr/bin/env bash
+# Run small static QA fixtures that guard known product-quality regressions.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+FIXTURE_ROOT="$ROOT/fixtures/quality"
+OUT_ROOT="${TMPDIR:-/tmp}/rds-quality-fixtures-$$"
+PORT_BASE="${RDS_FIXTURE_PORT_BASE:-47100}"
+
+usage() {
+  cat <<'EOF'
+Usage: bin/rds-quality-fixtures [--keep-going] [--fixture=<name>]
+
+Runs static fixture apps against the real RDS QA modules and asserts expected
+pass/fail outcomes. This is a fast regression harness for product-quality gates,
+not a full RDS build.
+EOF
+}
+
+KEEP_GOING=0
+ONLY_FIXTURE=""
+for arg in "$@"; do
+  case "$arg" in
+    --keep-going) KEEP_GOING=1 ;;
+    --fixture=*) ONLY_FIXTURE="${arg#--fixture=}" ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "FATAL: unknown argument: $arg" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+[[ -d "$FIXTURE_ROOT" ]] || { echo "FATAL: missing fixture dir: $FIXTURE_ROOT" >&2; exit 2; }
+mkdir -p "$OUT_ROOT"
+
+server_pid=""
+stop_server() {
+  if [[ -n "$server_pid" ]]; then
+    kill "$server_pid" >/dev/null 2>&1 || true
+    wait "$server_pid" >/dev/null 2>&1 || true
+    server_pid=""
+  fi
+}
+trap stop_server EXIT
+
+start_server() {
+  local dir="$1"
+  local port="$2"
+  stop_server
+  python3 -m http.server "$port" --bind 127.0.0.1 --directory "$dir" > "$OUT_ROOT/http-$port.log" 2>&1 &
+  server_pid="$!"
+  for _ in $(seq 1 50); do
+    if curl -fsS "http://127.0.0.1:$port/" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "FATAL: fixture server failed for $dir on port $port" >&2
+  return 2
+}
+
+json_status() {
+  local path="$1"
+  jq -r '.status // "missing"' "$path" 2>/dev/null || echo "missing"
+}
+
+assert_status() {
+  local expected="$1"
+  local actual="$2"
+  case "$expected" in
+    pass)
+      [[ "$actual" == "pass" ]]
+      ;;
+    not-pass)
+      [[ "$actual" != "pass" && "$actual" != "missing" ]]
+      ;;
+    *)
+      [[ "$actual" == "$expected" ]]
+      ;;
+  esac
+}
+
+run_module() {
+  local fixture="$1"
+  local module="$2"
+  local verdict_file="$3"
+  local expected="$4"
+  local port="$5"
+  local fixture_dir="$FIXTURE_ROOT/$fixture"
+  local out_dir="$OUT_ROOT/$fixture/$module"
+  local scenarios="$fixture_dir/qa-scenarios.json"
+
+  mkdir -p "$out_dir"
+  if [[ -d "$fixture_dir/rds-qa-preseed" ]]; then
+    cp -R "$fixture_dir/rds-qa-preseed"/. "$out_dir"/
+  fi
+  start_server "$fixture_dir" "$port"
+
+  local rc=0
+  (
+    cd "$ROOT/dashboard"
+    args=(
+      --base-url="http://127.0.0.1:$port/"
+      --out-dir="$out_dir"
+      --scenarios="$scenarios"
+    )
+    if [[ "$module" == "truthfulness-audit" ]]; then
+      args+=(--source-dir="$fixture_dir")
+    fi
+    if [[ "$module" == "prd-coverage-audit" ]]; then
+      args+=(--source-dir="$fixture_dir")
+    fi
+    bun run "$ROOT/lib/rds-qa/$module.ts" "${args[@]}"
+  ) > "$out_dir/run.log" 2>&1 || rc=$?
+
+  local verdict="$out_dir/$verdict_file"
+  local status
+  status="$(json_status "$verdict")"
+  if assert_status "$expected" "$status"; then
+    if [[ "$fixture" == "workflow-noop-controls" && "$module" == "workflow-uat" ]]; then
+      if ! jq -e '.scenarioVerdict.failureBreakdown.product_behavior >= 1 and ([.scenarioVerdict.checks[]? | select(.status != "pass") | .failureKind] | all(. == "product_behavior"))' "$verdict" >/dev/null 2>&1; then
+        printf '✗ %-34s %-16s missing scenario failure classification\n' "$fixture" "$module"
+        echo "  verdict: $verdict"
+        return 1
+      fi
+    fi
+    printf '✓ %-34s %-16s expected=%s actual=%s rc=%s\n' "$fixture" "$module" "$expected" "$status" "$rc"
+    return 0
+  fi
+
+  printf '✗ %-34s %-16s expected=%s actual=%s rc=%s\n' "$fixture" "$module" "$expected" "$status" "$rc"
+  echo "  verdict: $verdict"
+  echo "  log:     $out_dir/run.log"
+  return 1
+}
+
+run_taste_review_fixture() {
+  local name="$1"
+  local expected="$2"
+  local fixture_root="$OUT_ROOT/taste-root-$name"
+  local build_id="taste-$name"
+  local build_dir="$fixture_root/builds/$build_id"
+  local app_dir="$fixture_root/app"
+  local iter_dir="$build_dir/playwright/iter-001"
+
+  mkdir -p "$app_dir/src" "$iter_dir"
+  cat > "$build_dir/state.json" <<JSON
+{"app_type":"dashboard","app_dest":"$app_dir"}
+JSON
+  cat > "$build_dir/spec.md" <<'MD'
+# Taste Missing Design Fixture
+
+Build an operator dashboard with create, save, edit, filter, search, complete,
+submit, import, export, empty, loading, error, success, toast, validation,
+status, priority, owner, deadline, history, activity, progress, summary,
+insight, metric, responsive, mobile, grid, layout, overflow, breakpoint.
+MD
+  cat > "$app_dir/src/App.tsx" <<'TSX'
+export default function App() {
+  return "create save edit filter search complete submit import export empty loading error success toast disabled validation sample status priority owner deadline history activity progress summary insight metric responsive mobile grid layout overflow breakpoint";
+}
+TSX
+  cat > "$iter_dir/summary.json" <<'JSON'
+{"converged":true,"gapsFound":0}
+JSON
+  cat > "$iter_dir/spec-verdict.json" <<'JSON'
+{"overall":"pass"}
+JSON
+  cat > "$iter_dir/visual-verdict.json" <<'JSON'
+{"status":"pass","blockerCount":0}
+JSON
+  cat > "$iter_dir/workflow-verdict.json" <<'JSON'
+{"status":"pass","score":92,"threshold":75,"criteria":[]}
+JSON
+  printf 'not really an image, only presence evidence for missing design-review regression\n' > "$iter_dir/home.png"
+
+  local out_dir="$OUT_ROOT/$build_id/taste-review"
+  mkdir -p "$out_dir"
+  local rc=0
+  "$ROOT/bin/rds-taste-review" "$build_id" --root="$fixture_root" > "$out_dir/run.log" 2>&1 || rc=$?
+  local verdict="$build_dir/taste-review.json"
+  local status
+  status="$(json_status "$verdict")"
+  if assert_status "$expected" "$status" && jq -e '.runtime.designStatus == "missing" and .gates.design == "needs_iteration"' "$verdict" >/dev/null 2>&1; then
+    printf '✓ %-34s %-16s expected=%s actual=%s rc=%s\n' "$build_id" "taste-review" "$expected" "$status" "$rc"
+    return 0
+  fi
+
+  printf '✗ %-34s %-16s expected=%s actual=%s rc=%s\n' "$build_id" "taste-review" "$expected" "$status" "$rc"
+  echo "  verdict: $verdict"
+  echo "  log:     $out_dir/run.log"
+  return 1
+}
+
+run_scenario_generation_fixture() {
+  local name="scenario-finance-dashboard"
+  local fixture_root="$OUT_ROOT/scenario-root"
+  local build_id="$name"
+  local build_dir="$fixture_root/builds/$build_id"
+  local out_dir="$OUT_ROOT/$build_id/scenario-generation"
+
+  mkdir -p "$build_dir" "$out_dir"
+  cat > "$build_dir/state.json" <<'JSON'
+{"app_type":"dashboard"}
+JSON
+  cat > "$build_dir/spec.md" <<'MD'
+# Master Mold Financial Copilot
+
+Build a personal financial copilot dashboard. The operator reviews a daily
+briefing, opens review evidence, logs decisions, submits paper-trading
+predictions, connects demo integrations, saves portfolio notes, filters alerts,
+and reviews guardrail status. There is no order workflow and no trade execution.
+
+Routes include `/`, `/alerts`, `/portfolio`, `/journal`, `/paper`, `/chat`,
+`/executor`, `/review`, and `/settings/integrations`.
+
+Acceptance:
+- The app must expose a Create review packet action.
+- The decision journal must let the operator Log decision.
+- The paper-trading sandbox must Submit prediction.
+- The integrations view must Connect demo integration.
+- const activeAlerts = alerts.filter((alert) => !alert.acknowledged);
+MD
+
+  local rc=0
+  "$ROOT/bin/rds-qa-scenarios" "$build_id" --root="$fixture_root" > "$out_dir/generate.log" 2>&1 || rc=$?
+  "$ROOT/bin/rds-scenario-gate" "$build_id" --root="$fixture_root" > "$out_dir/gate.log" 2>&1 || rc=$?
+  local scenarios="$build_dir/qa-scenarios.json"
+  if [[ "$rc" -eq 0 ]] \
+    && jq -e '
+      ([.scenarios[].actions[]?.target // ""] | join("|") | test("order"; "i") | not)
+      and ([.scenarios[].actions[]?.target // ""] | join("|") | test("Create review packet|Log decision|Submit prediction|Connect demo integration"))
+      and ([.sourcePromises[]?] | all((test("const |filter\\(|markBrowserAction|window\\."; "i") | not) and (length >= 48)))
+    ' "$scenarios" >/dev/null 2>&1; then
+    printf '✓ %-34s %-16s expected=%s actual=%s rc=%s\n' "$name" "qa-scenarios" "domain-specific" "domain-specific" "$rc"
+    return 0
+  fi
+
+  printf '✗ %-34s %-16s expected=%s actual=%s rc=%s\n' "$name" "qa-scenarios" "domain-specific" "failed" "$rc"
+  echo "  scenarios: $scenarios"
+  echo "  generate:  $out_dir/generate.log"
+  echo "  gate:      $out_dir/gate.log"
+  return 1
+}
+
+CASES=(
+  "website-good|website-uat|website-verdict.json|pass"
+  "website-broken-links|website-uat|website-verdict.json|not-pass"
+  "workflow-good|workflow-uat|workflow-verdict.json|pass"
+  "workflow-noop-controls|workflow-uat|workflow-verdict.json|not-pass"
+  "truthfulness-good|truthfulness-audit|truthfulness-verdict.json|pass"
+  "truthfulness-opaque-spend|truthfulness-audit|truthfulness-verdict.json|not-pass"
+  "persona-good|persona-uat|persona-verdict.json|pass"
+  "persona-broken-login|persona-uat|persona-verdict.json|not-pass"
+  "prd-coverage-good|prd-coverage-audit|prd-coverage-verdict.json|pass"
+  "prd-coverage-missing-persona|prd-coverage-audit|prd-coverage-verdict.json|not-pass"
+  "visual-overlap-mobile|visual-audit|visual-verdict.json|not-pass"
+  "game-good|game-uat|game-verdict.json|pass"
+  "game-no-progression|game-uat|game-verdict.json|not-pass"
+)
+
+failures=0
+index=0
+for case_spec in "${CASES[@]}"; do
+  IFS='|' read -r fixture module verdict expected <<< "$case_spec"
+  if [[ -n "$ONLY_FIXTURE" && "$fixture" != "$ONLY_FIXTURE" ]]; then
+    continue
+  fi
+  index=$((index + 1))
+  port=$((PORT_BASE + index))
+  if ! run_module "$fixture" "$module" "$verdict" "$expected" "$port"; then
+    failures=$((failures + 1))
+    [[ "$KEEP_GOING" -eq 1 ]] || break
+  fi
+done
+
+if [[ -z "$ONLY_FIXTURE" || "$ONLY_FIXTURE" == "taste-missing-design" ]]; then
+  index=$((index + 1))
+  if ! run_taste_review_fixture "missing-design" "not-pass"; then
+    failures=$((failures + 1))
+    [[ "$KEEP_GOING" -eq 1 ]] || {
+      stop_server
+      echo "Quality fixture failures: $failures"
+      echo "Artifacts: $OUT_ROOT"
+      exit 1
+    }
+  fi
+fi
+
+if [[ -z "$ONLY_FIXTURE" || "$ONLY_FIXTURE" == "scenario-finance-dashboard" ]]; then
+  index=$((index + 1))
+  if ! run_scenario_generation_fixture; then
+    failures=$((failures + 1))
+    [[ "$KEEP_GOING" -eq 1 ]] || {
+      stop_server
+      echo "Quality fixture failures: $failures"
+      echo "Artifacts: $OUT_ROOT"
+      exit 1
+    }
+  fi
+fi
+
+stop_server
+
+if [[ "$index" -eq 0 ]]; then
+  echo "FATAL: no matching fixtures" >&2
+  exit 2
+fi
+if [[ "$failures" -gt 0 ]]; then
+  echo "Quality fixture failures: $failures"
+  echo "Artifacts: $OUT_ROOT"
+  exit 1
+fi
+
+echo "All quality fixtures passed."
+echo "Artifacts: $OUT_ROOT"

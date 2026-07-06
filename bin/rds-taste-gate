@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""Validate that the pre-scaffold taste brief is concrete enough to build from."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def read_text(path: Path, limit: int = 500_000) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="ignore")[:limit]
+    except Exception:
+        return ""
+
+
+def read_json(path: Path) -> Any:
+    try:
+        return json.loads(read_text(path))
+    except Exception:
+        return None
+
+
+def words(text: str) -> set[str]:
+    return set(re.findall(r"[a-z][a-z0-9-]{2,}", text.lower()))
+
+
+def add_issue(issues: list[dict[str, str]], code: str, detail: str, recovery: str) -> None:
+    issues.append({"code": code, "severity": "blocker", "detail": detail, "recovery": recovery})
+
+
+def count_hits(text: str, terms: set[str]) -> int:
+    lower = text.lower()
+    return sum(1 for term in terms if re.search(rf"\b{re.escape(term)}\b", lower))
+
+
+def validate_brief(build_dir: Path) -> dict[str, Any]:
+    brief_path = build_dir / "taste-brief.json"
+    spec_path = build_dir / "spec.md"
+    scenario_path = build_dir / "qa-scenarios.json"
+    brief = read_json(brief_path)
+    spec = read_text(spec_path)
+    issues: list[dict[str, str]] = []
+
+    if not isinstance(brief, dict):
+        add_issue(
+            issues,
+            "taste_brief_missing",
+            "taste-brief.json is missing or invalid",
+            "Run bin/rds-taste before skill resolution/scaffold.",
+        )
+        return {
+            "schema": "rds.taste-gate.v1",
+            "status": "fail",
+            "updatedAt": now_iso(),
+            "issues": issues,
+            "sources": {"brief": str(brief_path), "spec": str(spec_path), "scenarios": str(scenario_path)},
+        }
+
+    kind = str(brief.get("app_type") or brief.get("kind") or "auto")
+    quality = [str(x).strip() for x in brief.get("quality_bar") or [] if str(x).strip()]
+    anti_goals = [str(x).strip() for x in brief.get("anti_goals") or [] if str(x).strip()]
+    acceptance = [str(x).strip() for x in brief.get("acceptance") or [] if str(x).strip()]
+    position = str(brief.get("position") or "").strip()
+    brief_text = "\n".join([position, *quality, *anti_goals, *acceptance])
+    brief_words = words(brief_text)
+    spec_words = {w for w in words(spec) if len(w) >= 5}
+    overlap = sorted(brief_words & spec_words)
+
+    if len(quality) < 5 or len(acceptance) < 4 or len(anti_goals) < 3:
+        add_issue(
+            issues,
+            "taste_brief_too_thin",
+            f"brief has quality={len(quality)} acceptance={len(acceptance)} anti_goals={len(anti_goals)}",
+            "Expand the taste brief before scaffold with concrete quality bar, anti-goals, and acceptance criteria.",
+        )
+
+    if len(overlap) < 4:
+        add_issue(
+            issues,
+            "taste_brief_not_specific",
+            "brief barely references domain language from the PRD/spec",
+            "Regenerate the taste brief with product-specific nouns, workflows, interactions, and failure modes.",
+        )
+
+    common_terms = {
+        "first viewport", "first-screen", "primary workflow", "interaction model",
+        "visual hierarchy", "responsive", "acceptance criteria",
+    }
+    if count_hits(brief_text, common_terms) < 3:
+        add_issue(
+            issues,
+            "taste_brief_missing_product_shape",
+            "brief does not pin down enough first-screen/workflow/interaction/visual-shape criteria",
+            "Add explicit first-screen hierarchy, interaction model, visual stance, responsive expectation, and acceptance criteria.",
+        )
+
+    scenario_count = 0
+    scenarios = read_json(scenario_path)
+    if isinstance(scenarios, dict):
+        maybe = scenarios.get("scenarios")
+        if isinstance(maybe, list):
+            scenario_count = len(maybe)
+    if scenario_count < 3:
+        add_issue(
+            issues,
+            "domain_scenarios_missing",
+            f"only {scenario_count} QA scenario(s) are available before scaffold",
+            "Generate domain-specific QA scenarios before scaffold so the builder sees concrete acceptance tests.",
+        )
+
+    if kind == "game":
+        game_terms = {
+            "turn", "rules", "state", "score", "victory", "restart", "feedback",
+            "legal", "move", "capture", "board", "selected", "mobile",
+        }
+        if count_hits(brief_text, game_terms) < 6:
+            add_issue(
+                issues,
+                "game_taste_contract_weak",
+                "game brief does not include enough game-loop, rule, feedback, board/control, or restart criteria",
+                "Strengthen the game taste brief before scaffold; POLIS-like builds need board/turn/legal-move/capture/victory/mobile criteria.",
+            )
+    elif kind == "website":
+        website_terms = {"offer", "brand", "hero", "cta", "section", "visitor", "visual", "first viewport"}
+        if count_hits(brief_text, website_terms) < 4:
+            add_issue(
+                issues,
+                "website_taste_contract_weak",
+                "website brief does not specify enough offer/brand/hero/CTA/visitor criteria",
+                "Strengthen the website taste brief with first-viewport offer, CTA hierarchy, brand/visual stance, and visitor questions.",
+            )
+    else:
+        app_terms = {"workflow", "state", "operator", "empty", "error", "success", "data", "feedback"}
+        if count_hits(brief_text, app_terms) < 4:
+            add_issue(
+                issues,
+                "app_taste_contract_weak",
+                "app brief does not specify enough workflow/state/operator-feedback criteria",
+                "Strengthen the app taste brief with primary workflow, realistic states, data density, and feedback criteria.",
+            )
+
+    return {
+        "schema": "rds.taste-gate.v1",
+        "status": "fail" if issues else "pass",
+        "updatedAt": now_iso(),
+        "appType": kind,
+        "domainOverlap": overlap[:20],
+        "metrics": {
+            "qualityCriteria": len(quality),
+            "antiGoals": len(anti_goals),
+            "acceptanceCriteria": len(acceptance),
+            "qaScenarios": scenario_count,
+        },
+        "issues": issues,
+        "sources": {"brief": str(brief_path), "spec": str(spec_path), "scenarios": str(scenario_path)},
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("build_id")
+    parser.add_argument("--root", default=str(Path(__file__).resolve().parents[1]))
+    args = parser.parse_args()
+
+    root = Path(args.root).resolve()
+    build_dir = root / "builds" / args.build_id
+    payload = validate_brief(build_dir)
+    out = build_dir / "taste-gate.json"
+    out.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps({"status": payload["status"], "path": str(out), "issues": len(payload["issues"])}))
+    return 0 if payload["status"] == "pass" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

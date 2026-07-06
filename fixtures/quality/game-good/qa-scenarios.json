@@ -1,0 +1,23 @@
+{
+  "schema": "rds.qa.scenarios.v1",
+  "scenarios": [
+    {
+      "title": "Start a playable session",
+      "objective": "Start begins an active game session with score, lives, and level feedback.",
+      "actions": [{ "type": "click", "target": "Start game|Restart game" }],
+      "expectations": [{ "type": "state-change" }, { "type": "text", "value": "Score" }]
+    },
+    {
+      "title": "Move and use primary action",
+      "objective": "Keyboard controls and primary action change player state.",
+      "actions": [{ "type": "press", "key": "ArrowRight" }, { "type": "press", "key": "ArrowDown" }, { "type": "press", "key": "Space" }],
+      "expectations": [{ "type": "state-change" }, { "type": "text", "value": "score" }]
+    },
+    {
+      "title": "Reach pressure and restart loop",
+      "objective": "The game shows pressure/progression and supports restart.",
+      "actions": [{ "type": "wait", "ms": 1500 }, { "type": "press", "key": "KeyR" }],
+      "expectations": [{ "type": "state-change" }, { "type": "text", "value": "Lives" }]
+    }
+  ]
+}

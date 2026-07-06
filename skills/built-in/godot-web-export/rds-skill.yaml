@@ -1,0 +1,20 @@
+---
+slug: godot-web-export
+name: Godot web export
+status: ready
+default: false
+applies_to:
+- game-engine
+description: Godot HTML5 export contract.
+install:
+  command: bin/rds-skill-materialize godot-web-export
+verify:
+  command: bin/rds-skill-verify godot-web-export
+maturity: beta
+category: deploy
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should
+  understand during stack selection, skill resolution, implementation guidance, or
+  verification.
+source_links:
+- label: docs.godotengine.org
+  url: https://docs.godotengine.org/en/stable/tutorials/export/exporting_for_web.html

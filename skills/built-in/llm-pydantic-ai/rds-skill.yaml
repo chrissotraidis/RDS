@@ -1,0 +1,20 @@
+---
+slug: llm-pydantic-ai
+name: Pydantic AI
+status: ready
+default: false
+applies_to:
+- python-ai-service
+description: Adds the Python agent/structured-output implementation contract.
+install:
+  command: bin/rds-skill-materialize llm-pydantic-ai
+verify:
+  command: bin/rds-skill-verify llm-pydantic-ai
+maturity: operational
+category: llm
+rationale: Python AI services need typed outputs, testable agents, and provider isolation. This skill standardizes the Pydantic AI path.
+source_links:
+- label: Pydantic AI
+  url: https://ai.pydantic.dev/
+- label: Pydantic
+  url: https://docs.pydantic.dev/

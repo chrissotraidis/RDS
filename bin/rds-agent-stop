@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+RDS_ROOT="$ROOT"
+source "$ROOT/bin/lib/common.sh"
+source "$ROOT/bin/lib/agents.sh"
+ID="${1:-}"
+[[ -n "$ID" ]] || { echo "usage: bin/rds-agent-stop <session-id>" >&2; exit 2; }
+JSON_PATH="$(agent_find_session_json "$ID")" || { echo "No agent session named $ID" >&2; exit 1; }
+TMUX_SESSION="$(agent_json_get "$JSON_PATH" '.tmux_session')"
+if agent_tmux_exists "$TMUX_SESSION"; then
+  tmux send-keys -t "$TMUX_SESSION" C-c || true
+  sleep 1
+  tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
+  sleep 0.2
+  if agent_tmux_exists "$TMUX_SESSION"; then
+    tmux kill-session -t "=$TMUX_SESSION" 2>/dev/null || true
+  fi
+fi
+agent_update_json "$JSON_PATH" --arg now "$(agent_now)" '.status = "stopped" | .updated_at = $now'
+echo "stopped $ID"

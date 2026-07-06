@@ -1,0 +1,62 @@
+---
+name: ios-specialist
+description: "Use when implementing iOS, Swift, SwiftUI, Xcode, or native Apple platform tasks. Provides patterns for iOS development, Xcode project management, and Apple platform conventions. Examples: 'creating a SwiftUI view', 'adding a new screen', 'configuring Xcode project', 'implementing navigation'"
+---
+# iOS Specialist
+
+You are working on an iOS/Apple platform task. Follow Apple Human Interface
+Guidelines. Ensure every Swift file compiles and is registered in the Xcode
+project. Use SwiftUI patterns with proper state management.
+
+## Technology Stack
+
+<% (framework || {}).each do |key, value| -%>
+- **<%= key.capitalize %>:** <%= value %>
+<% end -%>
+<% if sections.any? -%>
+
+## Framework Patterns
+<% sections.each do |section| -%>
+
+### <%= section["name"] %>
+<%= section["description"]&.strip %>
+<% (section["guidance"] || []).each do |g| -%>
+- <%= g %>
+<% end -%>
+<% tools = section["rails_tools"] || section["tools"] -%>
+<% if tools&.any? -%>
+
+**Available tools:**
+<% tools.each do |t| -%>
+- <%= t %>
+<% end -%>
+<% end -%>
+<% end -%>
+<% end -%>
+
+## Quality Criteria
+
+Before marking the task done, verify:
+
+- [ ] `xcodebuild` succeeds with zero errors
+- [ ] All `.swift` files are registered in the `.pbxproj` file
+- [ ] No symbol collisions with existing definitions (grep before defining)
+- [ ] State management uses appropriate property wrappers (@State, @Binding, @ObservedObject, @StateObject)
+- [ ] Navigation follows the app's established hierarchy
+- [ ] Views handle loading, empty, and error states
+
+## Verification Focus
+
+When running verification commands, pay special attention to:
+- Xcode build succeeding (`xcodebuild -scheme ... build`)
+- All Swift files registered in pbxproj (no missing file references)
+- No duplicate symbol definitions
+- Cross-stack verification (if API backend exists, verify it still passes too)
+
+## Common Pitfalls
+
+- **Always register files in pbxproj.** Creating a `.swift` file on disk is not enough. It must be added to the Xcode project file. Verify with `grep filename.swift *.pbxproj`.
+- **Grep before defining.** Before creating ANY new type, extension, enum, or color, grep the entire project for existing definitions with the same name. Asset catalogs (`.colorset`, `.imageset`) and code files can conflict.
+- **Don't break the build.** After every change, run `xcodebuild` to verify compilation. A Swift file that doesn't compile blocks ALL other Swift files from compiling.
+- **Use proper state management.** @State for local state, @Binding for parent-child, @ObservedObject/@StateObject for shared models. Misuse causes UI update bugs.
+- **Don't forget the API backend.** If this project has a backend, run backend verification too. A task that builds iOS views but breaks the API is still a failure.

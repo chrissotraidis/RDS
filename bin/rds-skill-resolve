@@ -1,0 +1,96 @@
+#!/usr/bin/env ruby
+# Resolve requested skills for a stack and write build-local skill manifests.
+
+require "json"
+require "yaml"
+require "fileutils"
+
+args = {}
+ARGV.each_with_index do |arg, idx|
+  if arg.start_with?("--")
+    key, value = arg[2..].split("=", 2)
+    value ||= ARGV[idx + 1] unless ARGV[idx + 1]&.start_with?("--")
+    args[key] = value
+  end
+end
+
+root = File.expand_path("..", __dir__)
+stack = args.fetch("stack")
+requested_raw = args["requested"] || "default"
+build_dir = args.fetch("build-dir")
+registry_path = File.join(root, "skills", "registry.json")
+stack_registry_path = File.join(root, "stacks", "registry.yml")
+
+registry = JSON.parse(File.read(registry_path))
+skills = registry.fetch("skills")
+by_slug = skills.to_h { |skill| [skill.fetch("slug"), skill] }
+stack_registry = File.exist?(stack_registry_path) ? YAML.load_file(stack_registry_path) : {}
+stack_entry = Array(stack_registry["stacks"]).find { |entry| entry["slug"] == stack || entry["runtime_id"] == stack }
+stack_contract_path = stack_entry && stack_entry["contract"] ? File.join(root, stack_entry["contract"]) : nil
+stack_contract = stack_contract_path && File.exist?(stack_contract_path) ? YAML.load_file(stack_contract_path) : {}
+stack_default_skills =
+  Array(stack_contract.dig("compatible_skills", "primary")) +
+  Array(stack_contract.dig("compatible_skills", "universal"))
+
+no_stack_primaries = ARGV.include?("--no-stack-primaries")
+
+catalog_defaults = skills
+  .select { |skill| skill["default"] }
+  .select { |skill| (skill["applies_to"] || []).include?("universal") || (skill["applies_to"] || []).include?(stack) }
+  .map { |skill| skill["slug"] }
+
+requested =
+  if requested_raw.nil? || requested_raw.strip.empty? || requested_raw == "default"
+    (catalog_defaults + stack_default_skills).uniq
+  elsif requested_raw == "none"
+    []
+  else
+    explicit = requested_raw.split(",").map(&:strip).reject(&:empty?)
+    if no_stack_primaries
+      explicit
+    else
+      # Always heal explicit lists by unioning the stack contract's primaries+universals.
+      # The dashboard recommender used to drop shadcn-add/auth-better-auth/drizzle-introspect
+      # for nextjs because it sent an explicit list that bypassed stack defaults.
+      (explicit + stack_default_skills).uniq
+    end
+  end
+
+unknown = requested.reject { |slug| by_slug.key?(slug) }
+unless unknown.empty?
+  warn "FATAL: unknown skills: #{unknown.join(', ')}"
+  exit 1
+end
+
+skipped = []
+resolved = requested.filter_map do |slug|
+  skill = by_slug.fetch(slug)
+  applies = skill["applies_to"] || []
+  unless applies.include?("universal") || applies.include?(stack)
+    skipped << { "slug" => slug, "reason" => "does not apply to stack #{stack}" }
+    warn "WARN: skipping skill '#{slug}' because it does not apply to stack '#{stack}'"
+    next
+  end
+  skill
+end
+
+FileUtils.mkdir_p(File.join(build_dir, "skills"))
+resolved_manifest = {
+  stack: stack,
+  requested: requested,
+  skipped: skipped,
+  resolved: resolved.map { |skill| skill.slice("slug", "name", "path", "status", "install", "verify") },
+}
+File.write(File.join(build_dir, "skills", "resolved.json"), JSON.pretty_generate(resolved_manifest) + "\n")
+File.write(File.join(build_dir, "skills-resolved.yaml"), resolved_manifest.to_yaml)
+
+build_yaml = File.join(build_dir, "build.yaml")
+if File.exist?(build_yaml)
+  manifest = YAML.load_file(build_yaml) || {}
+  manifest["skills"] = requested
+  manifest["skills_skipped"] = skipped
+  manifest["skills_resolved"] = resolved.map { |skill| skill["slug"] }
+  File.write(build_yaml, manifest.to_yaml)
+end
+
+puts resolved.map { |skill| skill["slug"] }.join(",")

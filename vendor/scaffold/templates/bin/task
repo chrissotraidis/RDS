@@ -1,0 +1,2519 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# bin/task — Task state management and lazy preparation for tasks.json v2
+#
+# Commands:
+#   status            Show progress summary
+#   next              Print the next eligible task (JSON)
+#   start POSITION    Mark task in_progress
+#   done POSITION     Mark task done
+#   error POSITION    Mark task error (with optional message)
+#   block POSITION    Mark task blocked (circuit breaker)
+#   split POSITION <c1> <c2> [...]
+#                     Decompose a task into behavior-contract children (lazy expansion)
+#   reset POSITION    Reset task to pending
+#   prepare POSITION  Generate .scaffold/task-details/POSITION.json
+#   verify [POSITION] Run verification checks (global or task-specific)
+#   runbook POSITION  Output prepared runbook entry
+#   runbook-for POSITION [--budget N]
+#                     Print runbook.md entries from POSITION's transitive
+#                     depends_on closure, proximate-first, within a char
+#                     budget (default 3000). Replaces the naive tail-slice.
+#   attempt-advisory POSITION
+#                     Emit split advisory if failed attempts >= threshold (else no output)
+#   dossier POSITION [--bundle PATH]
+#                     Emit the full per-task context dossier (Markdown) that
+#                     launch-build.sh wraps with stable workflow instructions.
+
+require "cgi"
+require "erb"
+require "fileutils"
+require "json"
+require "open3"
+require "tempfile"
+require "time"
+require "yaml"
+
+TASKS_FILE = "tasks.json"
+CONFIG_FILE = "config.yml"
+SPEC_FILE = "spec.md"
+RUNBOOK_FILE = "runbook.md"
+DETAIL_DIR = ".scaffold/task-details"
+PREFLIGHT_REVIEW_DIR = ".scaffold/review/preflight"
+TELEMETRY_DIR = ".scaffold/telemetry"
+
+# Primitive types whose commands require a live app runtime (HTTP server,
+# native launcher, browser harness). `bin/task verify --skip-runtime-deps`
+# omits them so the stop-gate hook can check static invariants without
+# booting a server. The harness's post-session verify runs the full set.
+RUNTIME_DEPENDENT_PRIMITIVES = %w[
+  http_success
+  http_content
+  entry_navigation
+  task_tests
+  browser_tests
+  native_launch
+].freeze
+
+def telemetry_session_id
+  ENV["SCAFFOLD_SESSION_ID"] || ENV["CLAUDE_SESSION_ID"] || ""
+end
+
+require_relative "../lib/scaffold_task/advisory"
+require_relative "../lib/scaffold_task/runbook"
+require_relative "../lib/scaffold_task/wiki"
+require_relative "../lib/scaffold_task/drift"
+require_relative "../lib/scaffold_task/sync_proposal"
+require_relative "../lib/scaffold_task/sync_classifier"
+require_relative "../lib/scaffold_task/dag_hygiene"
+
+def abort_v1!
+  abort "tasks.json schema v1 is no longer supported. Regenerate this project with scaffold v2."
+end
+
+def load_document
+  raw = JSON.parse(File.read(TASKS_FILE, encoding: "utf-8"))
+  abort_v1! if raw.is_a?(Array)
+  abort "Invalid tasks.json: expected object wrapper" unless raw.is_a?(Hash)
+  abort "tasks.json schema v1 is no longer supported. Regenerate this project with scaffold v2." unless raw["schema_version"] == 2
+  abort "Invalid tasks.json: missing tasks array" unless raw["tasks"].is_a?(Array)
+  raw
+rescue Errno::ENOENT
+  abort "tasks.json not found"
+rescue JSON::ParserError => e
+  abort "Invalid tasks.json: #{e.message}"
+end
+
+def save_document(doc)
+  File.write(TASKS_FILE, JSON.pretty_generate(doc) + "\n")
+end
+
+def load_tasks
+  load_document["tasks"]
+end
+
+def find_task(tasks, position)
+  pos = position.to_i
+  task = tasks.find { |entry| entry["position"] == pos }
+  abort "No task at position #{pos}" unless task
+  task
+end
+
+def detail_path(position)
+  File.join(DETAIL_DIR, "#{position.to_i}.json")
+end
+
+def preflight_review_path(position)
+  File.join(PREFLIGHT_REVIEW_DIR, "#{position.to_i}.json")
+end
+
+def load_detail(position)
+  path = detail_path(position)
+  return nil unless File.exist?(path)
+
+  JSON.parse(File.read(path, encoding: "utf-8"))
+rescue JSON::ParserError
+  nil
+end
+
+def load_config
+  return @load_config if defined?(@load_config)
+
+  @load_config =
+    if File.exist?(CONFIG_FILE)
+      YAML.safe_load_file(CONFIG_FILE) || {}
+    else
+      {}
+    end
+rescue Psych::SyntaxError
+  @load_config = {}
+end
+
+def workflow_capabilities
+  load_config["workflow_capabilities"] || {}
+end
+
+def coverage_policy
+  load_config["coverage_policy"] || {}
+end
+
+def native_launch_smoke_config
+  load_config["native_launch_smoke"] || {}
+end
+
+def verification_adapters
+  load_config["verification_adapters"] || {}
+end
+
+def config_globs(key, fallback = [])
+  Array(load_config[key] || fallback).uniq
+end
+
+def spec_metadata
+  load_document["spec_metadata"] || {}
+end
+
+def entity_contracts
+  spec_metadata["entity_contracts"] || {}
+end
+
+def shell_quote(value)
+  "'#{value.to_s.gsub("'", %q('"'"'))}'"
+end
+
+def ruby_command(code)
+  "ruby -e #{shell_quote(code)}"
+end
+
+def command_exits(description, command, required: true)
+  {
+    "type" => "command_exits",
+    "description" => description,
+    "params" => {
+      "command" => command,
+      "expected_exit_code" => 0
+    },
+    "required" => required,
+    "gate_type" => required ? "blocking" : "advisory"
+  }
+end
+
+def parse_spec_sections(text)
+  sections = {}
+  current_h2 = nil
+  current_h3 = nil
+  h2_body = []
+  h3_body = []
+
+  text.each_line do |line|
+    if line.match?(/^##\s+[^#]/)
+      if current_h3
+        key = current_h2 ? "#{current_h2} > #{current_h3}" : current_h3
+        sections[key] = h3_body.join
+      end
+      sections[current_h2] = h2_body.join if current_h2
+
+      current_h2 = line.sub(/^##\s+/, "").strip
+      current_h3 = nil
+      h2_body = [line]
+      h3_body = []
+    elsif line.match?(/^###\s+/)
+      if current_h3
+        key = current_h2 ? "#{current_h2} > #{current_h3}" : current_h3
+        sections[key] = h3_body.join
+      end
+
+      current_h3 = line.sub(/^###\s+/, "").strip
+      h3_body = [line]
+      h2_body << line
+    else
+      h2_body << line
+      h3_body << line if current_h3
+    end
+  end
+
+  if current_h3
+    key = current_h2 ? "#{current_h2} > #{current_h3}" : current_h3
+    sections[key] = h3_body.join
+  end
+  sections[current_h2] = h2_body.join if current_h2
+
+  preamble = text.split(/^##\s+[^#]/).first
+  sections["Overview"] = preamble if preamble && !preamble.strip.empty?
+  sections
+end
+
+def find_matching_sections(section_ref, spec_sections)
+  return {} if section_ref.to_s.strip.empty?
+
+  ref_lower = section_ref.downcase.strip
+  exact = spec_sections.select { |heading, _| heading.to_s.downcase == ref_lower }
+  return exact unless exact.empty?
+
+  parts = ref_lower.split(/\s*>\s*/).map(&:strip)
+  partial = spec_sections.select do |heading, _|
+    heading_lower = heading.to_s.downcase
+    parts.any? { |part| heading_lower.include?(part) }
+  end
+  return partial unless partial.empty?
+
+  ref_words = ref_lower.split(/\W+/).reject { |word| word.length < 3 }
+  spec_sections.select do |heading, _|
+    heading_words = heading.to_s.downcase.split(/\W+/)
+    (ref_words & heading_words).any?
+  end
+end
+
+def detected_stacks
+  config = File.exist?(CONFIG_FILE) ? YAML.safe_load_file(CONFIG_FILE) : {}
+  config["detected_stacks"] || []
+rescue Psych::SyntaxError
+  []
+end
+
+def frontend_task?(task)
+  labels = (task["labels"] || []).map(&:downcase)
+  return true if (labels & %w[frontend ui views integration]).any?
+
+  task["title"].to_s.downcase.match?(/dashboard|screen|page|view|layout|form|portal|profile|settings|report|nav|tab/)
+end
+
+def hotwire_relevant?(task, spec_context, stacks)
+  stacks.include?("rails") &&
+    [task["title"], task["user_story"], task["done_when"], spec_context].compact.join(" ").match?(/turbo|hotwire|frame/i)
+end
+
+def mobile_bootstrap_task?(task, stacks)
+  return false if (stacks & %w[ios android flutter]).empty?
+
+  labels = Array(task["labels"]).map(&:downcase)
+  text = [task["title"], task["section_ref"], task["user_story"], task["done_when"]].compact.join(" ").downcase
+  task["position"].to_i.zero? ||
+    labels.include?("setup") ||
+    text.match?(/\bbootstrap\b|\blocal development\b|\bstarter\b|\bstart screen\b|\blaunch\b|\bapp shell\b|\broot view\b|\bhome screen\b|\bwelcome screen\b|\bentry point\b/)
+end
+
+def feature_terms(task)
+  terms = []
+  terms.concat(Array(task["requirement_refs"]))
+  terms.concat(Array(task["entities_touched"]))
+  terms.concat(Array(task["ui_actions"]))
+  terms << task["title"].to_s
+  terms << task["section_ref"].to_s
+  terms
+    .flat_map { |value| value.to_s.downcase.scan(/\b[a-z][a-z0-9_]{2,}\b/) }
+    .reject { |term| %w[task page screen button route user flow data feature].include?(term) }
+    .map { |term| term.end_with?("ies") ? "#{term[0..-4]}y" : term }
+    .uniq
+    .first(12)
+end
+
+def matched_test_files(task, globs)
+  return [] if globs.empty?
+
+  files = globs.flat_map { |pattern| Dir.glob(pattern) }.uniq.select { |path| File.file?(path) }
+  return files if files.empty?
+
+  terms = feature_terms(task)
+  return files if terms.empty?
+
+  files.select do |path|
+    down = path.downcase
+    terms.any? { |term| down.include?(term) }
+  end
+end
+
+def test_suite_command
+  checks = Array(load_config["verification_checks"])
+  checks.find { |check| check["type"] == "test_suite" }&.dig("command")
+end
+
+def configured_test_runner(stack_key)
+  verification_adapters.dig("test_runners", stack_key.to_s)
+end
+
+def configured_primitive_command(primitive_key, stacks)
+  commands = verification_adapters.dig(primitive_key, "commands") || {}
+  stack = (Array(stacks).find { |candidate| commands.key?(candidate) } || (commands.key?("generic") ? "generic" : nil))
+  stack ? commands[stack] : nil
+end
+
+def configured_readiness_command(prereq, stacks)
+  commands = verification_adapters.dig("readiness_commands", prereq.to_s) || {}
+  stack = (Array(stacks).find { |candidate| commands.key?(candidate) } || (commands.key?("generic") ? "generic" : nil))
+  stack ? commands[stack] : nil
+end
+
+def native_test_command(files, stacks)
+  return nil if files.empty?
+
+  quoted_files = files.map { |path| shell_quote(path) }.join(" ")
+
+  if stacks.include?("ios")
+    runner = configured_test_runner("ios")
+    return runner unless runner.to_s.empty?
+  end
+
+  if stacks.include?("flutter")
+    runner = configured_test_runner("flutter")
+    return "#{runner} #{quoted_files}".strip unless runner.to_s.empty?
+    return "flutter test #{quoted_files}"
+  end
+
+  if stacks.include?("android")
+    runner = configured_test_runner("android")
+    return runner unless runner.to_s.empty?
+    return "cd android 2>/dev/null && ./gradlew testDebugUnitTest 2>&1 | tail -20 || ./gradlew testDebugUnitTest 2>&1 | tail -20"
+  end
+
+  nil
+end
+
+def runnable_test_command(files, stacks)
+  return nil if files.empty?
+
+  quoted_files = files.map { |path| shell_quote(path) }.join(" ")
+
+  if stacks.include?("rails")
+    runner = configured_test_runner("rails")
+    return "#{runner} #{quoted_files}".strip unless runner.to_s.empty?
+    return "bin/rails test #{quoted_files}"
+  end
+
+  if stacks.include?("python")
+    runner = configured_test_runner("python")
+    return "#{runner} #{quoted_files}".strip unless runner.to_s.empty?
+    suite = test_suite_command.to_s
+    return "python -m pytest #{quoted_files}" if suite.include?("pytest")
+  end
+
+  if stacks.include?("node")
+    runner = configured_test_runner("node")
+    return "#{runner} #{quoted_files}".strip unless runner.to_s.empty?
+    suite = test_suite_command.to_s
+    return "npx vitest run #{quoted_files}" if suite.match?(/\bvitest\b/)
+    return "npx jest #{quoted_files}" if suite.match?(/\bjest\b/)
+  end
+
+  if stacks.include?("flutter")
+    runner = configured_test_runner("flutter")
+    return "#{runner} #{quoted_files}".strip unless runner.to_s.empty?
+    return "flutter test #{quoted_files}"
+  end
+
+  nil
+end
+
+def file_presence_command(files, label)
+  return nil if files.empty?
+
+  ruby_command(<<~RUBY)
+    files = #{files.inspect}
+    missing = files.reject { |path| File.file?(path) }
+    abort("Missing #{label} files: \#{missing.join(", ")}") unless missing.empty?
+    puts files.first(5)
+  RUBY
+end
+
+def entity_contract_command(task)
+  contracts = entity_contracts.slice(*Array(task["entities_touched"]))
+  return nil if contracts.empty?
+
+  adapter = verification_adapters["entity_contract"] || {}
+  patterns = config_globs(adapter["globs_key"] || "schema_globs", %w[db/schema.rb db/migrate/**/* schema.prisma prisma/**/* **/models.py **/migrations/**/*])
+  code = <<~RUBY
+    patterns = #{patterns.inspect}
+    files = patterns.flat_map { |pattern| Dir.glob(pattern) }.uniq.select { |path| File.file?(path) }
+    abort("No schema files found for entity contract verification") if files.empty?
+    content = files.map { |path| File.read(path, encoding: "UTF-8") rescue "" }.join("\\n")
+    contracts = #{contracts.inspect}
+    missing = []
+
+    contracts.each do |entity, contract|
+      ((contract["required_fields"] || []) + (contract["foreign_keys"] || []) + (contract["lifecycle_fields"] || [])).uniq.each do |field|
+        missing << "\#{entity}.\#{field}" unless content.match?(/\\b\#{Regexp.escape(field)}\\b/)
+      end
+
+      (contract["unique_constraints"] || []).each do |group|
+        next if group.empty?
+        next unless group.all? { |field| content.match?(/\\b\#{Regexp.escape(field)}\\b/) }
+
+        missing << "\#{entity}.unique(\#{group.join(",")})" unless content.match?(/unique/i)
+      end
+    end
+
+    abort("Missing entity contract coverage: \#{missing.join(", ")}") unless missing.empty?
+  RUBY
+  ruby_command(code)
+end
+
+def auth_helper_usage_command(stacks = [])
+  configured = configured_primitive_command("authz_wiring", stacks)
+  return configured unless configured.to_s.empty?
+
+  patterns = config_globs("code_globs", %w[app/**/*.rb lib/**/*.rb config/**/*.rb src/**/*.{js,jsx,ts,tsx} **/*.py])
+  code = <<~RUBY
+    patterns = #{patterns.inspect}
+    files = patterns.flat_map { |pattern| Dir.glob(pattern) }.uniq.select { |path| File.file?(path) }
+    defs = []
+
+    files.each do |path|
+      text = File.read(path, encoding: "UTF-8") rescue next
+      defs.concat(text.scan(/\\bdef\\s+(authorize_[a-z0-9_!?]+|require_[a-z0-9_!?]+)/).flatten)
+      defs.concat(text.scan(/\\b(?:function|const)\\s+(authorize[A-Z]\\w+|require[A-Z]\\w+)/).flatten)
+    end
+
+    defs.uniq!
+    unused = defs.select do |name|
+      references = files.sum do |path|
+        text = File.read(path, encoding: "UTF-8") rescue ""
+        text.scan(/\\b\#{Regexp.escape(name)}\\b/).size
+      end
+      references < 2
+    end
+
+    abort("Authorization helpers defined but not used: \#{unused.join(", ")}") unless unused.empty?
+  RUBY
+  ruby_command(code)
+end
+
+def ui_affordance_command_from_actions(actions)
+  adapter = verification_adapters["ui_affordance"] || {}
+  globs = config_globs(adapter["globs_key"] || "ui_template_globs", %w[app/views/**/* app/components/**/* src/**/*.{js,jsx,ts,tsx,vue,svelte} templates/**/*])
+  return nil if globs.empty? || actions.empty?
+  ignored = Array(adapter["ignored_terms"])
+  ignored = %w[page screen flow user click tap] if ignored.empty?
+
+  normalized = actions.map do |action|
+    action.to_s.downcase.scan(/\b[a-z][a-z0-9_]{2,}\b/).reject { |term| ignored.include?(term) }.first(3)
+  end.reject(&:empty?)
+  return nil if normalized.empty?
+
+  code = <<~RUBY
+    patterns = #{globs.inspect}
+    files = patterns.flat_map { |pattern| Dir.glob(pattern) }.uniq.select { |path| File.file?(path) }
+    abort("No UI template files found") if files.empty?
+    content = files.map { |path| File.read(path, encoding: "UTF-8") rescue "" }.join("\\n").downcase
+    actions = #{normalized.inspect}
+    missing = actions.reject do |terms|
+      terms.any? { |term| content.include?(term) }
+    end
+    abort("Missing UI affordances for: \#{missing.map { |terms| terms.join(" ") }.join(", ")}") unless missing.empty?
+  RUBY
+  ruby_command(code)
+end
+
+def ui_affordance_command(task)
+  ui_affordance_command_from_actions(Array(task["ui_actions"]))
+end
+
+def accessibility_command(stacks = [])
+  configured = configured_primitive_command("accessibility", stacks)
+  return configured unless configured.to_s.empty?
+
+  adapter = verification_adapters["accessibility"] || {}
+  globs = config_globs(adapter["globs_key"] || "ui_template_globs", %w[app/views/**/* app/components/**/* src/**/*.{js,jsx,ts,tsx,vue,svelte} templates/**/*])
+  return nil if globs.empty?
+
+  code = <<~RUBY
+    patterns = #{globs.inspect}
+    files = patterns.flat_map { |pattern| Dir.glob(pattern) }.uniq.select { |path| File.file?(path) }
+    offenders = []
+
+    files.each do |path|
+      text = File.read(path, encoding: "UTF-8") rescue next
+      if text.match?(/<button\\b(?![^>]*aria-label=)[^>]*>\\s*[×✕✖]\\s*<\\/button>/i)
+        offenders << path
+      end
+    end
+
+    abort("Icon-only buttons missing aria-label: \#{offenders.join(", ")}") unless offenders.empty?
+  RUBY
+  ruby_command(code)
+end
+
+def seed_credentials_command
+  patterns = %w[db/seeds.rb prisma/seed.* **/fixtures/**/* test/fixtures/**/* spec/fixtures/**/*]
+  code = <<~RUBY
+    patterns = #{patterns.inspect}
+    files = patterns.flat_map { |pattern| Dir.glob(pattern) }.uniq.select { |path| File.file?(path) }
+    abort("No seed or fixture files found") if files.empty?
+    content = files.map { |path| File.read(path, encoding: "UTF-8") rescue "" }.join("\\n")
+    has_identity = content.match?(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}/i) || content.match?(/password|token|api[_-]?key/i)
+    abort("Seeded credentials or identities not found") unless has_identity
+  RUBY
+  ruby_command(code)
+end
+
+def readiness_command(prereq, stacks)
+  configured = configured_readiness_command(prereq, stacks)
+  return configured unless configured.to_s.empty?
+
+  case prereq
+  when "background_processing_ready"
+    if stacks.include?("rails")
+      code = <<~RUBY
+        candidates = {
+          "Procfile.dev" => /queue:|solid_queue:start/,
+          ".env" => /SOLID_QUEUE_IN_PUMA\\s*=\\s*true/,
+          ".env.example" => /SOLID_QUEUE_IN_PUMA\\s*=\\s*true/,
+          "config/puma.rb" => /solid[_ ]queue|plugin.*queue/i,
+          "config/environments/development.rb" => /queue_adapter\\s*=\\s*:async/,
+          "config/application.rb" => /solid_queue/i
+        }
+        ready = candidates.any? do |path, pattern|
+          File.exist?(path) && File.read(path, encoding: "UTF-8").match?(pattern)
+        end
+        abort("Background processing is not proven ready in development") unless ready
+      RUBY
+      ruby_command(code)
+    elsif stacks.include?("node")
+      ruby_command(<<~RUBY)
+        require "json"
+        package = File.exist?("package.json") ? JSON.parse(File.read("package.json", encoding: "UTF-8")) : {}
+        scripts = package["scripts"] || {}
+        ready = scripts.keys.any? { |name| name.match?(/worker|queue|jobs?|dev/i) } ||
+          Dir.glob("Procfile*").any? { |path| File.read(path, encoding: "UTF-8").match?(/worker|queue|job/i) }
+        abort("Background processing is not proven ready in development") unless ready
+      RUBY
+    elsif stacks.include?("python")
+      ruby_command(<<~RUBY)
+        ready = Dir.glob("Procfile*").any? { |path| File.read(path, encoding: "UTF-8").match?(/celery|rq|worker|scheduler/i) } ||
+          Dir.glob("**/*.py").any? { |path| File.read(path, encoding: "UTF-8").match?(/celery|apscheduler|rq/i) rescue false }
+        abort("Background processing is not proven ready in development") unless ready
+      RUBY
+    end
+  when "email_delivery_ready"
+    if stacks.include?("rails")
+      ruby_command(<<~RUBY)
+        files = ["Gemfile", "config/environments/development.rb", ".env", ".env.example"]
+        content = files.select { |path| File.exist?(path) }.map { |path| File.read(path, encoding: "UTF-8") }.join("\\n")
+        ready = content.match?(/letter_opener|letter_opener_web|delivery_method\\s*=\\s*:(file|test|smtp)/i)
+        abort("Email delivery is not configured for local inspection") unless ready
+      RUBY
+    else
+      seed_credentials_command
+    end
+  end
+end
+
+def native_launch_smoke_command(task, stacks)
+  return nil unless mobile_bootstrap_task?(task, stacks)
+
+  adapter = verification_adapters["native_launch"] || {}
+  native_test_files = matched_test_files(task, config_globs("native_test_globs"))
+  if native_test_files.empty?
+    native_test_files = config_globs("native_test_globs").flat_map { |pattern| Dir.glob(pattern) }.uniq.select { |path| File.file?(path) }
+  end
+
+  if adapter.fetch("prefer_test_runner", true)
+    runnable_native_tests = native_test_command(native_test_files, stacks)
+    return runnable_native_tests if runnable_native_tests
+  end
+
+  smoke = native_launch_smoke_config
+  stack = (%w[ios android flutter] & stacks).find { |candidate| smoke.key?(candidate) }
+  return nil unless stack
+
+  entry_globs = Array(smoke.dig(stack, "entry_globs"))
+  root_globs = Array(smoke.dig(stack, "root_globs"))
+  return nil if entry_globs.empty? && root_globs.empty?
+
+  ruby_command(<<~RUBY)
+    entry_globs = #{entry_globs.inspect}
+    root_globs = #{root_globs.inspect}
+    entries = entry_globs.flat_map { |pattern| Dir.glob(pattern) }.uniq.select { |path| File.file?(path) }
+    roots = root_globs.flat_map { |pattern| Dir.glob(pattern) }.uniq.select { |path| File.file?(path) }
+    abort("No #{stack} app entry point found for launch smoke") if entries.empty?
+    abort("No #{stack} starter screen or root view found for launch smoke") if roots.empty?
+    puts((entries + roots).first(5))
+  RUBY
+end
+
+def extract_behavior_checks(text)
+  checks = []
+  source = text.to_s
+
+  source.scan(/((GET|POST|PATCH|PUT|DELETE)\s+(\/\S+?)(?:[\s,;.]|$).*?)/im).each do |clause, method, path|
+    clean_path = path.sub(/[,;.)]+$/, "")
+    clean_clause = clause.to_s.gsub(/`[^`]+`/, " ")
+    status = clean_clause[/returns\s+(\d{3})/i, 1]&.to_i
+    quoted = clean_clause.scan(/['"]([^'"]{2,80})['"]/).flatten
+    content = quoted.find { |value| value !~ /[=:]/ && value !~ %r{/} }
+
+    checks << {
+      method: method.upcase,
+      path: clean_path,
+      status: status,
+      content: content
+    }
+  end
+
+  checks.uniq { |check| [check[:method], check[:path], check[:content], check[:status]] }
+end
+
+def path_regex(path)
+  Regexp.escape(path.gsub(%r{/\d+}, "/__ID__")).gsub("__ID__", "[0-9]+")
+end
+
+def base_url_shell
+  verification_adapters.dig("http", "base_url_shell") || %q(${APP_BASE_URL:-http://127.0.0.1:${APP_PORT:-3000}})
+end
+
+def seed_command_for(stacks)
+  seed_commands = verification_adapters["seed_commands"] || {}
+  return seed_commands["rails"] if stacks.include?("rails") && seed_commands["rails"]
+  return seed_commands["python"] if stacks.include?("python") && seed_commands["python"]
+  return seed_commands["node"] if stacks.include?("node") && seed_commands["node"]
+
+  return "bin/rails db:seed" if stacks.include?("rails")
+  return "python manage.py loaddata demo" if stacks.include?("python")
+  return "npm run seed --if-present" if stacks.include?("node")
+
+  nil
+end
+
+def verification_command(name, primitive_type, primitive_params, command, stack_adapter, required: true, gate_type: nil)
+  {
+    "name" => name,
+    "primitive_type" => primitive_type,
+    "primitive_params" => primitive_params,
+    "command" => command,
+    "stack_adapter" => stack_adapter,
+    "required" => required,
+    "gate_type" => gate_type || (required ? "blocking" : "advisory")
+  }
+end
+
+def derive_verification_primitives(task, spec_context, stacks)
+  primitives = []
+  seen = {}
+  caps = Array(task["capabilities_required"])
+
+  add_primitive = lambda do |name, primitive_type, primitive_params = {}, required: true, gate_type: nil|
+    key = [name, primitive_type, primitive_params]
+    return if seen[key]
+
+    seen[key] = true
+    primitives << {
+      "name" => name,
+      "primitive_type" => primitive_type,
+      "primitive_params" => primitive_params,
+      "required" => required,
+      "gate_type" => gate_type || (required ? "blocking" : "advisory")
+    }
+  end
+
+  behavior_checks = extract_behavior_checks([task["done_when"], task["user_story"], spec_context].compact.join(" "))
+
+  behavior_checks.each do |check|
+    if check[:method] == "GET"
+      if check[:content]
+        add_primitive.call(
+          "GET #{check[:path]} contains expected content",
+          "http_content",
+          { "method" => check[:method], "path" => check[:path], "content" => check[:content] }
+        )
+      else
+        add_primitive.call(
+          "GET #{check[:path]} returns success",
+          "http_success",
+          { "method" => check[:method], "path" => check[:path] }
+        )
+      end
+
+      if frontend_task?(task) && check[:path] != "/"
+        add_primitive.call(
+          "Entry navigation links to #{check[:path]}",
+          "entry_navigation",
+          { "path" => check[:path] },
+          required: true,
+          gate_type: "blocking"
+        )
+      end
+    else
+      add_primitive.call(
+        "#{check[:method]} #{check[:path]} returns success",
+        "http_success",
+        { "method" => check[:method], "path" => check[:path] },
+        required: true,
+        gate_type: "blocking"
+      )
+    end
+  end
+
+  seed_command = seed_command_for(stacks)
+  if seed_command && Array(task["operational_prerequisites"]).include?("seed_data_loaded")
+    add_primitive.call("Seed data loads", "seed_load")
+
+    spec_emails = spec_context.scan(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i).uniq.first(2)
+    spec_emails.each do |email|
+      add_primitive.call(
+        "Seed data references #{email}",
+        "seed_reference_text",
+        { "text" => email },
+        required: false,
+        gate_type: "advisory"
+      )
+    end
+  end
+
+  if Array(task["operational_prerequisites"]).include?("authenticated_seed_account")
+    add_primitive.call("Seeded credentials exist", "seed_credentials")
+  end
+
+  Array(task["operational_prerequisites"]).each do |prereq|
+    add_primitive.call(
+      prereq.tr("_", " ").capitalize,
+      "readiness",
+      { "prerequisite" => prereq }
+    )
+  end
+
+  matched_feature_tests = matched_test_files(task, config_globs("task_test_globs"))
+  if caps.include?("native_tests")
+    runnable_feature_tests = runnable_test_command(matched_feature_tests, stacks)
+    if runnable_feature_tests
+      add_primitive.call(
+        "Feature-focused tests pass",
+        "task_tests",
+        { "files" => matched_feature_tests },
+        required: true,
+        gate_type: "blocking"
+      )
+    elsif matched_feature_tests.any?
+      add_primitive.call(
+        "Feature-focused test files exist",
+        "file_presence",
+        { "files" => matched_feature_tests, "label" => "feature test" },
+        required: false,
+        gate_type: "advisory"
+      )
+    end
+  end
+
+  launch_smoke_command = native_launch_smoke_command(task, stacks)
+  if launch_smoke_command
+    add_primitive.call(
+      "Native bootstrap launch path is present",
+      "native_launch",
+      required: true,
+      gate_type: "blocking"
+    )
+  end
+
+  if caps.include?("browser_ui") || caps.include?("accessibility")
+    matched_browser_tests = matched_test_files(task, config_globs("browser_test_globs"))
+    runnable_browser_tests = runnable_test_command(matched_browser_tests, stacks)
+    if runnable_browser_tests
+      add_primitive.call(
+        "Task-local browser or system tests pass",
+        "browser_tests",
+        { "files" => matched_browser_tests },
+        required: true,
+        gate_type: "blocking"
+      )
+    elsif matched_browser_tests.any?
+      add_primitive.call(
+        "Browser or system test files exist",
+        "file_presence",
+        { "files" => matched_browser_tests, "label" => "browser/system test" },
+        required: false,
+        gate_type: "advisory"
+      )
+    end
+
+    affordance_command = ui_affordance_command(task)
+    add_primitive.call("UI affordance text is present", "ui_affordance", { "actions" => Array(task["ui_actions"]) }, required: false, gate_type: "advisory") if affordance_command
+
+    a11y_command = accessibility_command
+    add_primitive.call("Icon-only controls are labeled", "accessibility", {}, required: true, gate_type: "blocking") if a11y_command
+  end
+
+  if caps.include?("authz")
+    add_primitive.call("Authorization helpers are wired into runtime code", "authz_wiring", {}, required: true, gate_type: "blocking")
+  end
+
+  contract_command = entity_contract_command(task)
+  add_primitive.call("Entity contract requirements are present", "entity_contract", { "entities" => Array(task["entities_touched"]) }, required: true, gate_type: "blocking") if contract_command
+
+  if Array(task["sensitive_events"]).any? && load_tasks.any? { |entry| entry["position"] < task["position"] && entry["title"].to_s.match?(/audit/i) }
+    add_primitive.call(
+      "Audit-related wiring text exists",
+      "audit_text",
+      required: false,
+      gate_type: "advisory"
+    )
+  end
+
+  if hotwire_relevant?(task, spec_context, stacks)
+    add_primitive.call(
+      "Turbo full-page navigation escapes frames when needed",
+      "turbo_navigation",
+      required: true,
+      gate_type: "blocking"
+    )
+  end
+
+  if primitives.empty?
+    if stacks.include?("rails")
+      add_primitive.call("Rails boots", "command", { "command" => "bin/rails runner 'puts :OK'" })
+    elsif stacks.include?("python")
+      add_primitive.call("Python syntax check", "command", { "command" => "python -m py_compile $(find . -name '*.py' | head -20)" })
+    elsif stacks.include?("node")
+      add_primitive.call("Node project installs", "command", { "command" => "npm install --silent" }, required: false)
+    else
+      add_primitive.call("Project files present", "command", { "command" => "test -f spec.md && test -f CLAUDE.md" }, required: false)
+    end
+  end
+
+  primitives
+end
+
+def primary_stack_adapter(stacks)
+  %w[rails node python ios android flutter].find { |stack| stacks.include?(stack) } || "generic"
+end
+
+def render_verification_primitive(primitive, task, stacks)
+  type = primitive["primitive_type"]
+  params = primitive["primitive_params"] || {}
+  command = nil
+  adapter = "generic"
+
+  case type
+  when "http_success"
+    adapter = "http"
+    method = params["method"].to_s.upcase
+    path = params["path"]
+    has_placeholder = path.to_s.match?(/<[^>]+>/)
+    safe_path = path.to_s.gsub(/<[^>]+>/) { |m| CGI.escape(m) }
+    accept_pattern = has_placeholder ? "^[2345]" : "^[23]"
+    curl_flag = has_placeholder ? "-s" : "-sf"
+    command =
+      if method.empty? || method == "GET"
+        "APP_BASE_URL=\"#{base_url_shell}\"; curl #{curl_flag} \"$APP_BASE_URL#{safe_path}\" -o /dev/null -w '%{http_code}' | grep -q '#{accept_pattern}'"
+      else
+        "APP_BASE_URL=\"#{base_url_shell}\"; curl #{curl_flag} -X #{method} \"$APP_BASE_URL#{safe_path}\" -o /dev/null -w '%{http_code}' | grep -q '#{accept_pattern}'"
+      end
+  when "http_content"
+    adapter = "http"
+    command = "APP_BASE_URL=\"#{base_url_shell}\"; curl -sf \"$APP_BASE_URL#{params["path"]}\" | grep -qi #{shell_quote(params["content"])}"
+  when "entry_navigation"
+    adapter = "http"
+    command = "APP_BASE_URL=\"#{base_url_shell}\"; curl -sf \"$APP_BASE_URL/\" | grep -Eq #{shell_quote(%(href=\"[^\"]*#{path_regex(params["path"])}\"))}"
+  when "seed_load"
+    adapter = primary_stack_adapter(stacks)
+    command = seed_command_for(stacks)
+  when "seed_reference_text"
+    adapter = "seed_data"
+    command = "test -f db/seeds.rb && grep -q #{shell_quote(params["text"])} db/seeds.rb"
+  when "seed_credentials"
+    adapter = "seed_data"
+    command = seed_credentials_command
+  when "readiness"
+    adapter = primary_stack_adapter(stacks)
+    command = readiness_command(params["prerequisite"], stacks)
+  when "task_tests", "browser_tests"
+    adapter = primary_stack_adapter(stacks)
+    command = runnable_test_command(Array(params["files"]), stacks)
+  when "file_presence"
+    adapter = "filesystem"
+    command = file_presence_command(Array(params["files"]), params["label"])
+  when "native_launch"
+    adapter = (%w[ios android flutter] & stacks).first || "native"
+    command = native_launch_smoke_command(task, stacks)
+  when "ui_affordance"
+    adapter = "ui_templates"
+    command = ui_affordance_command_from_actions(Array(params["actions"]))
+  when "accessibility"
+    adapter = configured_primitive_command("accessibility", stacks).to_s.empty? ? "ui_templates" : (primary_stack_adapter(stacks) || "generic")
+    command = accessibility_command(stacks)
+  when "authz_wiring"
+    adapter = primary_stack_adapter(stacks)
+    command = auth_helper_usage_command(stacks)
+  when "entity_contract"
+    adapter = primary_stack_adapter(stacks)
+    command = entity_contract_command(task)
+  when "audit_text"
+    adapter = configured_primitive_command("audit_text", stacks).to_s.empty? ? primary_stack_adapter(stacks) : "generic"
+    command = configured_primitive_command("audit_text", stacks) || "rg -ni 'audit|activity log|security log' app lib src config >/dev/null 2>&1"
+  when "turbo_navigation"
+    adapter = configured_primitive_command("turbo_navigation", stacks).to_s.empty? ? "rails" : "rails"
+    command = configured_primitive_command("turbo_navigation", stacks) || "if rg -n 'turbo_frame_tag|data-turbo-frame|turbo-frame' app/views app/components >/dev/null 2>&1; then rg -n 'data-turbo-frame=\"_top\"' app/views app/components >/dev/null; else true; fi"
+  when "command"
+    adapter = primary_stack_adapter(stacks)
+    command = params["command"]
+  end
+
+  return nil if command.to_s.strip.empty?
+
+  verification_command(
+    primitive["name"],
+    type,
+    params,
+    command,
+    adapter,
+    required: primitive["required"],
+    gate_type: primitive["gate_type"]
+  )
+end
+
+def render_verification_primitives(primitives, task, stacks)
+  Array(primitives).map { |primitive| render_verification_primitive(primitive, task, stacks) }.compact
+end
+
+def deterministic_verification(task, spec_context, stacks)
+  primitives = derive_verification_primitives(task, spec_context, stacks)
+  [primitives, render_verification_primitives(primitives, task, stacks)]
+end
+
+def fallback_description(task)
+  section = task["section_ref"].to_s.empty? ? "the relevant spec sections" : task["section_ref"]
+  "Implement #{task["title"]} to satisfy the user story and done_when behavior. " \
+    "Re-read #{section} in spec.md, preserve dependency behavior, and verify the feature through normal entry points instead of isolated direct access."
+end
+
+def fallback_runbook(task)
+  if task["done_when"].to_s.empty?
+    "Task #{task["position"]} extends the app. Use bin/task verify #{task["position"]} and the relevant seeded flow to confirm it works."
+  else
+    "Task #{task["position"]} is complete when #{task["done_when"]}. Use bin/task verify #{task["position"]} to re-check the flow."
+  end
+end
+
+def concise_hydration(task, spec_context, dependency_context, runbook_excerpt, stacks)
+  claude_path = `which claude 2>/dev/null`.strip
+  return {} if claude_path.empty?
+
+  prompt = <<~PROMPT
+    You are generating concise implementation guidance for one scaffold task.
+
+    Return ONLY JSON with keys "description" and "runbook".
+
+    Rules:
+    - description: 2-4 sentences, implementation intent only, not a shell transcript
+    - runbook: 1-2 sentences describing what the app can do after this task and how to verify it
+    - mention integration seams or navigation expectations when relevant
+    - do not generate verification commands
+    - do not include markdown fences
+
+    Task:
+    #{JSON.pretty_generate({
+      "title" => task["title"],
+      "position" => task["position"],
+      "labels" => task["labels"],
+      "section_ref" => task["section_ref"],
+      "user_story" => task["user_story"],
+      "done_when" => task["done_when"],
+      "requirement_refs" => task["requirement_refs"],
+      "capabilities_required" => task["capabilities_required"],
+      "entities_touched" => task["entities_touched"],
+      "ui_actions" => task["ui_actions"],
+      "sensitive_events" => task["sensitive_events"],
+      "operational_prerequisites" => task["operational_prerequisites"]
+    })}
+
+    Detected stacks: #{stacks.join(", ")}
+
+    Immediate dependencies:
+    #{dependency_context}
+
+    Existing runbook excerpt:
+    #{runbook_excerpt}
+
+    Relevant spec context:
+    #{spec_context[0..12_000]}
+  PROMPT
+
+  stdout, _stderr, status = Open3.capture3(
+    claude_path, "-p",
+    "--max-turns", "2",
+    "--model", "sonnet",
+    "--dangerously-skip-permissions",
+    stdin_data: prompt
+  )
+  return {} unless status.success?
+
+  response = stdout.to_s.strip
+  begin
+    envelope = JSON.parse(response)
+    response = envelope["result"].to_s.strip if envelope.is_a?(Hash) && envelope["type"] == "result"
+  rescue JSON::ParserError
+    # Raw response
+  end
+
+  json_str =
+    if response.start_with?("{")
+      response
+    elsif response.include?("```json")
+      response[/```json\s*\n(.*?)```/m, 1]
+    elsif response.include?("```")
+      response[/```\s*\n(.*?)```/m, 1]
+    end
+
+  return {} unless json_str
+
+  parsed = JSON.parse(json_str)
+  parsed.is_a?(Hash) ? parsed : {}
+rescue JSON::ParserError
+  {}
+end
+
+def default_preflight_review(status = "skipped", summary = nil)
+  {
+    "status" => status,
+    "reviewer" => "codex",
+    "summary" => summary || default_preflight_summary(status),
+    "contract_focus" => [],
+    "dependency_seams" => [],
+    "required_proofs" => [],
+    "prompt_directives" => [],
+    "findings" => [],
+    "generated_at" => Time.now.utc.iso8601
+  }
+end
+
+def default_preflight_summary(status)
+  case status
+  when "ready"
+    "Codex preflight review completed."
+  when "unavailable"
+    "Codex preflight review was unavailable for this bundle."
+  else
+    "Codex preflight review not enabled for this bundle."
+  end
+end
+
+def normalize_preflight_review(review)
+  payload = default_preflight_review
+  source = review.is_a?(Hash) ? review : {}
+
+  payload["status"] = source["status"].to_s.strip.empty? ? payload["status"] : source["status"].to_s
+  payload["reviewer"] = source["reviewer"].to_s.strip.empty? ? "codex" : source["reviewer"].to_s
+  payload["summary"] = source["summary"].to_s.strip.empty? ? default_preflight_summary(payload["status"]) : source["summary"].to_s.strip
+  payload["contract_focus"] = Array(source["contract_focus"]).map { |entry| entry.to_s.strip }.reject(&:empty?).uniq.first(6)
+  payload["dependency_seams"] = Array(source["dependency_seams"]).map { |entry| entry.to_s.strip }.reject(&:empty?).uniq.first(6)
+  payload["required_proofs"] = Array(source["required_proofs"]).map { |entry| entry.to_s.strip }.reject(&:empty?).uniq.first(8)
+  payload["prompt_directives"] = Array(source["prompt_directives"]).map { |entry| entry.to_s.strip }.reject(&:empty?).uniq.first(8)
+  payload["findings"] =
+    Array(source["findings"]).map do |finding|
+      next unless finding.is_a?(Hash)
+
+      severity = finding["severity"].to_s.downcase
+      severity = "advisory" unless %w[remediate advisory].include?(severity)
+
+      {
+        "severity" => severity,
+        "category" => finding["category"].to_s.strip,
+        "title" => finding["title"].to_s.strip,
+        "body" => finding["body"].to_s.strip,
+        "file" => finding["file"].to_s.strip.empty? ? nil : finding["file"].to_s.strip,
+        "line" => finding["line"].to_i.positive? ? finding["line"].to_i : nil
+      }
+    end.compact.first(10)
+  payload["generated_at"] = source["generated_at"].to_s.strip.empty? ? Time.now.utc.iso8601 : source["generated_at"].to_s
+  payload
+end
+
+def preflight_review_schema
+  {
+    "type" => "object",
+    "additionalProperties" => false,
+    "required" => ["summary", "contract_focus", "dependency_seams", "required_proofs", "prompt_directives", "findings"],
+    "properties" => {
+      "summary" => { "type" => "string" },
+      "contract_focus" => {
+        "type" => "array",
+        "items" => { "type" => "string" }
+      },
+      "dependency_seams" => {
+        "type" => "array",
+        "items" => { "type" => "string" }
+      },
+      "required_proofs" => {
+        "type" => "array",
+        "items" => { "type" => "string" }
+      },
+      "prompt_directives" => {
+        "type" => "array",
+        "items" => { "type" => "string" }
+      },
+      "findings" => {
+        "type" => "array",
+        "items" => {
+          "type" => "object",
+          "additionalProperties" => false,
+          "required" => ["severity", "category", "title", "body", "file", "line"],
+          "properties" => {
+            "severity" => { "type" => "string", "enum" => ["remediate", "advisory"] },
+            "category" => { "type" => "string" },
+            "title" => { "type" => "string" },
+            "body" => { "type" => "string" },
+            "file" => { "type" => ["string", "null"] },
+            "line" => { "type" => ["integer", "null"] }
+          }
+        }
+      }
+    }
+  }
+end
+
+def codex_path
+  @codex_path ||= `which codex 2>/dev/null`.strip
+end
+
+def classify_codex_failure(text)
+  body = text.to_s
+  return "authentication" if body.match?(/not logged in|login required|authentication/i)
+  return "schema" if body.match?(/invalid_json_schema|output schema|json schema|text\.format\.schema|Missing .*required/i)
+  return "network" if body.match?(/failed to lookup address information|dns error|could not resolve host|websocket|error sending request|stream disconnected/i)
+  return "environment" if body.match?(/readonly database|Operation not permitted|sandbox|permission/i)
+  return "codex_cli" if body.match?(/panic|panicked|unwrap\(\)|Could not create otel exporter/i)
+
+  "unknown"
+end
+
+def workflow_gates_for_task(task)
+  lines = []
+  lines << "- requirement_refs: #{Array(task["requirement_refs"]).join(", ")}" if Array(task["requirement_refs"]).any?
+  lines << "- required_capabilities: #{Array(task["capabilities_required"]).join(", ")}" if Array(task["capabilities_required"]).any?
+  lines << "- entities_touched: #{Array(task["entities_touched"]).join(", ")}" if Array(task["entities_touched"]).any?
+  lines << "- required_ui_affordances: #{Array(task["ui_actions"]).join(", ")}" if Array(task["ui_actions"]).any?
+  lines << "- sensitive_events: #{Array(task["sensitive_events"]).join(", ")}" if Array(task["sensitive_events"]).any?
+  lines << "- operational_prerequisites: #{Array(task["operational_prerequisites"]).join(", ")}" if Array(task["operational_prerequisites"]).any?
+  lines
+end
+
+def required_task_checks_for_bundle(bundle)
+  Array(bundle.dig("verification", "commands")).select { |command| command["required"] }.map do |command|
+    "- #{command["name"]}: #{command["command"]}"
+  end
+end
+
+def codex_preflight_prompt(task, bundle, spec_context, dependency_context, runbook_excerpt)
+  workflow_gates = workflow_gates_for_task(task)
+  required_checks = required_task_checks_for_bundle(bundle)
+  bundle_snapshot = {
+    "description" => bundle["description"],
+    "verification" => {
+      "commands" => Array(bundle.dig("verification", "commands")).map do |command|
+        {
+          "name" => command["name"],
+          "primitive_type" => command["primitive_type"],
+          "required" => command["required"],
+          "gate_type" => command["gate_type"],
+          "command" => command["command"]
+        }
+      end
+    },
+    "runbook" => bundle["runbook"]
+  }
+
+  prompt_task = {
+    "title" => task["title"],
+    "position" => task["position"],
+    "section_ref" => task["section_ref"],
+    "user_story" => task["user_story"],
+    "done_when" => task["done_when"],
+    "requirement_refs" => task["requirement_refs"],
+    "depends_on" => task["depends_on"],
+    "task_metadata" => bundle["task_metadata"]
+  }
+
+  <<~PROMPT
+    You are running an advisory pre-implementation Codex review for one scaffold task.
+
+    No code diff exists yet. Review the task contract, dependency seams, workflow gates,
+    and current verification plan to identify likely issues the executor should proactively
+    address before implementation is considered complete.
+
+    Return ONLY JSON matching the provided schema.
+
+    Severity rules:
+    - remediate: likely to cause this task to fail current post-review or remain under-proven unless the executor addresses it
+    - advisory: useful improvement or caution that exceeds the likely blocker/remediation bar
+
+    Review rules:
+    - stay scoped to done_when, required task checks, workflow gates, direct dependency seams, and the current runbook surface
+    - do not invent future features or stricter requirements than those sources imply
+    - weight security and recovery behavior when authn, authz, email delivery, or sensitive events are involved
+    - weight navigation reachability, UX affordances, and accessibility when browser_ui or ui_actions are involved
+    - for every task, check whether the claimed workflow lacks behavioral proof, round-trip tests, or realistic entry-path verification
+    - required_proofs must describe proofs or tests to add or perform, not shell commands
+    - prompt_directives must be short imperative instructions for the executor
+    - findings.body must begin with: `Contract source: <done_when|required_task_check|workflow_gate|direct_dependency_seam|runbook|under_proven_behavior> - <short citation>`
+    - prefer no finding over a speculative one
+
+    Task:
+    #{JSON.pretty_generate(prompt_task)}
+
+    Workflow gates:
+    #{workflow_gates.empty? ? "- none" : workflow_gates.join("\n")}
+
+    Required task checks:
+    #{required_checks.empty? ? "- none" : required_checks.join("\n")}
+
+    Direct dependencies:
+    #{dependency_context.empty? ? "- none" : dependency_context}
+
+    Current runbook excerpt:
+    #{runbook_excerpt.empty? ? "(none yet)" : runbook_excerpt}
+
+    Relevant spec context:
+    #{spec_context[0..12_000]}
+
+    Prepared bundle snapshot:
+    #{JSON.pretty_generate(bundle_snapshot)}
+  PROMPT
+end
+
+def persist_preflight_review(position, payload)
+  FileUtils.mkdir_p(PREFLIGHT_REVIEW_DIR)
+  raw_payload = payload.merge(
+    "task_position" => position.to_i,
+    "generated_at" => payload["generated_at"].to_s.strip.empty? ? Time.now.utc.iso8601 : payload["generated_at"].to_s
+  )
+  File.write(preflight_review_path(position), JSON.pretty_generate(raw_payload) + "\n")
+end
+
+def run_codex_preflight_review(task, bundle, spec_context, dependency_context, runbook_excerpt)
+  unavailable = lambda do |summary, failure_kind = nil|
+    payload = default_preflight_review("unavailable", summary)
+    payload["failure_kind"] = failure_kind if failure_kind
+    persist_preflight_review(task["position"], payload)
+    payload
+  end
+
+  return unavailable.call("Codex preflight review unavailable: codex CLI not found.", "environment") if codex_path.empty?
+
+  _stdout, stderr, login_status = Open3.capture3(codex_path, "login", "status")
+  unless login_status.success?
+    return unavailable.call("Codex preflight review unavailable: codex CLI is not logged in.", "authentication")
+  end
+
+  FileUtils.mkdir_p(PREFLIGHT_REVIEW_DIR)
+  schema_file = Tempfile.new(["codex-preflight-schema", ".json"])
+  schema_file.write(JSON.pretty_generate(preflight_review_schema))
+  schema_file.flush
+
+  output_path = preflight_review_path(task["position"])
+  prompt = codex_preflight_prompt(task, bundle, spec_context, dependency_context, runbook_excerpt)
+  stdout, stderr, status = Open3.capture3(
+    codex_path, "exec",
+    "-C", Dir.pwd,
+    "-s", "read-only",
+    "--ephemeral",
+    "--skip-git-repo-check",
+    "--output-schema", schema_file.path,
+    "--output-last-message", output_path,
+    prompt
+  )
+
+  unless status.success?
+    failure_kind = classify_codex_failure([stdout, stderr].join("\n"))
+    return unavailable.call("Codex preflight review unavailable: execution failed (#{failure_kind}).", failure_kind)
+  end
+
+  raw = JSON.parse(File.read(output_path, encoding: "utf-8"))
+  normalized = normalize_preflight_review(raw.merge("status" => "ready", "reviewer" => "codex"))
+  persist_preflight_review(task["position"], normalized.merge("codex_response" => raw))
+  normalized
+rescue Errno::ENOENT
+  unavailable.call("Codex preflight review unavailable: codex CLI not found.", "environment")
+rescue JSON::ParserError
+  unavailable.call("Codex preflight review unavailable: invalid structured output.", "schema")
+ensure
+  schema_file&.close!
+end
+
+def build_bundle(tasks, task)
+  spec_text = File.exist?(SPEC_FILE) ? File.read(SPEC_FILE, encoding: "utf-8") : ""
+  spec_sections = parse_spec_sections(spec_text)
+  matched_sections = find_matching_sections(task["section_ref"], spec_sections)
+  matched_sections["Overview"] = spec_sections["Overview"] if matched_sections.empty? && spec_sections["Overview"]
+  spec_context = matched_sections.map { |heading, body| "## #{heading}\n#{body}" }.join("\n\n")
+
+  dependency_context = (task["depends_on"] || []).map do |dep|
+    dep_task = tasks.find { |candidate| candidate["position"] == dep }
+    next unless dep_task
+
+    "- [#{dep_task["position"]}] #{dep_task["title"]}: #{dep_task["done_when"]}"
+  end.compact.join("\n")
+
+  runbook_excerpt =
+    if File.exist?(RUNBOOK_FILE)
+      File.read(RUNBOOK_FILE, encoding: "utf-8")[-2000..]
+    else
+      ""
+    end.to_s
+
+  stacks = detected_stacks
+  primitives, commands = deterministic_verification(task, spec_context, stacks)
+  llm_detail = concise_hydration(task, spec_context, dependency_context, runbook_excerpt, stacks)
+
+  description = llm_detail["description"].to_s.strip
+  description = fallback_description(task) if description.empty?
+
+  runbook = llm_detail["runbook"].to_s.strip
+  runbook = fallback_runbook(task) if runbook.empty?
+
+  acceptance = commands.first(3).map do |command|
+    command_exits(command["name"], command["command"], required: command["required"])
+  end
+
+  bundle = {
+    "position" => task["position"],
+    "title" => task["title"],
+    "task_metadata" => {
+      "requirement_refs" => task["requirement_refs"],
+      "capabilities_required" => task["capabilities_required"],
+      "entities_touched" => task["entities_touched"],
+      "ui_actions" => task["ui_actions"],
+      "sensitive_events" => task["sensitive_events"],
+      "operational_prerequisites" => task["operational_prerequisites"]
+    },
+    "description" => description,
+    "verification" => {
+      "primitives" => primitives,
+      "commands" => commands
+    },
+    "acceptance_criteria" => acceptance,
+    "runbook" => runbook,
+    "preflight_review" => default_preflight_review,
+    "generated_at" => Time.now.utc.iso8601
+  }
+
+  [bundle, spec_context, dependency_context, runbook_excerpt]
+end
+
+def prepare_bundle(tasks, task, force: false, codex_preflight_review: false)
+  FileUtils.mkdir_p(DETAIL_DIR)
+  path = detail_path(task["position"])
+  existing = force ? nil : load_detail(task["position"])
+  bundle, spec_context, dependency_context, runbook_excerpt =
+    if existing
+      spec_text = File.exist?(SPEC_FILE) ? File.read(SPEC_FILE, encoding: "utf-8") : ""
+      spec_sections = parse_spec_sections(spec_text)
+      matched_sections = find_matching_sections(task["section_ref"], spec_sections)
+      matched_sections["Overview"] = spec_sections["Overview"] if matched_sections.empty? && spec_sections["Overview"]
+      [
+        existing,
+        matched_sections.map { |heading, body| "## #{heading}\n#{body}" }.join("\n\n"),
+        (task["depends_on"] || []).map do |dep|
+          dep_task = tasks.find { |candidate| candidate["position"] == dep }
+          next unless dep_task
+
+          "- [#{dep_task["position"]}] #{dep_task["title"]}: #{dep_task["done_when"]}"
+        end.compact.join("\n"),
+        if File.exist?(RUNBOOK_FILE)
+          File.read(RUNBOOK_FILE, encoding: "utf-8")[-2000..]
+        else
+          ""
+        end.to_s
+      ]
+    else
+      build_bundle(tasks, task)
+    end
+
+  bundle["preflight_review"] = normalize_preflight_review(bundle["preflight_review"])
+  if codex_preflight_review && (force || bundle.dig("preflight_review", "status") == "skipped")
+    bundle["preflight_review"] = run_codex_preflight_review(task, bundle, spec_context, dependency_context, runbook_excerpt)
+  end
+
+  File.write(path, JSON.pretty_generate(bundle) + "\n")
+  bundle.merge("__path" => path)
+end
+
+def ensure_bundle(tasks, position, force: false, codex_preflight_review: false)
+  task = find_task(tasks, position)
+  prepare_bundle(tasks, task, force: force, codex_preflight_review: codex_preflight_review)
+end
+
+def global_check_command(check, current_task = nil)
+  return check["command"] unless check["type"] == "coverage_audit"
+
+  task_title = current_task&.dig("title").to_s
+  enforce_titles = Array(coverage_policy["enforce_on_titles"])
+  final_threshold = coverage_policy["final_fail_under"] || 90
+  enforce_final = ENV["SPEC_COVERAGE_ENFORCE_FINAL"] == "1" || enforce_titles.include?(task_title)
+
+  if enforce_final
+    "bin/spec_coverage --enforce-final --fail-under #{final_threshold}"
+  elsif current_task
+    "bin/spec_coverage --up-to #{current_task["position"]}"
+  else
+    "bin/spec_coverage"
+  end
+end
+
+def run_global_checks(verbose:, current_task: nil)
+  unless File.exist?(CONFIG_FILE)
+    puts "No config.yml found, skipping verification"
+    return true
+  end
+
+  config = YAML.safe_load_file(CONFIG_FILE)
+  checks = config["verification_checks"] || []
+  all_passed = true
+
+  puts "Global verification checks:"
+  checks.each do |check|
+    command = global_check_command(check, current_task)
+    next unless command
+
+    conditional = check["conditional"]
+    if conditional && Dir.glob(conditional).empty?
+      puts "  #{check["name"]}: SKIP (no #{conditional} files)"
+      next
+    end
+
+    $stderr.puts "  > #{command}" if verbose
+    print "  #{check["name"]}: "
+    start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    out_dest = verbose ? $stderr : "/dev/null"
+    err_dest = verbose ? $stderr : "/dev/null"
+    success = system(command, out: out_dest, err: err_dest)
+    elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - start
+    code = $?.exitstatus
+
+    if success
+      puts "PASS  [exit #{code}, #{elapsed.round(1)}s]"
+    else
+      puts "FAIL#{check["required"] ? " (REQUIRED)" : ""}  [exit #{code}, #{elapsed.round(1)}s]"
+      all_passed = false if check["required"]
+    end
+  end
+
+  all_passed
+end
+
+command = ARGV[0]
+verbose = ENV["VERIFY_VERBOSE"] == "1"
+
+case command
+when "status"
+  doc = load_document
+  tasks = doc["tasks"]
+  total = tasks.size
+  done = tasks.count { |task| task["status"] == "done" }
+  in_progress = tasks.select { |task| task["status"] == "in_progress" }
+  errored = tasks.select { |task| task["status"] == "error" }
+  blocked_tasks = tasks.select { |task| task["status"] == "blocked" }
+  split_tasks = tasks.count { |task| task["status"] == "split" }
+  pending = tasks.count { |task| task["status"] == "pending" }
+
+  puts "Tasks (schema v#{doc["schema_version"]}): #{done}/#{total} done, #{pending} pending, #{in_progress.size} in progress, #{errored.size} errors, #{blocked_tasks.size} blocked, #{split_tasks} split"
+  in_progress.each { |task| puts "  IN PROGRESS: [#{task["position"]}] #{task["title"]}" }
+  errored.each { |task| puts "  ERROR: [#{task["position"]}] #{task["title"]} — #{task["error_message"]}" }
+  blocked_tasks.each { |task| puts "  BLOCKED: [#{task["position"]}] #{task["title"]} — #{task["error_message"]}" }
+
+  eligible = tasks.select do |task|
+    task["status"] == "pending" &&
+      (task["depends_on"] || []).all? { |dep| tasks.find { |candidate| candidate["position"] == dep }&.dig("status") == "done" }
+  end.sort_by { |task| task["position"] }
+
+  if eligible.any?
+    puts "  NEXT: [#{eligible.first["position"]}] #{eligible.first["title"]}"
+  elsif done == total
+    puts "  All tasks complete!"
+  else
+    blocked = tasks.select { |task| task["status"] == "pending" } - eligible
+    puts "  #{blocked.size} task(s) blocked on dependencies" if blocked.any?
+  end
+
+when "next"
+  tasks = load_tasks
+  in_progress = tasks.select { |task| task["status"] == "in_progress" }
+  if in_progress.any?
+    puts JSON.pretty_generate(in_progress.first)
+    exit 0
+  end
+
+  eligible = tasks.select do |task|
+    task["status"] == "pending" &&
+      (task["depends_on"] || []).all? { |dep| tasks.find { |candidate| candidate["position"] == dep }&.dig("status") == "done" }
+  end.sort_by { |task| task["position"] }
+
+  if eligible.any?
+    puts JSON.pretty_generate(eligible.first)
+  else
+    done = tasks.count { |task| task["status"] == "done" }
+    if done == tasks.size
+      puts JSON.generate({ "message" => "All tasks complete!" })
+    else
+      puts JSON.generate({ "message" => "No eligible tasks. Some may be blocked on dependencies." })
+    end
+  end
+
+when "start", "done", "error", "reset", "block"
+  abort "Usage: bin/task #{command} POSITION [message]" unless ARGV[1]
+  doc = load_document
+  task = find_task(doc["tasks"], ARGV[1])
+
+  case command
+  when "start"
+    task["status"] = "in_progress"
+    puts "Task #{task["position"]} marked in_progress: #{task["title"]}"
+  when "done"
+    task["status"] = "done"
+    task.delete("error_message")
+    puts "Task #{task["position"]} marked done: #{task["title"]}"
+  when "error"
+    task["status"] = "error"
+    task["error_message"] = ARGV[2] || "Unknown error"
+    puts "Task #{task["position"]} marked error: #{task["title"]}"
+  when "block"
+    task["status"] = "blocked"
+    task["error_message"] = ARGV[2] || "Circuit breaker: consecutive verification failures"
+    puts "Task #{task["position"]} marked blocked: #{task["title"]}"
+  when "reset"
+    task["status"] = "pending"
+    task.delete("error_message")
+    puts "Task #{task["position"]} reset to pending: #{task["title"]}"
+  end
+
+  save_document(doc)
+
+when "prepare"
+  abort "Usage: bin/task prepare POSITION [--force] [--codex-preflight-review]" unless ARGV[1]
+  tasks = load_tasks
+  bundle = ensure_bundle(
+    tasks,
+    ARGV[1],
+    force: ARGV.include?("--force"),
+    codex_preflight_review: ARGV.include?("--codex-preflight-review") || ENV["CODEX_PREFLIGHT_REVIEW_ENABLED"] == "1"
+  )
+  puts bundle["__path"]
+
+when "split"
+  # Decompose a task into N behavior-contract children, then rewire every
+  # downstream dependent from the parent to ALL children.
+  abort "Usage: bin/task split POSITION <contract-1> <contract-2> [<contract-3> ...]" if ARGV.size < 4
+  parent_pos = ARGV[1].to_i
+  contracts = ARGV[2..].reject { |s| s.to_s.strip.empty? }
+  abort "Split requires at least 2 child contracts" if contracts.size < 2
+
+  doc = load_document
+  tasks = doc["tasks"]
+  parent = find_task(tasks, parent_pos)
+  abort "Cannot split task in status '#{parent["status"]}'; reset it first" if %w[done blocked].include?(parent["status"])
+
+  max_pos = tasks.map { |t| t["position"].to_i }.max
+  child_positions = []
+  children = contracts.map.with_index do |contract, idx|
+    child_pos = max_pos + 1 + idx
+    child_positions << child_pos
+    {
+      "title" => contract.split(/[.,;]/).first.to_s.strip[0, 80].then { |t| t.empty? ? "Child of #{parent_pos}" : t },
+      "position" => child_pos,
+      "depends_on" => Array(parent["depends_on"]).dup,
+      "labels" => Array(parent["labels"]).dup,
+      "section_ref" => parent["section_ref"].to_s,
+      "user_story" => parent["user_story"].to_s,
+      "done_when" => contract.strip,
+      "requirement_refs" => Array(parent["requirement_refs"]).dup,
+      "capabilities_required" => Array(parent["capabilities_required"]).dup,
+      "entities_touched" => Array(parent["entities_touched"]).dup,
+      "ui_actions" => Array(parent["ui_actions"]).dup,
+      "sensitive_events" => Array(parent["sensitive_events"]).dup,
+      "operational_prerequisites" => Array(parent["operational_prerequisites"]).dup,
+      "priority" => child_pos,
+      "parent_position" => parent_pos,
+      "status" => "pending"
+    }
+  end
+
+  tasks.each do |task|
+    deps = Array(task["depends_on"])
+    next unless deps.include?(parent_pos)
+    task["depends_on"] = (deps - [parent_pos] + child_positions).uniq
+  end
+
+  parent["status"] = "split"
+  parent["error_message"] = "Decomposed into children #{child_positions.inspect}"
+
+  tasks.concat(children)
+  save_document(doc)
+
+  FileUtils.mkdir_p(TELEMETRY_DIR)
+  event = {
+    "event" => "split",
+    "parent_position" => parent_pos,
+    "parent_title" => parent["title"],
+    "child_positions" => child_positions,
+    "contracts" => contracts.map(&:strip),
+    "recorded_at" => Time.now.utc.iso8601,
+    "session_id" => telemetry_session_id
+  }
+  File.open(File.join(TELEMETRY_DIR, "split_events.jsonl"), "a") do |f|
+    f.puts JSON.generate(event)
+  end
+
+  # Drop the parent's bundle so no one accidentally runs it.
+  parent_bundle = detail_path(parent_pos)
+  File.delete(parent_bundle) if File.exist?(parent_bundle)
+
+  puts "Task #{parent_pos} (#{parent["title"]}) split into #{child_positions.size} children:"
+  children.each do |c|
+    puts "  [#{c["position"]}] #{c["title"]} — done_when: #{c["done_when"]}"
+  end
+
+when "verify"
+  tasks = load_tasks
+  all_passed = true
+  task = nil
+  command_results = []
+  start_time = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+  skip_runtime = ARGV.include?("--skip-runtime-deps")
+  position_arg = ARGV[1..].find { |arg| !arg.start_with?("--") }
+
+  if position_arg
+    bundle = ensure_bundle(tasks, position_arg)
+    task = find_task(tasks, position_arg)
+    commands = bundle.dig("verification", "commands") || []
+
+    puts "Task #{task["position"]} verification#{skip_runtime ? " (skipping runtime-dependent checks)" : ""}:"
+    commands.each do |cmd|
+      if skip_runtime && RUNTIME_DEPENDENT_PRIMITIVES.include?(cmd["primitive_type"])
+        puts "  #{cmd["name"]} [#{cmd["primitive_type"]}]: SKIP (runtime-dependent)"
+        command_results << {
+          "name" => cmd["name"],
+          "required" => !!cmd["required"],
+          "gate_type" => cmd["gate_type"],
+          "passed" => nil,
+          "skipped" => "runtime_dependent",
+          "exit_code" => nil,
+          "elapsed_s" => 0.0
+        }
+        next
+      end
+
+      $stderr.puts "  > #{cmd["command"]}" if verbose
+      gate_label = cmd["gate_type"] == "advisory" ? " (ADVISORY)" : ""
+      primitive_label = cmd["primitive_type"] ? " [#{cmd["primitive_type"]} via #{cmd["stack_adapter"]}]" : ""
+      print "  #{cmd["name"]}#{primitive_label}#{gate_label}: "
+      start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      out_dest = verbose ? $stderr : "/dev/null"
+      err_dest = verbose ? $stderr : "/dev/null"
+      success = system(cmd["command"], out: out_dest, err: err_dest)
+      elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - start
+      code = $?.exitstatus
+
+      if success
+        puts "PASS  [exit #{code}, #{elapsed.round(1)}s]"
+      else
+        puts "FAIL#{cmd["required"] ? " (REQUIRED)" : ""}#{gate_label}  [exit #{code}, #{elapsed.round(1)}s]"
+        all_passed = false if cmd["required"] && cmd["gate_type"] != "advisory"
+      end
+
+      command_results << {
+        "name" => cmd["name"],
+        "required" => !!cmd["required"],
+        "gate_type" => cmd["gate_type"],
+        "passed" => success,
+        "exit_code" => code,
+        "elapsed_s" => elapsed.round(3)
+      }
+    end
+    puts ""
+  end
+
+  all_passed &&= run_global_checks(verbose: verbose, current_task: task)
+  elapsed_ms = ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - start_time) * 1000).to_i
+
+  if task
+    FileUtils.mkdir_p(TELEMETRY_DIR)
+    commit_sha = `git rev-parse HEAD 2>/dev/null`.strip
+
+    # Prefer SCAFFOLD_TASK_FILES_CHANGED exported by launch-build.sh. By the
+    # time the stop-gate's verify runs, the agent has already committed, so
+    # `git diff --name-only HEAD` alone would be empty. The harness pre-computes
+    # the full diff from the pre-task start_ref to current HEAD.
+    files_changed_env = ENV["SCAFFOLD_TASK_FILES_CHANGED"].to_s
+    files_changed = if !files_changed_env.strip.empty?
+      files_changed_env.split("\n").map(&:strip).reject(&:empty?)
+    else
+      start_ref = ENV["SCAFFOLD_TASK_START_REF"].to_s.strip
+      raw = if !start_ref.empty?
+        `git diff --name-only #{start_ref} HEAD 2>/dev/null`
+      else
+        `git diff --name-only HEAD 2>/dev/null`
+      end
+      raw.split("\n").map(&:strip).reject(&:empty?)
+    end
+    files_changed = files_changed
+      .reject { |path| path.start_with?(".scaffold/") }
+      .uniq
+    telemetry_path = "#{TELEMETRY_DIR}/#{task["position"]}.json"
+
+    # Split verify invocations by source so a passing `failed_attempts=0` run
+    # with many total invocations reads as "agent iterated with verify as a
+    # progress probe" instead of "harness retried 18 times."
+    # launch-build.sh sets SCAFFOLD_VERIFY_SOURCE=harness on its own calls;
+    # anything else (including the agent's in-session `bin/task verify`) is
+    # treated as agent iteration.
+    source = ENV["SCAFFOLD_VERIFY_SOURCE"].to_s.strip
+    source = "agent" unless source == "harness"
+
+    prior_harness = 0
+    prior_agent = 0
+    prior_harness_failed = 0
+    prior_agent_failed = 0
+    prior_failed = 0
+    if File.exist?(telemetry_path)
+      begin
+        prior = JSON.parse(File.read(telemetry_path, encoding: "utf-8"))
+        prior_harness = (prior["harness_invocations"] || 0).to_i
+        prior_agent = (prior["agent_invocations"] || 0).to_i
+        prior_harness_failed = (prior["harness_failed_attempts"] || 0).to_i
+        prior_agent_failed = (prior["agent_failed_attempts"] || 0).to_i
+        prior_failed = (prior["failed_attempts"] || 0).to_i
+      rescue JSON::ParserError
+        # treat as first invocation
+      end
+    end
+
+    this_failed = all_passed ? 0 : 1
+    harness_invocations = prior_harness + (source == "harness" ? 1 : 0)
+    agent_invocations = prior_agent + (source == "agent" ? 1 : 0)
+    harness_failed_attempts = prior_harness_failed + (source == "harness" ? this_failed : 0)
+    agent_failed_attempts = prior_agent_failed + (source == "agent" ? this_failed : 0)
+
+    telemetry = {
+      "position" => task["position"],
+      "title" => task["title"],
+      "verify_state" => all_passed ? "pass" : "fail",
+      "skipped_runtime_deps" => skip_runtime,
+      "commands" => command_results,
+      "commit_sha" => commit_sha,
+      "files_changed" => files_changed,
+      "elapsed_ms" => elapsed_ms,
+      "session_id" => telemetry_session_id,
+      "verify_invocations" => harness_invocations + agent_invocations,
+      "harness_invocations" => harness_invocations,
+      "agent_invocations" => agent_invocations,
+      # Source-split failure counters. harness_failed_attempts is the real
+      # remediation signal — it means the agent declared done but the harness
+      # disagreed. agent_failed_attempts is normal TDD-style iteration.
+      # failed_attempts stays as a total for back-compat.
+      "harness_failed_attempts" => harness_failed_attempts,
+      "agent_failed_attempts" => agent_failed_attempts,
+      "failed_attempts" => prior_failed + this_failed,
+      "recorded_at" => Time.now.utc.iso8601
+    }
+    File.write(telemetry_path, JSON.pretty_generate(telemetry) + "\n")
+  end
+
+  exit(all_passed ? 0 : 1)
+
+when "runbook"
+  abort "Usage: bin/task runbook POSITION" unless ARGV[1]
+  tasks = load_tasks
+  bundle = ensure_bundle(tasks, ARGV[1])
+  puts bundle["runbook"].to_s.empty? ? "(no runbook entry)" : bundle["runbook"]
+
+when "attempt-advisory"
+  abort "Usage: bin/task attempt-advisory POSITION" unless ARGV[1]
+  advisory = attempt_advisory_for(ARGV[1])
+  puts advisory unless advisory.empty?
+
+when "runbook-for"
+  # Print the subset of runbook.md in the transitive depends_on closure
+  # of POSITION, in dependency-resolved order. Runbook entries in the file
+  # are appended in completion order, which diverges from dependency order
+  # once tasks split or re-order.
+  abort "Usage: bin/task runbook-for POSITION [--budget N]" unless ARGV[1]
+  target = ARGV[1].to_i
+  budget_idx = ARGV.index("--budget")
+  budget = budget_idx && ARGV[budget_idx + 1] ? ARGV[budget_idx + 1].to_i : 3000
+
+  tasks = load_tasks
+  by_pos = tasks.each_with_object({}) { |t, h| h[t["position"].to_i] = t }
+  unless by_pos.key?(target)
+    warn "No task at position #{target}"
+    exit 1
+  end
+  puts runbook_closure_slice(target, by_pos, budget: budget)
+
+when "dossier"
+  # Emit the full per-task context dossier: the consolidated Markdown payload
+  # that launch-build.sh's build_prompt() wraps with stable workflow
+  # instructions. Centralising this here makes the payload inspectable
+  # (bin/task dossier N > /tmp/d.md) and testable.
+  abort "Usage: bin/task dossier POSITION [--bundle PATH]" unless ARGV[1]
+  target = ARGV[1].to_i
+  bundle_idx = ARGV.index("--bundle")
+  bundle_path = bundle_idx && ARGV[bundle_idx + 1] ? ARGV[bundle_idx + 1] : detail_path(target)
+
+  tasks = load_tasks
+  by_pos = tasks.each_with_object({}) { |t, h| h[t["position"].to_i] = t }
+  task = by_pos[target]
+  abort "No task at position #{target}" unless task
+
+  bundle = if File.exist?(bundle_path)
+    begin
+      JSON.parse(File.read(bundle_path, encoding: "utf-8"))
+    rescue JSON::ParserError
+      {}
+    end
+  else
+    {}
+  end
+
+  section_ref = task["section_ref"].to_s.strip
+  section_ref = "Overview" if section_ref.empty?
+  title = task["title"].to_s
+
+  out = []
+  out << "Read CLAUDE.md for full project context, conventions, and validation rules."
+  out << %(Read tasks.json and find the task at position #{target} ("#{title}").)
+  out << %(Read spec.md and cross-reference section_ref "#{section_ref}" for GIVEN/WHEN/THEN scenarios.)
+  out << "Read the prepared task bundle at #{bundle_path} for implementation guidance and task-specific verification."
+
+  if File.exist?("wiki/index/wiki-index.json")
+    out << "Read wiki/index/wiki-index.json and consult the 2-3 wiki pages most relevant to this task's entities, terminology, and product decisions before implementing."
+  end
+
+  # Skill activation (from .claude/label-map.json)
+  label_map_path = ".claude/label-map.json"
+  if File.exist?(label_map_path)
+    label_map = begin
+      JSON.parse(File.read(label_map_path, encoding: "utf-8"))
+    rescue JSON::ParserError
+      {}
+    end
+    labels = Array(task["labels"])
+    skills = labels.map { |l| label_map[l] }.compact.uniq
+    if skills.any?
+      out << ""
+      out << "## Skill Activation"
+      out << ""
+      out << "This task is labeled: #{labels.join(", ")}."
+      out << "Before implementing, load the following specialist skill(s) for guidance:"
+      skills.each do |s|
+        skill_path = ".claude/skills/#{s}/SKILL.md"
+        out << "- #{File.exist?(skill_path) ? skill_path : s}"
+      end
+      out << ""
+      out << "These skills contain framework-specific patterns, quality criteria,"
+      out << "and common pitfalls for this type of work. Follow their guidance."
+    end
+  end
+
+  out << ""
+  out << "## Predecessor Runbook (dependency closure)"
+  out << ""
+  out << "The entries below are the runbook sections for this task's transitive"
+  out << "`depends_on` ancestors, ordered from deepest ancestor (top) to direct"
+  out << "dependency (bottom). This is what the app can already do for the slice"
+  out << "this task builds on. Prefer this over reading all of `runbook.md`."
+  out << ""
+  out << runbook_closure_slice(target, by_pos, budget: 3000)
+
+  done_when = task["done_when"].to_s.strip
+  unless done_when.empty?
+    out << ""
+    out << "## Definition of Done"
+    out << ""
+    out << "This task is complete when: #{done_when}"
+    out << ""
+    out << "This is the PRIMARY success criterion. File existence and route checks are"
+    out << "necessary but not sufficient — the behavior above must be verifiable."
+    out << "Use `curl` or the framework's console runner to verify it before marking done."
+  end
+
+  user_story = task["user_story"].to_s.strip
+  unless user_story.empty?
+    out << ""
+    out << "## User Story"
+    out << ""
+    out << user_story
+  end
+
+  metadata_lines = []
+  metadata_lines << "- Requirement refs: #{Array(task["requirement_refs"]).join(", ")}" if Array(task["requirement_refs"]).any?
+  metadata_lines << "- Required capabilities: #{Array(task["capabilities_required"]).join(", ")}" if Array(task["capabilities_required"]).any?
+  metadata_lines << "- Entities touched: #{Array(task["entities_touched"]).join(", ")}" if Array(task["entities_touched"]).any?
+  metadata_lines << "- Required UI affordances: #{Array(task["ui_actions"]).join(", ")}" if Array(task["ui_actions"]).any?
+  metadata_lines << "- Sensitive events: #{Array(task["sensitive_events"]).join(", ")}" if Array(task["sensitive_events"]).any?
+  metadata_lines << "- Operational prerequisites: #{Array(task["operational_prerequisites"]).join(", ")}" if Array(task["operational_prerequisites"]).any?
+  unless metadata_lines.empty?
+    out << ""
+    out << "## Workflow Gates"
+    out << ""
+    out.concat(metadata_lines)
+    out << ""
+    out << "These are blocking executor gates. The task is not complete unless they are satisfied."
+  end
+
+  # Pre-resolve entities_touched against the product wiki, if present. Inlines
+  # real field names + risk flags so the agent doesn't have to fetch them.
+  wiki_block = wiki_context_for_task(task)
+  unless wiki_block.empty?
+    out << ""
+    out << wiki_block
+  end
+
+  review = bundle["preflight_review"]
+  if review.is_a?(Hash) && !(%w[skipped].include?(review["status"].to_s) || review["status"].to_s.empty?)
+    status = review["status"].to_s
+    out << ""
+    out << "## Preflight Review"
+    out << ""
+    out << "Codex preflight review status: #{status}."
+    summary = review["summary"].to_s.strip
+    out << summary unless summary.empty?
+    out << ""
+
+    if status == "ready"
+      out << "Address every `remediate` finding below and satisfy each required proof before marking the task done."
+      out << ""
+      [
+        ["Contract focus", "contract_focus"],
+        ["Dependency seams", "dependency_seams"],
+        ["Required proofs", "required_proofs"],
+        ["Prompt directives", "prompt_directives"]
+      ].each do |heading, key|
+        entries = Array(review[key]).map { |e| e.to_s.strip }.reject(&:empty?)
+        next if entries.empty?
+        out << "### #{heading}"
+        out << ""
+        entries.each { |e| out << "- #{e}" }
+        out << ""
+      end
+
+      findings = Array(review["findings"])
+      unless findings.empty?
+        out << "### Findings"
+        out << ""
+        findings.each_with_index do |finding, idx|
+          severity = finding["severity"].to_s.upcase
+          ftitle = finding["title"].to_s.strip
+          out << "#{idx + 1}. [#{severity.empty? ? "ADVISORY" : severity}] #{ftitle.empty? ? "Untitled finding" : ftitle}"
+          out << "   category: #{finding["category"]}" unless finding["category"].to_s.strip.empty?
+          unless finding["file"].to_s.strip.empty?
+            location = finding["file"].to_s.strip
+            location += ":#{finding["line"]}" if finding["line"].to_i.positive?
+            out << "   location: #{location}"
+          end
+          out << "   #{finding["body"]}" unless finding["body"].to_s.strip.empty?
+        end
+        out << ""
+      end
+    else
+      out << "Continue with workflow gates and deterministic verification; preflight did not block execution."
+      out << ""
+    end
+  end
+
+  advisory = attempt_advisory_for(target)
+  unless advisory.empty?
+    out << ""
+    out << "## Verification Attempt Advisory"
+    out << ""
+    out << advisory
+    out << ""
+    out << "Splitting re-plans the dependency graph, so confirm the split makes sense before invoking it. If you proceed, stop after `bin/task split` — downstream children will run in their own sessions."
+  end
+
+  prev_summary = previous_task_summary(target, by_pos)
+  unless prev_summary.empty?
+    out << ""
+    out << prev_summary
+  end
+
+  description = bundle["description"].to_s.strip
+  unless description.empty?
+    out << ""
+    out << "## Implementation Guidance"
+    out << ""
+    out << description
+  end
+
+  commands = Array(bundle.dig("verification", "commands"))
+  unless commands.empty?
+    out << ""
+    out << "## Task Verification Commands"
+    commands.each do |cmd|
+      req = cmd["required"] ? " (REQUIRED)" : ""
+      gate = cmd["gate_type"] == "advisory" ? " (ADVISORY)" : ""
+      out << "   - #{cmd["name"]}#{req}#{gate}: `#{cmd["command"]}`"
+    end
+  end
+
+  puts out.join("\n")
+
+when "sync"
+  allow_dirty_spec = false
+  apply_mode = false
+  show_drift_only = false
+  force_apply = false
+  confirm_batch = false
+
+  ARGV[1..].to_a.each do |flag|
+    case flag
+    when "--show-drift" then show_drift_only = true
+    when "--allow-dirty-spec" then allow_dirty_spec = true
+    when "--apply" then apply_mode = true
+    when "--force" then force_apply = true
+    when "--confirm-batch" then confirm_batch = true
+    else
+      abort "Unknown flag: #{flag}\nUsage: bin/task sync [--show-drift] [--allow-dirty-spec] [--confirm-batch] [--apply [--force]]"
+    end
+  end
+
+  # Phase 1: drift-only mode
+  if show_drift_only
+    doc = load_document
+    tasks = doc["tasks"]
+    reports = ScaffoldTask::Drift.detect(tasks, detail_dir: DETAIL_DIR)
+
+    if reports.empty?
+      puts "No drift detected. #{tasks.count { |t| t["status"] == "done" }} completed task(s) probed."
+      exit(0)
+    end
+
+    puts ScaffoldTask::Drift.render_markdown(reports)
+    exit(0)
+  end
+
+  # Phase 3a: apply
+  if apply_mode
+    unless File.exist?(ScaffoldTask::SyncProposal::PROPOSAL_PATH)
+      abort "No proposal at #{ScaffoldTask::SyncProposal::PROPOSAL_PATH}. Run `bin/task sync` first."
+    end
+
+    begin
+      parsed = ScaffoldTask::SyncProposal.parse
+      ScaffoldTask::SyncProposal.validate!(parsed)
+    rescue ScaffoldTask::SyncProposal::ParseError, ScaffoldTask::SyncProposal::ValidationError => e
+      abort "Proposal is invalid: #{e.message}"
+    end
+
+    current_head = `git rev-parse HEAD`.strip
+    proposal_sha = parsed[:top]["generated_against_sha"].to_s
+
+    if proposal_sha != "WORKING_TREE" && proposal_sha != current_head && !force_apply
+      abort <<~ERR
+        Proposal is stale: it was generated against #{proposal_sha[0..7]},
+        but HEAD is now #{current_head[0..7]}. The spec has moved since
+        the proposal was produced.
+
+        Options:
+          - Regenerate: delete .scaffold/sync-proposal.md and rerun `bin/task sync`
+          - Force apply: bin/task sync --apply --force (rare; breaks the
+            recoverability property)
+      ERR
+    end
+
+    doc = load_document
+    tasks = doc["tasks"]
+    accepted = parsed[:changes].select { |c| c[:frontmatter]["status"] == "accept" }
+    rejected = parsed[:changes].select { |c| c[:frontmatter]["status"] == "reject" }
+    edited = parsed[:changes].select { |c| c[:frontmatter]["status"] == "edit" }
+
+    if accepted.empty?
+      puts "No accepted changes in proposal (#{rejected.length} rejected, #{edited.length} still marked `edit`)."
+      puts "Delete or re-status blocks, then run `bin/task sync --apply` again."
+      exit(0)
+    end
+
+    applied_summary = []
+    max_position = tasks.map { |t| t["position"].to_i }.max || 0
+
+    accepted.each do |change|
+      fm = change[:frontmatter]
+      classification = fm["classification"]
+      change_id = fm["change_id"]
+      target = fm["target"] || {}
+      payload = ScaffoldTask::SyncProposal.extract_task_payload(change[:body]) || {}
+
+      case classification
+      when "new-task", "inject-against-completed", "deprecate"
+        pos = target["position"]
+        if pos.nil?
+          max_position += 1
+          pos = max_position
+        else
+          max_position = pos if pos > max_position
+        end
+        depends_on = Array(target["depends_on"]).map(&:to_i)
+
+        new_task = payload.merge(
+          "position" => pos,
+          "depends_on" => depends_on,
+          "status" => "pending",
+          "sync_provenance" => {
+            "change_id" => change_id,
+            "classification" => classification,
+            "spec_sha" => parsed[:top]["generated_against_sha"],
+            "spec_diff_hunk" => fm.dig("provenance", "spec_diff_hunk")
+          }
+        )
+        tasks << new_task
+        applied_summary << "  #{change_id} [#{classification}] new task #{pos}: #{payload["title"]}"
+
+      when "modify-pending"
+        pos = target["position"]
+        existing = tasks.find { |t| t["position"].to_i == pos.to_i }
+        unless existing
+          applied_summary << "  #{change_id} [#{classification}] SKIPPED: no task at position #{pos}"
+          next
+        end
+        if existing["status"] == "done"
+          applied_summary << "  #{change_id} [#{classification}] SKIPPED: task #{pos} is done (use inject-against-completed)"
+          next
+        end
+        # Overlay only the fields present in payload — don't wipe others
+        payload.each do |k, v|
+          existing[k] = v unless %w[position status sync_provenance].include?(k)
+        end
+        existing["sync_provenance"] ||= {}
+        existing["sync_provenance"]["last_modified_by"] = change_id
+        existing["sync_provenance"]["spec_sha"] = parsed[:top]["generated_against_sha"]
+        applied_summary << "  #{change_id} [#{classification}] modified task #{pos}"
+
+      when "refinement-noop"
+        applied_summary << "  #{change_id} [#{classification}] no action (advisory only)"
+      else
+        applied_summary << "  #{change_id} [#{classification}] SKIPPED: unknown classification"
+      end
+    end
+
+    # Phase 3b: DAG hygiene. Cycle detection is a safety gate — the
+    # classifier should never produce cycles, but better to abort here
+    # than fail at build time. Transitive reduction keeps the graph
+    # minimal after repeated syncs (the iteration-10 dependency-bloat
+    # problem from the debate synthesis).
+    begin
+      ScaffoldTask::DagHygiene.assert_acyclic!(tasks)
+    rescue ScaffoldTask::DagHygiene::CycleError => e
+      abort <<~ERR
+        Refusing to apply: the proposed tasks.json would introduce a cycle.
+
+        #{e.message}
+
+        Review the proposal's depends_on values (especially on
+        inject-against-completed blocks) and re-edit or reject the offending
+        change. Then re-run `bin/task sync --apply`.
+      ERR
+    end
+
+    pruned_edges = ScaffoldTask::DagHygiene.transitive_reduce!(tasks)
+    if !pruned_edges.empty?
+      applied_summary << ""
+      applied_summary << "Transitive reduction pruned redundant depends_on edges:"
+      pruned_edges.each do |rec|
+        applied_summary << "  task #{rec[:position]} no longer directly depends on: #{rec[:pruned].join(", ")}"
+      end
+    end
+
+    # Advance last_synced_spec_sha. Dirty-tree syncs store a working-tree
+    # marker since git has no stable identifier until the spec is committed.
+    doc["last_synced_spec_sha"] = proposal_sha == "WORKING_TREE" ? current_head : proposal_sha
+    doc["tasks"] = tasks.sort_by { |t| t["position"].to_i }
+
+    save_document(doc)
+
+    # Remove the proposal; commit.
+    File.unlink(ScaffoldTask::SyncProposal::PROPOSAL_PATH) if File.exist?(ScaffoldTask::SyncProposal::PROPOSAL_PATH)
+
+    commit_body = [
+      "Applied #{accepted.length} change(s) from bin/task sync.",
+      "Rejected: #{rejected.length}. Marked edit: #{edited.length}.",
+      "",
+      "Proposal generated against #{proposal_sha[0..11]}; applying against HEAD #{current_head[0..11]}.",
+      "",
+      "Change summary:"
+    ] + applied_summary
+
+    short_sha = doc["last_synced_spec_sha"][0..11]
+    system("git", "add", TASKS_FILE)
+    system("git", "commit", "-q", "-m", "tasks: sync against spec.md at #{short_sha}", "-m", commit_body.join("\n"))
+
+    puts "Applied #{accepted.length} accepted change(s)."
+    applied_summary.each { |line| puts line }
+    puts "Committed as `tasks: sync against spec.md at #{short_sha}`."
+    exit(0)
+  end
+
+  _ = force_apply # used above
+  _ = confirm_batch # used below
+
+  # Phase 2a: proposal generation
+  doc = load_document
+  tasks = doc["tasks"]
+
+  # Resolve last_synced_spec_sha. The sentinel "baseline" (written at
+  # scaffold time) resolves lazily to the first commit that introduced
+  # spec.md. After the first successful `sync --apply`, it's replaced
+  # with a real SHA.
+  last_sha = doc["last_synced_spec_sha"].to_s
+  if last_sha.empty?
+    abort "tasks.json is missing `last_synced_spec_sha`. Regenerate this project with scaffold v2, or set the field manually to the commit you want sync to diff against."
+  end
+
+  if last_sha == "baseline"
+    # git log --diff-filter=A --follow --format=%H -- spec.md → commits where spec.md was ADDED.
+    # Take the earliest (last line of `git log` output in default order).
+    lines = `git log --diff-filter=A --follow --format=%H -- spec.md 2>/dev/null`.strip.lines.map(&:strip).reject(&:empty?)
+    if lines.empty?
+      abort "Cannot resolve baseline: no commit in git history added spec.md.\nEnsure you're running from inside a scaffold-generated project with committed history."
+    end
+    last_sha = lines.last
+    $stderr.puts "Resolved baseline to commit #{last_sha[0..7]} (first commit that introduced spec.md)"
+  end
+
+  # Dirty-spec gate (Phase 2c scope, but basic check here so Phase 2a
+  # is usable without foot-guns). Detect whether spec.md has uncommitted
+  # modifications.
+  dirty_spec = !`git status --porcelain -- spec.md 2>/dev/null`.strip.empty?
+  if dirty_spec && !allow_dirty_spec
+    abort <<~ERR
+      spec.md has uncommitted changes. Commit the spec first, or pass --allow-dirty-spec
+      to sync against the working-tree content. Committing is preferred — sync writes
+      `last_synced_spec_sha` on apply, and that anchor is meaningless if HEAD doesn't
+      match what sync saw.
+
+      Hint:
+        git add spec.md && git commit -m "spec: <describe the edit>"
+        bin/task sync
+    ERR
+  end
+
+  # Compute the diff. If spec.md is at working tree (--allow-dirty-spec),
+  # diff the stored SHA against the working tree rather than HEAD.
+  head_ref = dirty_spec ? "--" : "HEAD --"
+  spec_diff = `git diff #{last_sha} #{head_ref} spec.md 2>/dev/null`.to_s
+
+  if spec_diff.strip.empty?
+    puts "No spec changes since last sync (last_synced_spec_sha: #{last_sha[0..7]})."
+    exit(0)
+  end
+
+  # Batched-sync-debt warning. Count commits on spec.md between last_sha
+  # and HEAD. Large batches mean the classifier sees a bigger change set
+  # per hunk and is more likely to under-sample — debate synthesis flagged
+  # this as the most-likely-misuse failure mode.
+  batch_threshold_raw = ENV["SCAFFOLD_BATCHED_SYNC_THRESHOLD"].to_s.strip
+  batch_threshold = batch_threshold_raw.empty? ? 10 : (Integer(batch_threshold_raw) rescue 10)
+  commits_since = `git rev-list --count #{last_sha}..HEAD -- spec.md 2>/dev/null`.strip.to_i
+  if commits_since > batch_threshold && !confirm_batch
+    abort <<~WARN
+      spec.md has drifted #{commits_since} commits since last sync (threshold: #{batch_threshold}).
+
+      Classifier quality degrades on large change sets — hunks get under-sampled
+      and misclassifications compound. Consider syncing more often so each sync
+      sees a smaller, coherent diff.
+
+      To proceed anyway:
+        bin/task sync --confirm-batch
+
+      To raise the threshold:
+        SCAFFOLD_BATCHED_SYNC_THRESHOLD=20 bin/task sync
+    WARN
+  end
+
+  # Build the slim tasks summary. We deliberately omit descriptions and
+  # acceptance_criteria — those blow out context and aren't needed for
+  # classification decisions.
+  tasks_summary = tasks.map do |t|
+    {
+      "position" => t["position"],
+      "title" => t["title"],
+      "status" => t["status"],
+      "done_when" => t["done_when"],
+      "depends_on" => t["depends_on"] || [],
+      "labels" => t["labels"] || [],
+      "section_ref" => t["section_ref"]
+    }
+  end
+
+  # Runbook excerpt — prefer recent completed tasks. Use the tail of
+  # runbook.md (most recently completed context) capped at a budget.
+  runbook_excerpt = ""
+  if File.exist?(RUNBOOK_FILE)
+    full = File.read(RUNBOOK_FILE, encoding: "utf-8")
+    runbook_excerpt = full[-6000..] || full
+  end
+
+  $stderr.puts "Running sync classifier against #{spec_diff.lines.count} diff lines..."
+
+  begin
+    classifications = ScaffoldTask::SyncClassifier.classify(
+      spec_diff: spec_diff,
+      tasks_summary: tasks_summary,
+      runbook_excerpt: runbook_excerpt
+    )
+  rescue ScaffoldTask::SyncClassifier::ClassifierError => e
+    abort "Sync classifier failed: #{e.message}"
+  end
+
+  if !classifications.is_a?(Array) || classifications.empty?
+    $stderr.puts "Classifier returned no changes. Inspect the diff; the classifier may have treated everything as refinement-noop."
+    exit(0)
+  end
+
+  # Phase 2b: double-sample medium/low-confidence entries. Adds a critic
+  # pass that may downgrade confidence or annotate payload divergence.
+  uncertain_count = classifications.count { |c| %w[medium low].include?(c["confidence"].to_s) }
+  if uncertain_count > 0
+    $stderr.puts "Double-sampling #{uncertain_count} uncertain classification(s)..."
+    classifications = ScaffoldTask::SyncClassifier.double_sample_if_uncertain(
+      classifications,
+      spec_diff: spec_diff,
+      tasks_summary: tasks_summary,
+      runbook_excerpt: runbook_excerpt
+    )
+  end
+
+  # Run drift detection for the advisory section inside the proposal.
+  drift_reports = ScaffoldTask::Drift.detect(tasks, detail_dir: DETAIL_DIR)
+
+  # Build the proposal structure for writing.
+  top = {
+    "generated_against_sha" => dirty_spec ? "WORKING_TREE" : `git rev-parse HEAD`.strip,
+    "last_synced_spec_sha" => last_sha,
+    "generated_at" => Time.now.utc.iso8601
+  }
+
+  # Per-change blocks
+  max_position = tasks.map { |t| t["position"].to_i }.max || 0
+  next_position = max_position + 1
+
+  change_blocks = classifications.map.with_index do |c, idx|
+    # Normalize frontmatter
+    classification = c["classification"].to_s
+    provenance = {
+      "spec_diff_hunk" => c["spec_diff_hunk"] || ""
+    }
+    if c["double_sample_agreement"]
+      provenance["double_sample_agreement"] = c["double_sample_agreement"]
+    end
+    if c["critic_classification"]
+      provenance["critic_classification"] = c["critic_classification"]
+    end
+    if c["critic_rationale"]
+      provenance["critic_rationale"] = c["critic_rationale"]
+    end
+
+    frontmatter = {
+      "change_id" => c["change_id"] || "C-%03d" % (idx + 1),
+      "status" => "accept",
+      "classification" => classification,
+      "confidence" => c["confidence"] || "medium",
+      "provenance" => provenance
+    }
+
+    # Target — only for non-noop classifications
+    unless classification == "refinement-noop"
+      target = c["target"] || {}
+      # Assign a position if the classifier didn't supply one
+      if %w[new-task inject-against-completed deprecate].include?(classification)
+        target["position"] ||= next_position
+        next_position += 1 if target["position"] == next_position
+      end
+      frontmatter["target"] = target
+    end
+
+    # Body — render the task payload as markdown
+    body_lines = []
+    if classification == "refinement-noop"
+      body_lines << "### #{frontmatter["change_id"]}: Refinement / no action"
+      body_lines << ""
+      body_lines << "_#{c["rationale"] || "No behavioral change detected."}_"
+    else
+      payload = c["task_payload"] || {}
+      pos = frontmatter.dig("target", "position")
+      action_word = case classification
+                    when "new-task" then "Proposed task"
+                    when "modify-pending" then "Modify pending task"
+                    when "inject-against-completed" then "Injected task (against completed)"
+                    when "deprecate" then "Deprecation task"
+                    else "Change"
+                    end
+      body_lines << "### #{action_word} #{pos}: #{payload["title"] || "(no title supplied)"}"
+      body_lines << ""
+      body_lines << "**Rationale:** #{c["rationale"]}" if c["rationale"]
+      body_lines << ""
+      if payload["user_story"]
+        body_lines << "**User story:** #{payload["user_story"]}"
+        body_lines << ""
+      end
+      if payload["done_when"]
+        body_lines << "**done_when:**"
+        body_lines << ""
+        body_lines << "> #{payload["done_when"]}"
+        body_lines << ""
+      end
+      if payload["description"]
+        body_lines << "**Description:**"
+        body_lines << ""
+        body_lines << payload["description"]
+        body_lines << ""
+      end
+      if payload["labels"] && !payload["labels"].empty?
+        body_lines << "**Labels:** #{Array(payload["labels"]).join(", ")}"
+      end
+      if payload["section_ref"]
+        body_lines << "**Section:** `#{payload["section_ref"]}`"
+      end
+      if payload["acceptance_criteria"] && !payload["acceptance_criteria"].empty?
+        body_lines << ""
+        body_lines << "**Acceptance criteria:**"
+        Array(payload["acceptance_criteria"]).each do |ac|
+          body_lines << "- `#{ac["type"]}`: `#{JSON.generate(ac["params"] || {})}`"
+        end
+      end
+
+      # Preserve full task_payload as a code block so --apply can read
+      # the canonical form even if the rendered prose above was edited.
+      body_lines << ""
+      body_lines << "<details><summary>Raw task payload</summary>"
+      body_lines << ""
+      body_lines << "```json"
+      body_lines << JSON.pretty_generate(payload)
+      body_lines << "```"
+      body_lines << ""
+      body_lines << "</details>"
+    end
+
+    { frontmatter: frontmatter, body: body_lines.join("\n") }
+  end
+
+  # Write the proposal file. Drift advisory gets appended as a plain
+  # Markdown tail so it isn't parsed as a change block.
+  ScaffoldTask::SyncProposal.write(top: top, changes: change_blocks)
+
+  if !drift_reports.empty?
+    File.open(ScaffoldTask::SyncProposal::PROPOSAL_PATH, "a") do |f|
+      f.write("\n")
+      f.write(ScaffoldTask::Drift.render_markdown(drift_reports))
+      f.write("\n")
+    end
+  end
+
+  $stderr.puts ""
+  $stderr.puts "Sync proposal written to #{ScaffoldTask::SyncProposal::PROPOSAL_PATH}"
+  $stderr.puts "  #{classifications.length} change(s) proposed"
+  noops = classifications.count { |c| c["classification"] == "refinement-noop" }
+  $stderr.puts "  #{noops} classified as refinement-noop" if noops > 0
+  $stderr.puts "  #{drift_reports.length} completed task(s) show drift" if !drift_reports.empty?
+  $stderr.puts ""
+  $stderr.puts "Review the file (edit status: accept|reject|edit per block), then run"
+  $stderr.puts "  bin/task sync --apply"
+
+else
+  puts <<~USAGE
+    Usage: bin/task <command> [args]
+
+    Commands:
+      status            Show progress summary
+      next              Print next eligible task (JSON)
+      start POSITION    Mark task in_progress
+      done POSITION     Mark task done
+      error POSITION    Mark task error (with optional message)
+      block POSITION    Mark task blocked (circuit breaker, with optional message)
+      reset POSITION    Reset task to pending
+      split POSITION <contract-1> <contract-2> [<c3> ...]
+                        Decompose a task into behavior-contract children
+      prepare POSITION  Generate lazy task details for one task (`--force`, `--codex-preflight-review`)
+      verify [POSITION] Run verification checks
+      runbook POSITION  Show prepared runbook entry
+      runbook-for POSITION [--budget N]
+                        Print runbook entries from POSITION's dependency
+                        closure (default budget: 3000 chars)
+      attempt-advisory POSITION
+                        Emit split advisory once failed attempts >= threshold
+                        (env: SCAFFOLD_ATTEMPT_WARNING_THRESHOLD, default 8)
+      dossier POSITION [--bundle PATH]
+                        Emit consolidated per-task context Markdown
+                        (inspectable input to launch-build.sh's prompt)
+      sync --show-drift Detect drift: completed tasks whose cheap probes
+                        no longer pass against current code
+                        (full sync + apply coming in later phases)
+  USAGE
+  exit 1
+end

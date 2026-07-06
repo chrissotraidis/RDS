@@ -1,0 +1,23 @@
+{
+  "name": "wiki-marketplace",
+  "owner": {
+    "name": "RDS Contributors",
+    "email": "noreply@example.com"
+  },
+  "metadata": {
+    "description": "Product wiki plugins"
+  },
+  "plugins": [
+    {
+      "name": "wiki",
+      "source": {
+        "source": "github",
+        "repo": "chrissotraidis/RDS"
+      },
+      "description": "Analyze codebases into product wikis and as-built specifications. Includes specialist agents for gap analysis, UX review, research, and product-owner question management with spec sync.",
+      "version": "0.3.0",
+      "homepage": "https://github.com/chrissotraidis/RDS",
+      "license": "MIT"
+    }
+  ]
+}

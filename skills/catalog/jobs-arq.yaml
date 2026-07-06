@@ -1,0 +1,17 @@
+---
+slug: jobs-arq
+name: ARQ background jobs
+status: curated
+category: jobs
+maturity: beta
+applies_to:
+- python-ai-service
+description: ARQ background job default for Python services.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: arq-docs.helpmanual.io
+  url: https://arq-docs.helpmanual.io/
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

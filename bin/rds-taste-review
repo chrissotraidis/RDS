@@ -1,0 +1,459 @@
+#!/usr/bin/env python3
+"""Review a completed RDS build for taste and write a targeted iteration prompt."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+from pathlib import Path
+from typing import Any
+
+GAME_SIGNALS = {
+    "score": ["score", "points", "combo", "multiplier"],
+    "progression": ["level", "wave", "stage", "difficulty", "speedup", "escalat"],
+    "failure_retry": ["game over", "restart", "try again", "lives", "health"],
+    "pressure": ["enemy", "obstacle", "hazard", "timer", "countdown", "chase", "spawn"],
+    "feedback": ["sound", "shake", "flash", "particle", "animation", "transition", "pulse"],
+    "hook": ["power", "upgrade", "special", "combo", "risk", "reward", "bonus"],
+}
+
+APP_SIGNALS = {
+    "primary_workflow": ["create", "save", "edit", "filter", "search", "complete", "submit", "import", "export"],
+    "state_depth": ["empty", "loading", "error", "success", "toast", "disabled", "validation"],
+    "real_data": ["sample", "mock", "seed", "example", "status", "priority", "owner", "deadline"],
+    "operator_confidence": ["history", "activity", "audit", "progress", "summary", "insight", "metric"],
+    "responsive_polish": ["responsive", "mobile", "grid", "layout", "overflow", "breakpoint"],
+}
+
+SKIP_DIRS = {"node_modules", "dist", "build", ".git", ".scaffold-debug", "coverage", "vendor/bundle"}
+SOURCE_EXTS = {".ts", ".tsx", ".js", ".jsx", ".css", ".html", ".erb", ".rb", ".md", ".json"}
+
+
+def read_text(path: Path, limit: int = 500_000) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="ignore")[:limit]
+    except Exception:
+        return ""
+
+
+def read_json(path: Path) -> Any:
+    try:
+        return json.loads(read_text(path))
+    except Exception:
+        return None
+
+
+def latest_iter(build_dir: Path) -> Path | None:
+    root = build_dir / "playwright"
+    if not root.exists():
+        return None
+    iters = [p for p in root.glob("iter-*") if p.is_dir()]
+    return sorted(iters)[-1] if iters else None
+
+
+def source_blob(app_dest: Path) -> tuple[str, list[str]]:
+    chunks: list[str] = []
+    files: list[str] = []
+    if not app_dest.exists():
+        return "", []
+    for path in app_dest.rglob("*"):
+        rel_parts = set(path.relative_to(app_dest).parts) if path.is_relative_to(app_dest) else set(path.parts)
+        if SKIP_DIRS & rel_parts:
+            continue
+        if path.is_file() and path.suffix.lower() in SOURCE_EXTS:
+            rel = str(path.relative_to(app_dest))
+            text = read_text(path, 60_000)
+            if text:
+                files.append(rel)
+                chunks.append(f"\n--- {rel} ---\n{text}")
+    return "\n".join(chunks).lower()[:900_000], files
+
+
+def infer_kind(spec: str, state: dict[str, Any]) -> str:
+    explicit = str(state.get("app_type") or "").strip().lower().replace("_", "-")
+    if explicit and explicit not in {"auto", "unknown"}:
+        return explicit
+    brief = read_json(Path(state.get("_build_dir", "")) / "taste-brief.json")
+    if isinstance(brief, dict) and isinstance(brief.get("kind"), str):
+        return str(brief["kind"])
+    lower = spec.lower()
+    if any(w in lower for w in ["game", "score", "enemy", "player", "level", "arcade", "dig dug", "pong", "tetris"]):
+        return "game"
+    if any(w in lower for w in ["landing page", "website", "marketing", "portfolio", "hero"]):
+        return "website"
+    return "app"
+
+
+def score_signals(blob: str, signals: dict[str, list[str]]) -> tuple[int, list[dict[str, Any]], list[str]]:
+    total = 0
+    items = []
+    missing = []
+    for name, terms in signals.items():
+        found = sorted({term for term in terms if term in blob})
+        ok = bool(found)
+        total += 1 if ok else 0
+        if not ok:
+            missing.append(name)
+        items.append({"name": name, "ok": ok, "evidence": found[:8]})
+    return total, items, missing
+
+
+def runtime_status(iter_dir: Path | None, build_dir: Path) -> tuple[int, dict[str, Any]]:
+    if not iter_dir:
+        return -15, {"available": False, "reason": "no Playwright iteration found"}
+    summary = read_json(iter_dir / "summary.json") or {}
+    verdict = read_json(iter_dir / "spec-verdict.json") or {}
+    gaps = int(summary.get("gapsFound") or 0)
+    converged = bool(summary.get("converged"))
+    overall = str(verdict.get("overall") or "unknown")
+    penalty = 0
+    if not converged:
+        penalty -= 15
+    if gaps:
+        penalty -= min(25, gaps * 5)
+    if overall == "fail":
+        penalty -= 25
+    elif overall == "partial":
+        penalty -= 10
+    mockup = read_json(build_dir / "mockup-diff" / "report.json") or {}
+    mockup_status = str(mockup.get("status") or "unknown")
+    if mockup_status == "failed":
+        penalty -= 25
+    visual = read_json(iter_dir / "visual-verdict.json") or {}
+    visual_status = str(visual.get("status") or "unknown")
+    visual_blockers = int(visual.get("blockerCount") or 0)
+    if visual_status in {"fail", "needs_iteration"} or visual_blockers:
+        penalty -= min(35, 15 + visual_blockers * 5)
+    design_path = iter_dir / "design-review.json"
+    screenshots = sorted(iter_dir.glob("*.png"))
+    design = read_json(design_path) or {}
+    design_status = str(design.get("status") or "unknown")
+    design_score = int(design.get("score") or 0)
+    design_missing = not design_path.exists()
+    if design_missing:
+        design_status = "missing"
+    design_issues = design.get("issues") if isinstance(design.get("issues"), list) else []
+    design_blockers = [
+        issue for issue in design_issues
+        if isinstance(issue, dict) and str(issue.get("severity") or "") in {"blocker", "major"}
+    ]
+    # A skipped design review is not a pass. It means RDS has no taste/polish
+    # evidence for the screenshots, so the build needs another quality pass
+    # before pending operator review.
+    if design_status == "fail":
+        penalty -= 18
+    elif design_status == "needs_iteration":
+        penalty -= 12
+    elif design_status == "skipped":
+        penalty -= 20
+    elif design_status == "missing":
+        penalty -= 25 if screenshots else 15
+    if design_status == "pass" and design_score and design_score < 80:
+        penalty -= 6
+    truthfulness = read_json(iter_dir / "truthfulness-verdict.json") or {}
+    truthfulness_status = str(truthfulness.get("status") or "unknown")
+    if truthfulness_status in {"fail", "needs_iteration"}:
+        penalty -= 18
+    persona = read_json(iter_dir / "persona-verdict.json") or {}
+    persona_status = str(persona.get("status") or "unknown")
+    if persona_status in {"fail", "needs_iteration"}:
+        penalty -= 18
+    prd_coverage = read_json(iter_dir / "prd-coverage-verdict.json") or {}
+    prd_coverage_status = str(prd_coverage.get("status") or "unknown")
+    if prd_coverage_status in {"fail", "needs_iteration"}:
+        penalty -= 25 if prd_coverage_status == "fail" else 18
+    return penalty, {
+        "available": True,
+        "iteration": iter_dir.name,
+        "converged": converged,
+        "gapsFound": gaps,
+        "specVerdict": overall,
+        "mockupStatus": mockup_status,
+        "visualStatus": visual_status,
+        "visualBlockers": visual_blockers,
+        "designStatus": design_status,
+        "designScore": design_score,
+        "designBlockers": len(design_blockers),
+        "designReviewPath": str(design_path),
+        "designReviewMissing": design_missing,
+        "screenshotsAvailable": len(screenshots),
+        "truthfulnessStatus": truthfulness_status,
+        "truthfulnessScore": int(truthfulness.get("score") or 0),
+        "truthfulnessFailures": truthfulness.get("failedRequiredCriteria") if isinstance(truthfulness.get("failedRequiredCriteria"), list) else [],
+        "personaStatus": persona_status,
+        "personaScore": int(persona.get("score") or 0),
+        "personaFailures": persona.get("failedRequiredCriteria") if isinstance(persona.get("failedRequiredCriteria"), list) else [],
+        "prdCoverageStatus": prd_coverage_status,
+        "prdCoverageScore": int(prd_coverage.get("score") or 0),
+        "prdCoverageFailures": prd_coverage.get("failedRequiredCriteria") if isinstance(prd_coverage.get("failedRequiredCriteria"), list) else [],
+        "designIssues": [
+            {
+                "severity": str(issue.get("severity") or ""),
+                "kind": str(issue.get("kind") or ""),
+                "evidence": str(issue.get("evidence") or "")[:400],
+                "fixHint": str(issue.get("fixHint") or "")[:400],
+            }
+            for issue in design_issues[:6]
+            if isinstance(issue, dict)
+        ],
+    }
+
+
+GAME_UAT_TO_TASTE = {
+    "controls_discoverable": "feedback",
+    "responds_to_input": "feedback",
+    "keeps_animating_or_escalates": "progression",
+    "scoring_or_progression_visible": "score",
+    "failure_restart_loop": "failure_retry",
+    "pressure_signal": "pressure",
+    "play_session_depth": "progression",
+}
+
+
+def typed_uat_status(kind: str, iter_dir: Path | None) -> tuple[int, dict[str, Any], list[str]]:
+    if not iter_dir:
+        return 0, {"available": False}, []
+    artifact = "game-verdict.json"
+    if kind == "website":
+        artifact = "website-verdict.json"
+    elif kind in {"web-app", "dashboard", "internal-tool", "app"}:
+        artifact = "workflow-verdict.json"
+    elif kind != "game":
+        return 0, {"available": False}, []
+    verdict = read_json(iter_dir / artifact)
+    if not isinstance(verdict, dict):
+        return -10, {"available": False, "reason": f"{artifact} missing"}, ["feedback"]
+
+    score = int(verdict.get("score") or 0)
+    threshold = int(verdict.get("threshold") or 75)
+    status = str(verdict.get("status") or "unknown")
+    failed_criteria = []
+    mapped_missing: list[str] = []
+    for item in verdict.get("criteria") or []:
+        if not isinstance(item, dict) or item.get("ok"):
+            continue
+        name = str(item.get("name") or "")
+        failed_criteria.append({
+            "name": name,
+            "evidence": str(item.get("evidence") or "")[:300],
+        })
+        mapped = GAME_UAT_TO_TASTE.get(name)
+        if mapped and mapped not in mapped_missing:
+            mapped_missing.append(mapped)
+
+    penalty = 0
+    if status == "fail":
+        penalty -= 30
+    elif status == "needs_iteration":
+        penalty -= 20
+    elif score < threshold:
+        penalty -= 15
+
+    return penalty, {
+        "available": True,
+        "artifact": str(iter_dir / artifact),
+        "status": status,
+        "score": score,
+        "threshold": threshold,
+        "failedCriteria": failed_criteria,
+    }, mapped_missing
+
+
+def improvement_prompt(kind: str, title: str, missing: list[str], runtime: dict[str, Any], uat: dict[str, Any], review_path: str) -> str:
+    if kind == "game":
+        focus = {
+            "score": "add scoring that rewards skill and is visible during play",
+            "progression": "add level/wave/difficulty progression so the second minute is harder than the first",
+            "failure_retry": "make failure and instant restart clear and satisfying",
+            "pressure": "add enemy, hazard, resource, or timer pressure that creates decisions",
+            "feedback": "add visual/audio/haptic-style feedback such as flashes, particles, shake, or animation",
+            "hook": "add one memorable mechanic beyond the obvious clone",
+        }
+        default = "Improve the core game loop so it is meaningfully fun after 60 seconds."
+    else:
+        focus = {
+            "primary_workflow": "make the primary workflow complete and obvious",
+            "state_depth": "add empty/loading/error/success states and validation",
+            "real_data": "replace placeholders with realistic sample data and domain-specific labels",
+            "operator_confidence": "add status/progress/history so the user trusts what happened",
+            "responsive_polish": "tighten responsive layout, hierarchy, and overflow behavior",
+        }
+        default = "Improve the primary product experience so it feels like a real first version, not a toy."
+    design_fix_hints = [
+        str(issue.get("fixHint") or "").strip()
+        for issue in (runtime.get("designIssues") or [])
+        if isinstance(issue, dict) and str(issue.get("fixHint") or "").strip()
+    ]
+    fixes = [focus[m] for m in missing if m in focus][:3] or design_fix_hints[:4] or [default]
+    runtime_note = ""
+    if runtime.get("available"):
+        runtime_note = f"Latest QA: converged={runtime.get('converged')} gaps={runtime.get('gapsFound')} specVerdict={runtime.get('specVerdict')} visualStatus={runtime.get('visualStatus')} visualBlockers={runtime.get('visualBlockers')} designStatus={runtime.get('designStatus')} designScore={runtime.get('designScore')}."
+    uat_note = ""
+    if uat.get("available"):
+        uat_note = f"Typed UAT: status={uat.get('status')} score={uat.get('score')}/{uat.get('threshold')}."
+    qa_contract_lines = []
+    for label, status_key, score_key, failures_key in [
+        ("Truthfulness", "truthfulnessStatus", "truthfulnessScore", "truthfulnessFailures"),
+        ("Persona UAT", "personaStatus", "personaScore", "personaFailures"),
+        ("PRD coverage", "prdCoverageStatus", "prdCoverageScore", "prdCoverageFailures"),
+    ]:
+        status = runtime.get(status_key)
+        if status and status != "unknown":
+            qa_contract_lines.append(f"{label}: status={status} score={runtime.get(score_key)}")
+            for failure in (runtime.get(failures_key) or [])[:4]:
+                if isinstance(failure, dict):
+                    qa_contract_lines.append(f"- {failure.get('name')}: {failure.get('evidence')}")
+    design_lines = []
+    if runtime.get("designIssues"):
+        design_lines = ["Design-review issues:"]
+        for issue in runtime.get("designIssues") or []:
+            if not isinstance(issue, dict):
+                continue
+            design_lines.append(f"- {issue.get('severity')} {issue.get('kind')}: {issue.get('fixHint') or issue.get('evidence')}")
+    return f"""RDS taste layer found that "{title}" needs one focused quality pass.
+
+Goal:
+{default}
+
+Apply the highest-leverage fixes only:
+{chr(10).join(f"- {fix}" for fix in fixes)}
+
+Constraints:
+- Work only inside the generated app.
+- Preserve existing working behavior and the user's original intent.
+- Prefer depth, feedback, progression, and clarity over adding broad unrelated features.
+- Keep the result shippable: run local checks after editing.
+
+Evidence:
+- Review artifact: {review_path}
+- {runtime_note}
+- {uat_note}
+{chr(10).join(qa_contract_lines)}
+{chr(10).join(design_lines)}
+"""
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("build_id")
+    parser.add_argument("--root", default=str(Path(__file__).resolve().parents[1]))
+    parser.add_argument("--threshold", type=int, default=75)
+    args = parser.parse_args()
+
+    root = Path(args.root).resolve()
+    build_dir = root / "builds" / args.build_id
+    state_path = build_dir / "state.json"
+    if not state_path.exists():
+        raise SystemExit(f"FATAL: state not found: {state_path}")
+
+    state = read_json(state_path) or {}
+    state["_build_dir"] = str(build_dir)
+    spec = read_text(build_dir / "spec.md")
+    title = re.search(r"^#\s+(.+?)\s*$", spec, flags=re.MULTILINE)
+    title_text = title.group(1).strip() if title else args.build_id
+    kind = infer_kind(spec, state)
+    app_dest = Path(str(state.get("app_dest") or build_dir / "scaffold-out"))
+    blob, files = source_blob(app_dest)
+    iter_dir = latest_iter(build_dir)
+    runtime_penalty, runtime = runtime_status(iter_dir, build_dir)
+    uat_penalty, typed_uat, uat_missing = typed_uat_status(kind, iter_dir)
+
+    signals = GAME_SIGNALS if kind == "game" else APP_SIGNALS
+    matched, signal_items, missing = score_signals(blob, signals)
+    for item in uat_missing:
+        if item not in missing:
+            missing.append(item)
+    for status_key, mapped in [
+        ("truthfulnessStatus", "real_data"),
+        ("personaStatus", "primary_workflow"),
+        ("prdCoverageStatus", "operator_confidence"),
+    ]:
+        if runtime.get(status_key) in {"fail", "needs_iteration"} and mapped not in missing:
+            missing.append(mapped)
+    signal_score = round((matched / max(1, len(signals))) * 70)
+    runtime_score = max(0, 30 + runtime_penalty + uat_penalty)
+    score = min(100, signal_score + runtime_score)
+
+    # Gate model: each verification dimension is its own opinion. A single
+    # dimension can downgrade the build only if other dimensions also
+    # disagree, or if it's hard-blocking (broken spec, broken mockup).
+    spec_blocking   = runtime.get("specVerdict") == "fail"
+    visual_blocking = runtime.get("visualStatus") in {"fail", "needs_iteration"} or int(runtime.get("visualBlockers") or 0) > 0
+    mockup_blocking = runtime.get("mockupStatus") == "failed"
+    design_blocking = runtime.get("designStatus") in {"fail", "needs_iteration", "skipped", "missing"}
+    truthfulness_blocking = runtime.get("truthfulnessStatus") in {"fail", "needs_iteration"}
+    persona_blocking = runtime.get("personaStatus") in {"fail", "needs_iteration"}
+    prd_coverage_blocking = runtime.get("prdCoverageStatus") in {"fail", "needs_iteration"}
+    runtime_blocking_hard = bool(
+        runtime.get("available") and (
+            runtime.get("converged") is False
+            or int(runtime.get("gapsFound") or 0) > 0
+            or spec_blocking
+            or mockup_blocking
+            or visual_blocking
+            or truthfulness_blocking
+            or persona_blocking
+            or prd_coverage_blocking
+        )
+    )
+
+    if spec_blocking and typed_uat.get("status") != "pass":
+        status = "fail"
+    elif typed_uat.get("status") == "fail":
+        status = "fail"
+    elif typed_uat.get("status") == "needs_iteration":
+        status = "needs_iteration"
+    elif runtime_blocking_hard:
+        status = "needs_iteration"
+    elif typed_uat.get("status") == "pass" and design_blocking:
+        # UAT passed, but screenshot-backed design/taste evidence is missing or
+        # unhappy. Iterate; do not let a build score 100 on skipped review.
+        status = "needs_iteration"
+    elif typed_uat.get("status") == "pass" and score >= args.threshold:
+        status = "pass"
+    elif score >= args.threshold:
+        status = "pass"
+    else:
+        status = "needs_iteration"
+
+    review = {
+        "schema": "rds.taste.review.v1",
+        "build_id": args.build_id,
+        "status": status,
+        "score": score,
+        "threshold": args.threshold,
+        "kind": kind,
+        "title": title_text,
+        "runtime": runtime,
+        "typedUat": typed_uat,
+        "signals": signal_items,
+        "missing": missing,
+        "sourceFilesScanned": len(files),
+        "gates": {
+            "spec":   "fail" if spec_blocking else "ok",
+            "visual": "needs_iteration" if visual_blocking else "ok",
+            "mockup": "fail" if mockup_blocking else "ok",
+            "design": "needs_iteration" if design_blocking else (runtime.get("designStatus") or "unknown"),
+            "truthfulness": "needs_iteration" if truthfulness_blocking else (runtime.get("truthfulnessStatus") or "unknown"),
+            "persona": "needs_iteration" if persona_blocking else (runtime.get("personaStatus") or "unknown"),
+            "prdCoverage": "needs_iteration" if prd_coverage_blocking else (runtime.get("prdCoverageStatus") or "unknown"),
+            "uat":    typed_uat.get("status") or "unknown",
+        },
+        "limitations": [
+            "Deterministic taste review checks source/runtime signals. It is not a substitute for human judgment.",
+            "Design-reviewer verdicts are required evidence: skipped or failing design review forces iteration instead of pending operator review.",
+            "The goal is to force a useful improvement pass when the build lacks depth, feedback, progression, or real workflow states.",
+        ],
+    }
+    review_path = build_dir / "taste-review.json"
+    review_path.write_text(json.dumps(review, indent=2) + "\n", encoding="utf-8")
+    prompt = improvement_prompt(kind, title_text, missing, runtime, typed_uat, f"builds/{args.build_id}/taste-review.json")
+    prompt_path = build_dir / "taste-iteration-prompt.md"
+    prompt_path.write_text(prompt, encoding="utf-8")
+    print(json.dumps({"status": status, "score": score, "threshold": args.threshold, "review": str(review_path), "prompt": str(prompt_path)}))
+    return 0 if status == "pass" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

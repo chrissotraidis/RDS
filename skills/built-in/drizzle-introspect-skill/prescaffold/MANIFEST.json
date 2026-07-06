@@ -1,0 +1,19 @@
+{
+  "writes": [
+    {
+      "path": "lib/db.ts",
+      "source": "lib/db.ts",
+      "replace_if_contains_any": []
+    },
+    {
+      "path": "lib/schema.ts",
+      "source": "lib/schema.ts",
+      "replace_if_contains_any": []
+    },
+    {
+      "path": "drizzle.config.ts",
+      "source": "drizzle.config.ts",
+      "replace_if_contains_any": []
+    }
+  ]
+}

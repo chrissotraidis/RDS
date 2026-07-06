@@ -1,0 +1,21 @@
+---
+slug: shadcn-add
+name: shadcn add
+status: ready
+default: false
+applies_to:
+- nextjs-fullstack
+description: Adds the shadcn/ui component workflow contract for polished Next.js interfaces.
+install:
+  mode: imperative
+  command: skills/built-in/shadcn-add/install.sh
+verify:
+  command: skills/built-in/shadcn-add/verify.sh
+maturity: operational
+category: frontend
+rationale: Next.js builds need a consistent component source. This skill tells RDS when to use shadcn/ui, how to avoid ad-hoc component drift, and how to verify the app still builds after components are added.
+source_links:
+- label: shadcn/ui CLI
+  url: https://ui.shadcn.com/docs/cli
+- label: shadcn/ui Components
+  url: https://ui.shadcn.com/docs/components

@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# bin/rds-pause — pause a running build without marking it failed.
+#
+# Stops the active build runner, records state.status=paused, resets the active
+# stage to pending, and emits build_paused. A later bin/rds-resume <id> will
+# continue from the paused stage because completed stages remain done/skipped.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck disable=SC1091
+source "$ROOT/bin/lib/common.sh"
+
+TIMEOUT="${RDS_PAUSE_TIMEOUT:-15}"
+TARGET_BUILD=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --timeout=*) TIMEOUT="${1#--timeout=}"; shift ;;
+    --timeout)   TIMEOUT="$2"; shift 2 ;;
+    -h|--help)   sed -n '2,11p' "$0"; exit 0 ;;
+    -*)
+      echo "ERROR: unknown flag '$1'" >&2
+      exit 2
+      ;;
+    *)
+      if [[ -z "$TARGET_BUILD" ]]; then TARGET_BUILD="$1"
+      else echo "ERROR: unexpected positional '$1'" >&2; exit 2; fi
+      shift
+      ;;
+  esac
+done
+
+[[ -n "$TARGET_BUILD" ]] || { echo "usage: bin/rds-pause <build-id> [--timeout=<s>]" >&2; exit 2; }
+[[ "$TIMEOUT" =~ ^[0-9]+$ ]] || { echo "ERROR: --timeout must be a positive integer" >&2; exit 2; }
+
+BUILD_DIR="$RDS_BUILDS_DIR/$TARGET_BUILD"
+STATE="$BUILD_DIR/state.json"
+PIDFILE="$BUILD_DIR/run.pid"
+[[ -f "$STATE" ]] || { echo "no such build: $TARGET_BUILD" >&2; exit 1; }
+
+active_stage="$(jq -r '
+  (.current_stage // empty) as $current |
+  if $current != "" then $current
+  else ((.stages | to_entries | map(select(.value.status == "running")) | .[0].key) // "")
+  end
+' "$STATE" 2>/dev/null || true)"
+
+pid=""
+pgid=""
+if [[ -f "$PIDFILE" ]]; then
+  pid="$(awk -F= '/^pid=/{print $2; exit}' "$PIDFILE" 2>/dev/null || true)"
+  pgid="$(awk -F= '/^pgid=/{print $2; exit}' "$PIDFILE" 2>/dev/null || true)"
+  : "${pgid:=$pid}"
+fi
+
+if [[ "$pid" =~ ^[0-9]+$ ]] && rds_pid_is_build_runner "$pid" "$TARGET_BUILD"; then
+  echo "[rds-pause] $TARGET_BUILD: terminating pgid=$pgid (SIGTERM)"
+  kill -TERM "-$pgid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+  waited=0
+  while (( waited < TIMEOUT )); do
+    if ! kill -0 "$pid" 2>/dev/null; then break; fi
+    sleep 1
+    waited=$(( waited + 1 ))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    echo "[rds-pause] $TARGET_BUILD: still alive after ${TIMEOUT}s — escalating to SIGKILL"
+    kill -KILL "-$pgid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+    sleep 1
+  fi
+else
+  echo "[rds-pause] $TARGET_BUILD: no live build runner found; marking paused anyway"
+fi
+
+rm -f "$PIDFILE" "$PIDFILE.tmp" 2>/dev/null || true
+
+tmp="$STATE.tmp.$$"
+jq --arg now "$(date -u +%FT%TZ)" --arg stage "$active_stage" '
+  .status = "paused" |
+  .paused_at = $now |
+  .paused_from_stage = (if $stage == "" then (.current_stage // null) else $stage end) |
+  .error = null |
+  .updated_at = $now |
+  if $stage != "" then
+    .current_stage = $stage |
+    .stages[$stage] = {status: "pending"}
+  else
+    .
+  end
+' "$STATE" > "$tmp"
+mv "$tmp" "$STATE"
+
+"$ROOT/bin/rds-event" build_paused \
+  --build-id "$TARGET_BUILD" --build-dir "$BUILD_DIR" \
+  stage="${active_stage:-unknown}" reason="operator-pause" \
+  >/dev/null 2>&1 || true
+
+echo "[rds-pause] $TARGET_BUILD: paused${active_stage:+ at stage '$active_stage'}"

@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Review Console</title>
+  </head>
+  <body>
+    <main>
+      <h1>Review Console</h1>
+      <section>
+        <h2>Review mode: what works, seeded, stubbed, and required</h2>
+        <p>What works: operators can inspect the sample dashboard, source pages, and workflow shape.</p>
+        <p>Seeded: orders, spend, and source rows are seeded sample data.</p>
+        <p>Stubbed: production integrations are not connected in this review build.</p>
+        <p>Still required: configure live database, billing ingestion, and provider credentials before production.</p>
+      </section>
+      <p>Review mode uses seeded sample data so operators can test the workflow before production integrations are connected.</p>
+      <section>
+        <h2>Spend</h2>
+        <p>Sample spend: $1,842.36. This is demo billing data, not real usage.</p>
+      </section>
+      <section>
+        <h2>Sources</h2>
+        <p>Sources are stubbed in local review mode. Connect production ingestion before launch.</p>
+      </section>
+      <button>Refresh sample data</button>
+    </main>
+    <script src="./sample-data.js"></script>
+  </body>
+</html>

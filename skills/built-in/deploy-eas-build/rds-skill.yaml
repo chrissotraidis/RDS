@@ -1,0 +1,20 @@
+---
+slug: deploy-eas-build
+name: EAS Build deploy
+status: ready
+default: false
+applies_to:
+- mobile-native
+description: Expo EAS preview build artifact contract.
+install:
+  command: bin/rds-skill-materialize deploy-eas-build
+verify:
+  command: bin/rds-skill-verify deploy-eas-build
+maturity: beta
+category: deploy
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should
+  understand during stack selection, skill resolution, implementation guidance, or
+  verification.
+source_links:
+- label: docs.expo.dev
+  url: https://docs.expo.dev/build/introduction/

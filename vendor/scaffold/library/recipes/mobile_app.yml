@@ -1,0 +1,350 @@
+name: Mobile App
+type: mobile_app
+keywords:
+  - mobile
+  - ios
+  - android
+  - native
+  - react native
+  - flutter
+  - phone
+  - tablet
+  - app store
+  - play store
+  - push notification
+  - offline
+description: >
+  Mobile application with a Rails 8+ API backend. The frontend is a
+  native or cross-platform mobile app (React Native, Flutter, Swift,
+  Kotlin) that communicates with Rails via JSON API. Rails handles
+  authentication, business logic, data storage, push notifications,
+  file uploads, and background processing.
+
+framework:
+  backend: Rails 8+ (API mode)
+  frontend: React Native (recommended default), Flutter, or native Swift/Kotlin
+  native_ios: Swift / SwiftUI / Xcode
+  native_android: Kotlin / Jetpack Compose
+  auth: Token-based (JWT or Rails session tokens via API)
+  push: Action Notifier or third-party (Firebase Cloud Messaging, APNs)
+  deployment_backend: Kamal 2
+  deployment_mobile: App Store / Google Play
+
+workflow:
+  capabilities:
+    http_routes: true
+    background_work: true
+    email_delivery: true
+    authn: true
+    authz: true
+    seed_data: true
+    accessibility: true
+    native_tests: true
+  native_launch_smoke:
+    ios:
+      entry_globs:
+        - "ios/**/*App.swift"
+        - "**/*App.swift"
+        - "ios/**/*AppDelegate.swift"
+        - "**/*AppDelegate.swift"
+      root_globs:
+        - "ios/**/*View.swift"
+        - "**/*View.swift"
+        - "ios/**/*ViewController.swift"
+        - "**/*ViewController.swift"
+    android:
+      entry_globs:
+        - "android/**/AndroidManifest.xml"
+        - "**/AndroidManifest.xml"
+      root_globs:
+        - "android/**/*Activity.kt"
+        - "android/**/*Activity.java"
+        - "android/**/*Screen.kt"
+        - "android/**/*Screen.java"
+    flutter:
+      entry_globs:
+        - "lib/main.dart"
+      root_globs:
+        - "lib/**/*screen*.dart"
+        - "lib/**/*page*.dart"
+        - "lib/**/*view*.dart"
+        - "lib/**/*widget*.dart"
+
+mcp:
+  capabilities:
+    - database_schema
+    - docs_lookup
+  hints:
+    database_schema:
+      adapter: sqlite3
+      schema_paths: ["db/schema.rb"]
+      migration_paths: ["db/migrate"]
+      model_paths: ["app/models"]
+    docs_lookup:
+      frameworks: ["rails"]
+
+finalization:
+  commands:
+    - bundle install
+    - bin/rails db:prepare
+  checks:
+    - name: Boot check
+      command: "bin/rails runner 'puts Rails.version'"
+      type: custom
+      required: true
+
+verification:
+  checks:
+    - name: Solid stack
+      type: solid_stack
+      required: true
+    - name: Xcode build (iOS)
+      command: "xcodeproj=$(find . -name '*.xcodeproj' -not -path './.build/*' | head -1) && [ -n \"$xcodeproj\" ] && xcodebuild -project \"$xcodeproj\" -scheme \"$(xcodebuild -project \"$xcodeproj\" -list 2>/dev/null | awk '/Schemes:/{found=1; next} found && NF{print; exit}' | xargs)\" -destination 'generic/platform=iOS Simulator' build 2>&1 | tail -5"
+      type: compilation
+      required: true
+      conditional: "ios/**/*.swift"
+    - name: pbxproj file registration
+      command: "ruby -e 'proj = Dir.glob(\"**/*.xcodeproj\").first; exit(0) unless proj; pbx = File.read(File.join(proj, \"project.pbxproj\")); swifts = Dir.glob(\"**/*.swift\").reject{|f| f.include?(\"DerivedData\") || f.include?(\".build\")}; missing = swifts.select{|f| !pbx.include?(File.basename(f))}; if missing.any?; $stderr.puts \"MISSING from pbxproj: #{missing.join(\", \")}\"; exit(1); end'"
+      type: custom
+      required: true
+      conditional: "ios/**/*.swift"
+  setup_commands:
+    - bin/setup
+  boot_command: bin/rails server -p 3000 -d
+  health_checks:
+    - url: "http://localhost:3000/up"
+      expected_status: 200
+    - url: "http://localhost:3000/api/v1/health"
+      expected_status: 200
+  test_command: bin/rails test
+  cleanup_command: kill $(cat tmp/pids/server.pid)
+
+sections:
+  - name: Local Development
+    phase: pipeline
+    labels: ["setup"]
+    description: >
+      Development environment setup. The API backend boots and responds
+      locally with zero external dependencies. If the specification
+      describes native mobile screens (SwiftUI views, React Native
+      components, Flutter widgets), the pipeline MUST include tasks
+      that implement those screens. Verification covers all stacks:
+      API endpoints, native builds, and UI rendering.
+    rails_tools:
+      - bin/setup (Rails default setup script)
+      - SQLite (Rails 8 default, zero-dependency database)
+      - Solid Queue (zero-dependency job backend)
+    guidance:
+      - The bootstrap task (task 0) MUST produce a Rails API backend that starts with bin/rails server
+      - bin/setup MUST run successfully (bundle install + db:prepare) with no manual steps
+      - Use SQLite for development and test databases (Rails 8 default)
+      - Create db/seeds.rb with demo data for all core API resources
+      - Create .env.example listing optional integration variables (none required to boot)
+      - The /up health check MUST respond 200 immediately after bootstrap
+      - Create an API-specific health endpoint (e.g., /api/v1/health) returning JSON
+      - Push notification services MUST degrade gracefully when credentials are absent (log instead of send)
+      - All external service integrations MUST work without ENV vars in development
+      - Do NOT generate tasks for App Store submission, Play Store listing, or production backend hosting during pipeline execution
+    solid_stack_setup: >
+      Rails 8 Solid Queue requires its own SQLite database in development.
+      The bootstrap task MUST configure this correctly or the app will
+      crash when any background job (including push notification delivery)
+      is triggered. Mobile API backends typically need Solid Queue but
+      may skip Solid Cache and Solid Cable unless specifically required.
+
+      Required bootstrap steps for the Solid stack:
+
+      1. Run the install generators for needed components only:
+           bin/rails solid_queue:install
+
+      2. Verify database.yml has entries for ALL environments, not just
+         production. After running the generator, database.yml should
+         include the queue database under development:
+
+           development:
+             primary:
+               <<: *default
+               database: storage/development.sqlite3
+             queue:
+               <<: *default
+               database: storage/development_queue.sqlite3
+               migrations_paths: db/queue_migrate
+
+      3. Verify config/application.rb (not just production.rb) contains
+         the connects_to directive so it applies in all environments:
+           config.solid_queue.connects_to = { database: { writing: :queue } }
+
+      4. Run bin/rails db:prepare to create and load schemas for all
+         databases including queue.
+
+      Common failure mode: The generators sometimes only add database
+      entries under the production section of database.yml, and place
+      connects_to config in config/environments/production.rb only. The
+      bootstrap task MUST verify these exist in the development section
+      and in application.rb (or development.rb) before considering setup
+      complete.
+
+      If the app does not need background jobs, skip Solid Queue entirely
+      rather than installing it and leaving it misconfigured.
+
+      ANTI-PATTERNS — common mistakes AI agents make with Procfile.dev:
+      - Do NOT add `cable: bin/rails solid_cable:start` — there is no such
+        command. Solid Cable polls from within the Puma process.
+      - Do NOT add `cache: bin/rails solid_cache:start` — there is no such
+        command. Solid Cache operates inline within the web process.
+      - Do NOT use bare `tailwindcss:watch` — it exits immediately when
+        stdin is closed (which foreman does). Use `tailwindcss:watch[always]`.
+
+  - name: API Backend
+    phase: pipeline
+    labels: ["backend"]
+    description: >
+      Rails API-mode application serving JSON endpoints to the mobile
+      client. Covers all server-side logic, data storage, and
+      integrations.
+    rails_tools:
+      - ActionController::API
+      - ActiveRecord (models, migrations)
+      - ActiveStorage (file uploads via direct upload)
+      - Solid Queue (background jobs)
+    guidance:
+      - Build the API using the api_service recipe as foundation
+      - Version the API from day one (breaking changes strand old app versions)
+      - Support direct upload to cloud storage for images/videos
+      - Design endpoints for mobile-friendly payloads (minimize round trips)
+      - Include device registration endpoint for push notification tokens
+      - In development, file uploads should work with local disk storage (ActiveStorage local service)
+
+  - name: Screens & Navigation
+    phase: pipeline
+    labels: ["ios", "android", "frontend"]
+    description: >
+      Screen inventory, navigation patterns, tab structure, modals,
+      and deep linking.
+    guidance:
+      - For each screen described in the spec, create the native view file (e.g., SwiftUI View, React Native component). Include navigation, data binding, and API integration.
+      - Implement the navigation hierarchy (tab bar, navigation stack) in the app's root view or App.swift entry point.
+      - Implement deep linking with URL scheme handling.
+      - Each screen task must include a file_exists acceptance criterion for the view file and xcodebuild verification.
+      - Keep navigation depth shallow (3 taps to any core feature).
+
+  - name: Authentication & Session
+    phase: pipeline
+    labels: ["auth", "backend"]
+    description: >
+      User registration, login, token management, biometric auth,
+      and session persistence on device.
+    rails_tools:
+      - Rails 8 authentication generator (adapted for API tokens)
+      - has_secure_password
+      - Custom token generation and refresh logic
+    guidance:
+      - Use short-lived access tokens with longer-lived refresh tokens
+      - Store tokens securely (Keychain on iOS, Keystore on Android)
+      - Support biometric authentication as a convenience layer
+      - Handle token expiry gracefully (auto-refresh, not hard logout)
+      - Plan the "logged out" experience (what's visible without auth)
+      - Seed at least one test user with known credentials in db/seeds.rb for API testing
+
+  - name: Offline & Data Sync
+    phase: pipeline
+    labels: ["backend", "ios", "android"]
+    description: >
+      Local data storage, offline capability, and synchronization
+      strategy with the Rails backend.
+    guidance:
+      - Decide offline strategy early (offline-first vs online-required)
+      - Cache critical data locally for read access when offline
+      - Queue writes locally and sync when connectivity returns
+      - Handle merge conflicts with a clear strategy (last-write-wins, or manual)
+      - Show clear offline/online indicators in the UI
+      - Use ETags or last_modified headers from Rails for efficient sync
+
+  - name: Push Notifications
+    phase: pipeline
+    labels: ["backend"]
+    description: >
+      Notification types, delivery triggers, and device token
+      management.
+    rails_tools:
+      - Solid Queue (trigger notifications from background jobs)
+      - Custom notification service wrapping FCM/APNs
+    guidance:
+      - Register device tokens via API endpoint on app launch
+      - Handle token rotation (devices get new tokens periodically)
+      - Define notification categories with distinct actions
+      - Support notification preferences (user can mute categories)
+      - Test notification delivery on real devices early
+      - In development, stub push delivery to log output when FCM/APNs credentials are absent
+
+  - name: File & Media Handling
+    phase: pipeline
+    labels: ["backend"]
+    description: >
+      Image uploads, camera integration, video, and media display.
+    rails_tools:
+      - ActiveStorage (direct upload from mobile to cloud storage)
+      - Image processing (variants for thumbnails)
+    guidance:
+      - Use ActiveStorage direct upload to avoid proxying through Rails
+      - Generate image variants server-side for different screen densities
+      - Handle camera and photo library permissions explicitly
+      - Compress images client-side before upload on slow connections
+      - Plan for large file uploads with resumable upload support
+      - In development, use ActiveStorage local disk service — no cloud credentials needed
+
+  - name: Testing
+    phase: pipeline
+    labels: ["testing"]
+    description: >
+      Backend API tests and mobile-specific testing strategy. API tests
+      are generated alongside feature tasks and must be runnable locally
+      with zero external dependencies. The spec's GIVEN/WHEN/THEN
+      scenarios are the primary source for integration test cases.
+    rails_tools:
+      - Minitest (default) with request specs
+      - Fixtures or FactoryBot
+    guidance:
+      - Every backend endpoint and mobile screen task MUST ship with at least one relevant automated test or executable experience check derived from the spec's GIVEN/WHEN/THEN scenarios
+      - All API tests MUST pass with bin/rails test using only local resources
+      - No test may depend on network access, deployed services, or production credentials
+      - Test all API endpoints with request specs (see api_service recipe)
+      - Mock push notification services with WebMock — never call real FCM/APNs in tests
+      - Test authentication token lifecycle (issue, refresh, expire, revoke)
+      - Test offline sync scenarios explicitly at the API level (conflict resolution, ETag handling)
+      - Mobile UI tests may be lighter than web system tests, but screen tasks still need executable verification or framework-native UI coverage when the recipe supports it
+      - Use fixtures or factories that mirror db/seeds.rb structure
+
+  - name: Distribution
+    phase: post_pipeline
+    description: >
+      App store submission, beta testing, and update strategy.
+      This section is NOT executed during pipeline iterations. Tasks
+      derived from this section should only be generated after the
+      implementation has passed analysis and the pipeline has converged
+      on a working local build.
+    guidance:
+      - Set up beta distribution early (TestFlight, Google Play Internal Testing)
+      - Plan app store metadata, screenshots, and review guidelines compliance
+      - Implement over-the-air updates for JS bundle (React Native) where possible
+      - Handle forced update flow for breaking API changes
+      - Plan app signing and certificate management from the start
+      - DO NOT generate distribution tasks during pipeline iterations
+
+  - name: Deployment & Infrastructure
+    phase: post_pipeline
+    description: >
+      Production backend deployment and mobile app distribution.
+      This section is NOT executed during pipeline iterations. Tasks
+      derived from this section should only be generated after the
+      implementation has passed analysis.
+    rails_tools:
+      - Kamal 2 (deploy Rails API backend)
+      - Thruster (HTTP/2 proxy with auto SSL)
+      - Rails credentials (encrypted secrets)
+    guidance:
+      - Deploy the Rails API backend with Kamal
+      - Store secrets in Rails encrypted credentials
+      - Use Thruster as the production entry point for SSL and compression
+      - DO NOT generate deployment tasks during pipeline iterations
+      - Deployment configuration is deferred until the project passes all tier gates and analysis

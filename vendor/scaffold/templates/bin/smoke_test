@@ -1,0 +1,308 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# bin/smoke_test — Hit every GET route with seed data IDs, assert no 500s.
+#
+# Dynamically discovers routes from `bin/rails routes` and resolves :id
+# placeholders using seeded database records. No hardcoded model names.
+#
+# Usage:
+#   bin/smoke_test              # Run full smoke test
+#   bin/smoke_test --verbose    # Show each URL and response
+#
+# Requires: Rails app with routes and seed data.
+# Starts its own test server on port 3001 (app must NOT be running there).
+
+require "json"
+require "net/http"
+require "open3"
+require "tempfile"
+require "uri"
+
+VERBOSE = ARGV.include?("--verbose")
+PORT = (ENV["SMOKE_TEST_PORT"] || 3001).to_i
+HOST = "http://127.0.0.1:#{PORT}"
+
+ERROR_SIGNATURES = [
+  "Action Controller: Exception",
+  "AbstractController::ActionNotFound",
+  "ActiveRecord::RecordNotFound",
+  "ActionController::RoutingError",
+  "NameError in",
+  "NoMethodError in",
+  "RuntimeError in",
+  "SyntaxError in",
+  "ArgumentError in",
+  "TypeError in"
+].freeze
+
+ID_RESOLUTION_SCRIPT = <<~RUBY
+  require "json"
+
+  Rails.application.eager_load!
+  ids = {}
+
+  ActiveRecord::Base.descendants.each do |model|
+    next if model.abstract_class?
+    next unless model.table_exists?
+
+    begin
+      first = model.first
+      ids[model.name.underscore] = first.id if first && first.respond_to?(:id)
+    rescue StandardError
+      next
+    end
+  end
+
+  puts JSON.generate(ids)
+RUBY
+
+def log(message)
+  puts message if VERBOSE
+end
+
+def fail_harness!(message, details = nil)
+  warn "HARNESS FAILURE: #{message}"
+  warn details unless details.to_s.strip.empty?
+  exit 1
+end
+
+def run_command!(label, *command, env: {}, allow_empty: false)
+  stdout, stderr, status = Open3.capture3(env, *command)
+  log("#{label}: #{command.join(' ')}")
+
+  unless status.success?
+    fail_harness!(
+      "#{label} failed with exit #{status.exitstatus}",
+      [stdout, stderr].reject(&:empty?).join("\n")
+    )
+  end
+
+  output = stdout.to_s.strip
+  if output.empty? && !allow_empty
+    fail_harness!("#{label} produced no output", stderr)
+  end
+
+  output
+end
+
+def discover_routes
+  log "Discovering routes via bin/rails routes..."
+  raw = run_command!("Route discovery", "bin/rails", "routes", allow_empty: true)
+  fail_harness!("Route discovery returned no output", "Run `bin/rails routes` manually to inspect the app state.") if raw.empty?
+
+  routes = []
+  raw.each_line do |line|
+    match = line.match(/\s+GET\s+(\/\S+?)(?:\(\.:format\))?\s+/)
+    next unless match
+
+    path = match[1]
+    next if path.start_with?("/rails/", "/cable", "/assets")
+
+    routes << path
+  end
+
+  routes.unshift("/") unless routes.include?("/")
+  routes = routes.uniq
+  fail_harness!("Route discovery found no usable GET routes", raw) if routes.empty?
+  routes
+end
+
+def seed_database
+  log "Seeding test database..."
+  run_command!(
+    "Seed database",
+    "bin/rails", "db:prepare", "db:seed",
+    env: { "RAILS_ENV" => "test" },
+    allow_empty: true
+  )
+end
+
+def resolve_seed_ids
+  log "Resolving seed data IDs from database..."
+  output = run_command!(
+    "Seed ID resolution",
+    "bin/rails", "runner", ID_RESOLUTION_SCRIPT,
+    env: { "RAILS_ENV" => "test" }
+  )
+
+  JSON.parse(output)
+rescue JSON::ParserError => e
+  fail_harness!("Seed ID resolution returned invalid JSON", "#{e.message}\n#{output}")
+end
+
+def singularize(segment)
+  return "#{segment[0..-4]}y" if segment.end_with?("ies") && segment.length > 4
+  return segment[0..-2] if segment.end_with?("s") && !segment.end_with?("ss")
+
+  segment
+end
+
+def substitute_ids(path, seed_ids)
+  result = path.dup
+
+  result.gsub!(/:(\w+)_id/) do
+    model_name = Regexp.last_match(1)
+    (seed_ids[model_name] || 1).to_s
+  end
+
+  if result.include?(":id")
+    segments = result.split("/")
+    id_index = segments.index(":id")
+    if id_index && id_index > 0
+      resource = singularize(segments[id_index - 1].to_s)
+      result.sub!(":id", (seed_ids[resource] || 1).to_s)
+    else
+      result.sub!(":id", "1")
+    end
+  end
+
+  result.gsub(/:(\w+)/, "1")
+end
+
+def server_ready?(path)
+  response = Net::HTTP.get_response(URI("#{HOST}#{path}"))
+  response.is_a?(Net::HTTPSuccess) || response.is_a?(Net::HTTPRedirection)
+rescue Errno::ECONNREFUSED, Errno::EADDRNOTAVAIL, Net::OpenTimeout, Net::ReadTimeout
+  false
+end
+
+def start_server
+  log "Starting test server on port #{PORT}..."
+  stdout_log = Tempfile.new(["smoke-test-server-out", ".log"])
+  stderr_log = Tempfile.new(["smoke-test-server-err", ".log"])
+
+  pid = spawn(
+    { "RAILS_ENV" => "test", "PORT" => PORT.to_s, "RAILS_LOG_TO_STDOUT" => "0" },
+    "bin/rails", "server", "-p", PORT.to_s, "-b", "127.0.0.1",
+    out: stdout_log.path, err: stderr_log.path
+  )
+
+  30.times do
+    return [pid, stdout_log, stderr_log] if server_ready?("/up") || server_ready?("/")
+
+    waited = Process.waitpid(pid, Process::WNOHANG)
+    if waited
+      details = [
+        "stdout:",
+        File.read(stdout_log.path, encoding: "UTF-8"),
+        "stderr:",
+        File.read(stderr_log.path, encoding: "UTF-8")
+      ].join("\n")
+      fail_harness!("Server exited before becoming ready", details)
+    end
+
+    sleep 1
+  end
+
+  details = [
+    "stdout:",
+    File.read(stdout_log.path, encoding: "UTF-8"),
+    "stderr:",
+    File.read(stderr_log.path, encoding: "UTF-8")
+  ].join("\n")
+  fail_harness!("Server failed to start within 30 seconds on port #{PORT}", details)
+end
+
+def stop_server(pid, stdout_log, stderr_log)
+  Process.kill("TERM", pid)
+  Process.wait(pid)
+rescue Errno::ESRCH, Errno::ECHILD
+  nil
+ensure
+  stdout_log&.close!
+  stderr_log&.close!
+end
+
+def check_route(url, name)
+  uri = URI(url)
+  http = Net::HTTP.new(uri.host, uri.port)
+  http.open_timeout = 5
+  http.read_timeout = 10
+
+  response = http.request(Net::HTTP::Get.new(uri.request_uri))
+  status = response.code.to_i
+
+  if status >= 500
+    return { url: url, name: name, status: status, pass: false, reason: "Server error (#{status})" }
+  end
+
+  if status == 200 && response.body
+    error_found = ERROR_SIGNATURES.find { |signature| response.body.include?(signature) }
+    if error_found
+      return {
+        url: url,
+        name: name,
+        status: status,
+        pass: false,
+        reason: "Rails error page: #{error_found}"
+      }
+    end
+  end
+
+  if [200, 301, 302].include?(status)
+    { url: url, name: name, status: status, pass: true, reason: "OK" }
+  else
+    { url: url, name: name, status: status, pass: false, reason: "Unexpected status #{status}" }
+  end
+rescue Net::OpenTimeout, Net::ReadTimeout => e
+  { url: url, name: name, status: 0, pass: false, reason: "Timeout: #{e.message}" }
+rescue StandardError => e
+  { url: url, name: name, status: 0, pass: false, reason: e.message }
+end
+
+puts "Route Smoke Test"
+puts "=" * 60
+
+route_patterns = discover_routes
+log "Found #{route_patterns.size} GET route patterns"
+
+seed_database
+seed_ids = resolve_seed_ids
+log "Resolved IDs for: #{seed_ids.keys.join(', ')}" if seed_ids.any?
+
+routes = route_patterns.map do |pattern|
+  concrete_path = substitute_ids(pattern, seed_ids)
+  fail_harness!("Route substitution produced malformed path", "#{pattern} -> #{concrete_path}") unless concrete_path.start_with?("/")
+
+  { url: "#{HOST}#{concrete_path}", name: pattern }
+end
+
+puts "Testing #{routes.size} routes..."
+puts ""
+
+pid, stdout_log, stderr_log = start_server
+
+begin
+  results = routes.map do |route|
+    result = check_route(route[:url], route[:name])
+    status_label = result[:pass] ? "PASS" : "FAIL"
+    if VERBOSE || !result[:pass]
+      puts "  #{status_label}  #{result[:status]}  #{route[:name]}  #{result[:reason] unless result[:pass]}"
+    end
+    result
+  end
+ensure
+  stop_server(pid, stdout_log, stderr_log)
+end
+
+passed = results.count { |result| result[:pass] }
+failed = results.reject { |result| result[:pass] }
+
+puts ""
+puts "Results: #{passed}/#{results.size} passed"
+
+if failed.any?
+  puts ""
+  puts "FAILURES:"
+  failed.each do |failure|
+    puts "  #{failure[:name]}: #{failure[:reason]} [HTTP #{failure[:status]}]"
+    puts "    URL: #{failure[:url]}"
+  end
+  puts ""
+  puts "SMOKE TEST FAILED"
+  exit 1
+else
+  puts "ALL ROUTES OK"
+  exit 0
+end

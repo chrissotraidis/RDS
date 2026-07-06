@@ -1,0 +1,20 @@
+---
+slug: jobs-arq
+name: ARQ background jobs
+status: ready
+default: false
+applies_to:
+- python-ai-service
+description: ARQ background job default for Python services.
+install:
+  command: bin/rds-skill-materialize jobs-arq
+verify:
+  command: bin/rds-skill-verify jobs-arq
+maturity: beta
+category: jobs
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should
+  understand during stack selection, skill resolution, implementation guidance, or
+  verification.
+source_links:
+- label: arq-docs.helpmanual.io
+  url: https://arq-docs.helpmanual.io/

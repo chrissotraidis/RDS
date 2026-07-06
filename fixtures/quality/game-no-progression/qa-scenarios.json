@@ -1,0 +1,23 @@
+{
+  "schema": "rds.qa.scenarios.v1",
+  "scenarios": [
+    {
+      "title": "Start a playable session",
+      "objective": "Start changes game state.",
+      "actions": [{ "type": "click", "target": "Start game" }],
+      "expectations": [{ "type": "state-change" }]
+    },
+    {
+      "title": "Move the player",
+      "objective": "Keyboard controls change position.",
+      "actions": [{ "type": "press", "key": "ArrowRight" }, { "type": "press", "key": "ArrowDown" }],
+      "expectations": [{ "type": "state-change" }]
+    },
+    {
+      "title": "Reach failure or restart loop",
+      "objective": "Game has pressure and restart.",
+      "actions": [{ "type": "wait", "ms": 1000 }, { "type": "press", "key": "KeyR" }],
+      "expectations": [{ "type": "text", "value": "restart" }]
+    }
+  ]
+}

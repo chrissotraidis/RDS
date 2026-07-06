@@ -1,0 +1,18 @@
+---
+slug: jobs-trigger-dev
+name: Trigger.dev jobs
+status: curated
+category: jobs
+maturity: beta
+applies_to:
+- nextjs-fullstack
+- python-ai-service
+description: Trigger.dev background jobs integration contract.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: trigger.dev
+  url: https://trigger.dev/docs
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# bin/rds-dashboard-keepalive — cron-friendly "is the dashboard up? if not, start it" check.
+#
+# Add to crontab as:
+#   * * * * * /home/workspace/Programs/RDS/bin/rds-dashboard-keepalive >>/dev/shm/rds-dashboard-keepalive.log 2>&1
+#   @reboot   /home/workspace/Programs/RDS/bin/rds-dashboard-keepalive >>/dev/shm/rds-dashboard-keepalive.log 2>&1
+#
+# Reads RDS_DASHBOARD_TOKEN from $ROOT/.env if not in the env. Idempotent —
+# safe to run every minute.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PIDFILE="/dev/shm/rds-dashboard.pid"
+PORT="${PORT:-4000}"
+
+# Already alive? Exit silently. Two reasons it might be:
+#   1. our own setsid+nohup detach (PID file present)
+#   2. Zo's hosted-service supervisor (no PID file, but port 4000 responds)
+if [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
+  exit 0
+fi
+if curl -fsS --max-time 3 "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1; then
+  # The dashboard's unauthenticated health endpoint is alive. This also works
+  # when "/" correctly returns 401 behind Basic Auth.
+  # Refuse to start a duplicate that would EADDRINUSE.
+  exit 0
+fi
+
+# Hydrate env from .env (dashboard token, RDS_OPERATOR, etc).
+if [[ -f "$ROOT/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "$ROOT/.env"
+  set +a
+fi
+
+export PORT RDS_ROOT="$ROOT"
+
+ts="$(date -u +%FT%TZ)"
+echo "[$ts] keepalive: dashboard not running, restarting…"
+
+if "$ROOT/bin/rds-dashboard" --detach; then
+  echo "[$ts] keepalive: started"
+
+  # Best-effort: also bring the watchdog up so stuck builds get auto-fixed.
+  if [[ -x "$ROOT/bin/rds-watchdog" ]]; then
+    "$ROOT/bin/rds-watchdog" --status >/dev/null 2>&1 || \
+      "$ROOT/bin/rds-watchdog" --detach >/dev/null 2>&1 || true
+  fi
+else
+  echo "[$ts] keepalive: FAILED to start dashboard"
+  exit 1
+fi

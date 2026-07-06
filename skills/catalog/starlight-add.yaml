@@ -1,0 +1,17 @@
+---
+slug: starlight-add
+name: Astro Starlight
+status: curated
+category: content
+maturity: stable
+applies_to:
+- astro-thin-web
+description: Astro Starlight docs-site capability.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: starlight.astro.build
+  url: https://starlight.astro.build/
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

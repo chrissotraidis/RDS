@@ -1,0 +1,48 @@
+---
+slug: mobile-native
+runtime_id: react-native
+name: React Native / Expo
+description: Expo-backed native mobile stack with QR/tunnel preview and web-export
+  fallback.
+category: mobile
+v1_status: ship
+priority: 8
+language:
+  primary: typescript
+framework:
+  name: expo
+  version: latest
+scaffold:
+  command: stacks/react-native/init.sh
+commands:
+  install: bun install
+  run: bun preview-server.ts
+  test: bun run check
+  doctor: stacks/react-native/doctor.sh
+ports:
+  range:
+  - 4000
+  - 4099
+health_path: "/health.json"
+deploy:
+  preview_on_zo: durable-zo-http-service
+  default_external: eas-build
+mockup_analog:
+  primary: screens-folder
+public_preview_model:
+  type: device-tunnel
+compatible_skills:
+  primary:
+  - expo-skills-mount
+  - expo-router-codegen
+  - qr-tunnel-publisher
+  universal:
+  - rds-context7-mount
+  - rds-mockup-fidelity
+  - rds-secrets-broker
+  - rds-eval-harness
+  - playwright-mcp
+agent_notes:
+  primary: claude-code
+aliases:
+- react-native

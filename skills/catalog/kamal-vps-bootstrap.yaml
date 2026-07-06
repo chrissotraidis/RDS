@@ -1,0 +1,17 @@
+---
+slug: kamal-vps-bootstrap
+name: Kamal VPS bootstrap
+status: curated
+category: deploy
+maturity: stable
+applies_to:
+- rails-web
+description: Kamal 2 VPS deployment bootstrap for Rails.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: kamal-deploy.org
+  url: https://kamal-deploy.org/
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

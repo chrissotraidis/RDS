@@ -1,0 +1,43 @@
+{
+  "id": "browser-extension",
+  "name": "Browser extension",
+  "language": "typescript",
+  "runtime": {
+    "bun": ">=1.1.0",
+    "node": ">=20"
+  },
+  "framework": {
+    "name": "wxt",
+    "version": "latest"
+  },
+  "database": "none",
+  "default_port_range": [
+    4000,
+    4099
+  ],
+  "health_path": "/health.json",
+  "stages": [
+    "intake",
+    "spec",
+    "init",
+    "scaffold",
+    "local-run",
+    "deploy",
+    "qa"
+  ],
+  "init": "stacks/browser-extension/init.sh",
+  "local_run": "stacks/browser-extension/local-run.sh",
+  "doctor": "stacks/browser-extension/doctor.sh",
+  "scaffold_recipe": "browser_extension",
+  "service_entrypoint": "bash -c 'bun install --frozen-lockfile || bun install; bun run build:extension; exec bun preview-server.ts'",
+  "service_env": {
+    "NODE_ENV": "development",
+    "RDS_RUNTIME": "zo"
+  },
+  "supports_modes": [
+    "green",
+    "brown"
+  ],
+  "status": "ready",
+  "notes": "Ready V1 Phase 1b stack for Chrome MV3 browser extensions using WXT plus a Zo-served popup preview and zip artifact."
+}

@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title><%= h(project_name) %> — Mockup Preview</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3/dist/cdn.min.js"></script>
+  <style>[x-cloak] { display: none !important; }</style>
+</head>
+<body class="bg-gray-50 min-h-screen" x-data="mockupApp()" x-cloak>
+
+  <!-- Mockup banner -->
+  <div class="bg-amber-50 border-b border-amber-200 px-4 py-2 text-xs text-amber-800 text-center">
+    Lo-fi mockup preview — structural only. The build pipeline produces the
+    high-fidelity mock from <code class="font-mono">mockup-manifest.json</code>.
+  </div>
+
+  <!-- Role / entry selector -->
+  <div x-show="!loggedIn" class="min-h-screen flex items-center justify-center bg-gradient-to-br from-indigo-500 to-purple-600">
+    <div class="bg-white rounded-xl shadow-2xl p-8 w-full max-w-sm">
+      <h1 class="text-2xl font-bold text-gray-800 mb-1"><%= h(project_name) %></h1>
+      <p class="text-sm text-gray-500 mb-6">Mockup preview</p>
+      <div class="space-y-3">
+        <label class="block text-sm font-medium text-gray-700">Enter as</label>
+        <select x-model="currentRole" class="w-full px-3 py-2 border border-gray-300 rounded-md text-sm">
+          <% roles.each do |role| -%>
+          <option value="<%= h(role) %>"><%= h(role.capitalize) %></option>
+          <% end -%>
+        </select>
+        <button @click="login()" class="w-full bg-indigo-600 text-white py-2.5 rounded-md font-medium hover:bg-indigo-700">
+          Continue as <span x-text="currentRole" class="capitalize"></span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+<% layout_type = (layout["type"] || "sidebar").to_s.downcase -%>
+
+  <!-- App shell — layout.type: <%= h(layout_type) %> -->
+  <% case layout_type
+     when "top_nav" -%>
+
+  <div x-show="loggedIn" class="min-h-screen flex flex-col" x-cloak>
+    <header class="bg-white border-b border-gray-200 sticky top-0 z-10">
+      <div class="px-6 py-3 flex items-center justify-between gap-6">
+        <h2 class="font-bold text-gray-900 text-sm whitespace-nowrap"><%= h(project_name) %></h2>
+        <nav class="flex-1 flex flex-wrap gap-1">
+          <template x-for="item in nav[currentRole] || []" :key="item.screen_id">
+            <button
+              @click="navigate(item.screen_id)"
+              :class="currentScreen === item.screen_id
+                ? 'bg-indigo-50 text-indigo-700'
+                : 'text-gray-600 hover:bg-gray-50'"
+              class="px-3 py-1.5 text-sm font-medium rounded-md transition-colors"
+              x-text="item.label">
+            </button>
+          </template>
+        </nav>
+        <div class="flex items-center gap-2 shrink-0">
+          <% if roles.size > 1 -%>
+          <select x-model="currentRole" @change="onRoleChange()" class="px-2 py-1 border border-gray-300 rounded text-xs">
+            <% roles.each do |role| -%>
+            <option value="<%= h(role) %>"><%= h(role.capitalize) %></option>
+            <% end -%>
+          </select>
+          <% end -%>
+          <button @click="logout()" class="text-xs text-gray-500 hover:text-gray-700">Log out</button>
+        </div>
+      </div>
+    </header>
+    <main class="flex-1 overflow-y-auto">
+      <div class="p-6">
+        <div class="flex items-center justify-between mb-4">
+          <h1 class="text-lg font-semibold text-gray-900" x-text="screenName()"></h1>
+          <div class="text-xs text-gray-400" x-text="currentScreen"></div>
+        </div>
+        <% screens.each do |screen| -%>
+        <div x-show="currentScreen === '<%= h(screen["id"]) %>'" x-cloak>
+          <%= render_screen(screen) %>
+        </div>
+        <% end -%>
+      </div>
+    </main>
+  </div>
+
+  <% when "bottom_tabs" -%>
+
+  <!-- Mobile phone chrome to make the bottom-tab layout feel intentional on desktop. -->
+  <div x-show="loggedIn" class="min-h-screen flex justify-center bg-gray-100 py-4" x-cloak>
+    <div class="w-full max-w-md flex flex-col bg-white border border-gray-200 rounded-xl shadow-sm overflow-hidden min-h-[640px]">
+      <header class="bg-white border-b border-gray-200 px-4 py-3 flex items-center justify-between">
+        <div>
+          <h1 class="text-base font-semibold text-gray-900" x-text="screenName()"></h1>
+          <p class="text-xs text-gray-400">Mockup · <span x-text="currentRole" class="capitalize"></span></p>
+        </div>
+        <div class="flex items-center gap-2">
+          <% if roles.size > 1 -%>
+          <select x-model="currentRole" @change="onRoleChange()" class="px-2 py-1 border border-gray-300 rounded text-xs">
+            <% roles.each do |role| -%>
+            <option value="<%= h(role) %>"><%= h(role.capitalize) %></option>
+            <% end -%>
+          </select>
+          <% end -%>
+          <button @click="logout()" class="text-xs text-gray-500 hover:text-gray-700">Log out</button>
+        </div>
+      </header>
+      <main class="flex-1 overflow-y-auto p-4 pb-4">
+        <% screens.each do |screen| -%>
+        <div x-show="currentScreen === '<%= h(screen["id"]) %>'" x-cloak>
+          <%= render_screen(screen) %>
+        </div>
+        <% end -%>
+      </main>
+      <nav class="border-t border-gray-200 bg-white">
+        <div class="flex">
+          <template x-for="item in (nav[currentRole] || []).slice(0, 5)" :key="item.screen_id">
+            <button
+              @click="navigate(item.screen_id)"
+              :class="currentScreen === item.screen_id ? 'text-indigo-700' : 'text-gray-500 hover:text-gray-700'"
+              class="flex-1 py-3 text-xs font-medium"
+              x-text="item.label">
+            </button>
+          </template>
+        </div>
+      </nav>
+    </div>
+  </div>
+
+  <% else -%>
+
+  <!-- Default: sidebar layout -->
+  <div x-show="loggedIn" class="flex h-screen" x-cloak>
+    <aside class="w-64 bg-white border-r border-gray-200 flex flex-col shrink-0">
+      <div class="p-4 border-b border-gray-200">
+        <h2 class="font-bold text-gray-900 text-sm"><%= h(project_name) %></h2>
+        <p class="text-xs text-gray-400 mt-0.5">Mockup · <span x-text="currentRole" class="capitalize"></span></p>
+      </div>
+      <nav class="flex-1 py-2 overflow-y-auto">
+        <template x-for="item in nav[currentRole] || []" :key="item.screen_id">
+          <button
+            @click="navigate(item.screen_id)"
+            :class="currentScreen === item.screen_id
+              ? 'bg-indigo-50 text-indigo-700 border-r-2 border-indigo-600'
+              : 'text-gray-600 hover:bg-gray-50'"
+            class="w-full text-left px-4 py-2 text-sm font-medium transition-colors"
+            x-text="item.label">
+          </button>
+        </template>
+      </nav>
+      <div class="p-3 border-t border-gray-200 space-y-2">
+        <% if roles.size > 1 -%>
+        <select x-model="currentRole" @change="onRoleChange()" class="w-full px-2 py-1 border border-gray-300 rounded text-xs">
+          <% roles.each do |role| -%>
+          <option value="<%= h(role) %>"><%= h(role.capitalize) %></option>
+          <% end -%>
+        </select>
+        <% end -%>
+        <button @click="logout()" class="text-xs text-gray-500 hover:text-gray-700">Log out</button>
+      </div>
+    </aside>
+    <main class="flex-1 overflow-y-auto">
+      <header class="bg-white border-b border-gray-200 px-6 py-4 flex items-center justify-between">
+        <h1 class="text-lg font-semibold text-gray-900" x-text="screenName()"></h1>
+        <div class="text-xs text-gray-400" x-text="currentScreen"></div>
+      </header>
+      <div class="p-6">
+        <% screens.each do |screen| -%>
+        <div x-show="currentScreen === '<%= h(screen["id"]) %>'" x-cloak>
+          <%= render_screen(screen) %>
+        </div>
+        <% end -%>
+      </div>
+    </main>
+  </div>
+
+  <% end -%>
+
+  <script>
+    function mockupApp() {
+      return {
+        loggedIn: false,
+        currentRole: '<%= h(roles.first) %>',
+        currentScreen: '<%= h(initial_screen) %>',
+        nav: <%= nav_for_js.to_json %>,
+        screens: <%= screens_for_js.to_json %>,
+        login() {
+          this.loggedIn = true;
+          const roleNav = this.nav[this.currentRole] || [];
+          const target = roleNav[0] && roleNav[0].screen_id;
+          if (target) { this.currentScreen = target; window.location.hash = target; }
+        },
+        logout() { this.loggedIn = false; window.location.hash = ''; },
+        navigate(id) {
+          this.currentScreen = id;
+          window.location.hash = id;
+        },
+        onRoleChange() {
+          const roleNav = this.nav[this.currentRole] || [];
+          const target = roleNav[0] && roleNav[0].screen_id;
+          if (target) this.navigate(target);
+        },
+        screenName() {
+          const s = this.screens.find(x => x.id === this.currentScreen);
+          return s ? s.name : this.currentScreen;
+        },
+        init() {
+          const hash = window.location.hash.slice(1);
+          if (hash) {
+            this.currentScreen = hash;
+            this.loggedIn = true;
+          }
+        }
+      }
+    }
+  </script>
+</body>
+</html>

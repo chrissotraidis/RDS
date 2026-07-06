@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# bin/rds-intake — resolves an input trigger to a local markdown file.
+#
+# Green-field (research → research.md):
+#   ./bin/rds-intake --mode=green --trigger=<notion-url|md-path> --out=<path>
+#
+# Brown-field (PRD → spec.md):
+#   ./bin/rds-intake --mode=brown --prd-source=<notion-url|md-path|raw-github-url> --out=<path>
+#
+# Notion URLs are NOT fetched here. Claude Code on Zo must pre-fetch them via
+# the Notion MCP (MCP is scoped to Claude, not shell subprocesses) and write
+# the result to --out BEFORE invoking rds-build. This script sanity-checks
+# that the file landed.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck disable=SC1091
+source "$ROOT/bin/lib/common.sh"
+# shellcheck disable=SC1091
+source "$ROOT/bin/lib/logging.sh"
+
+MODE="$(parse_flag --mode "$@")"
+OUT="$(parse_flag --out  "$@")"
+
+case "$MODE" in
+  green) SRC="$(parse_flag --trigger     "$@")" ;;
+  brown) SRC="$(parse_flag --prd-source  "$@")" ;;
+  *) echo "FATAL: --mode must be green or brown" >&2; exit 1 ;;
+esac
+
+[[ -n "$OUT" ]] || { echo "FATAL: --out is required" >&2; exit 1; }
+mkdir -p "$(dirname "$OUT")"
+
+resolve_to_markdown() {
+  local src="$1" dest="$2"
+
+  # 1. Local file — copy (unless dest is the same file).
+  if [[ -f "$src" ]]; then
+    if [[ "$(cd "$(dirname "$src")" && pwd)/$(basename "$src")" \
+       != "$(cd "$(dirname "$dest")" && pwd)/$(basename "$dest")" ]]; then
+      cp "$src" "$dest"
+    fi
+    log "resolved local file → $dest"
+    return 0
+  fi
+
+  # 2. Raw GitHub URL — curl.
+  if [[ "$src" =~ ^https?://raw\.githubusercontent\.com/ ]] || \
+     [[ "$src" =~ ^https?://github\.com/.+/raw/ ]]; then
+    log "fetching raw GitHub URL $src"
+    curl -fsSL "$src" -o "$dest"
+    return 0
+  fi
+
+  # 3. Notion URL — MUST be pre-fetched by Claude Code via Notion MCP.
+  if [[ "$src" =~ notion\.so ]] || [[ "$src" =~ notion\.site ]]; then
+    if [[ ! -s "$dest" ]]; then
+      cat >&2 <<EOF
+FATAL: source is a Notion URL but $dest is empty.
+
+Notion MCP access is scoped to the Claude Code process, not to shell
+subprocesses. AGENT.md (§4 green-field intake / §5 brown-field intake)
+requires Claude Code to fetch the Notion page via MCP and write it to
+$dest BEFORE invoking bin/rds-build.
+
+URL: $src
+EOF
+      exit 2
+    fi
+    log "accepted pre-fetched Notion content at $dest"
+    return 0
+  fi
+
+  cat >&2 <<EOF
+FATAL: unrecognized source: $src
+Supported forms:
+  - local .md file path
+  - Notion URL (pre-fetched by Claude Code before invoking rds-build)
+  - raw GitHub URL (https://raw.githubusercontent.com/... or .../raw/...)
+EOF
+  exit 1
+}
+
+resolve_to_markdown "$SRC" "$OUT"
+
+# --- Sanity: non-empty markdown ---------------------------------------------
+[[ -s "$OUT" ]] || { echo "FATAL: $OUT is empty after resolution" >&2; exit 3; }
+if ! head -n1 "$OUT" | grep -q '.'; then
+  echo "FATAL: $OUT has no content on its first line" >&2
+  exit 3
+fi
+
+log "intake ok ($MODE) — $OUT ($(wc -l < "$OUT") lines)"

@@ -1,0 +1,27 @@
+---
+slug: analytics-posthog
+name: PostHog analytics
+status: ready
+default: false
+applies_to:
+- rails-web
+- nextjs-fullstack
+- python-ai-service
+- astro-thin-web
+- web-3d
+- game-engine
+- mobile-native
+- browser-extension
+description: Adds the product analytics and event instrumentation contract.
+install:
+  command: bin/rds-skill-materialize analytics-posthog
+verify:
+  command: bin/rds-skill-verify analytics-posthog
+maturity: operational
+category: analytics
+rationale: Product builds need explicit event definitions, not random tracking snippets. This skill makes analytics intentional and keeps credentials environment-driven.
+source_links:
+- label: PostHog Docs
+  url: https://posthog.com/docs
+- label: PostHog JavaScript Web SDK
+  url: https://posthog.com/docs/libraries/js

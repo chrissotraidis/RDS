@@ -1,0 +1,20 @@
+---
+slug: rds-usd-validator
+name: RDS USD validator
+status: ready
+default: true
+applies_to:
+- game-asset-pipeline
+description: Adds USD/glTF validation expectations for asset pipeline builds.
+install:
+  mode: metadata
+verify:
+  command: skills/built-in/rds-usd-validator/scripts/verify.sh
+maturity: operational
+category: asset-pipeline
+rationale: Default asset-pipeline skill because 3D assets need deterministic validation before preview or handoff.
+source_links:
+- label: openusd.org
+  url: https://openusd.org/release/toolset.html
+- label: Khronos glTF Validator
+  url: https://github.khronos.org/glTF-Validator/

@@ -1,0 +1,20 @@
+---
+slug: solid-queue-doctor
+name: Solid Queue doctor
+status: ready
+default: false
+applies_to:
+- rails-web
+description: Solid Queue schema and runtime health checks.
+install:
+  command: bin/rds-skill-materialize solid-queue-doctor
+verify:
+  command: bin/rds-skill-verify solid-queue-doctor
+maturity: stable
+category: jobs
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should
+  understand during stack selection, skill resolution, implementation guidance, or
+  verification.
+source_links:
+- label: guides.rubyonrails.org
+  url: https://guides.rubyonrails.org/active_job_basics.html#solid-queue

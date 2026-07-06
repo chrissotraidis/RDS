@@ -1,0 +1,20 @@
+---
+slug: partial-prerendering-skill
+name: Partial prerendering
+status: ready
+default: false
+applies_to:
+- nextjs-fullstack
+description: Next.js partial prerendering setup metadata.
+install:
+  command: bin/rds-skill-materialize partial-prerendering-skill
+verify:
+  command: bin/rds-skill-verify partial-prerendering-skill
+maturity: experimental
+category: performance
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should
+  understand during stack selection, skill resolution, implementation guidance, or
+  verification.
+source_links:
+- label: nextjs.org
+  url: https://nextjs.org/docs

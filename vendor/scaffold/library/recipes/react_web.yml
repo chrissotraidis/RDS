@@ -1,0 +1,104 @@
+name: React Web App
+type: react_web
+keywords:
+  - react
+  - vite
+  - spa
+  - game
+  - browser game
+  - frontend
+  - dashboard
+  - web app
+  - interactive
+description: >
+  Browser-native React application built with Vite, TypeScript, and Bun.
+  Use this for games, interactive tools, dashboards, prototypes, and SPAs
+  that should deploy as a Zo HTTP service without a Rails backend.
+
+framework:
+  primary: React
+  bundler: Vite
+  language: TypeScript
+  runtime: Bun
+  styling: CSS modules or plain CSS unless the existing starter already includes another system
+  deployment: Zo HTTP service
+
+workflow:
+  capabilities:
+    browser_ui: true
+    client_state: true
+    canvas: true
+    accessibility: true
+    native_tests: false
+    http_routes: false
+    background_work: false
+    database: false
+
+finalization:
+  commands:
+    - bun install
+    - bun run build
+  checks:
+    - name: Vite build
+      command: bun run build
+      type: compilation
+      required: true
+
+verification:
+  setup_commands:
+    - bun install
+  boot_command: bun run dev --host 0.0.0.0 --port 3000
+  health_checks:
+    - url: "http://localhost:3000/"
+      expected_status: 200
+  test_command: bun run build
+
+sections:
+  - name: Local Development
+    phase: pipeline
+    labels: ["setup"]
+    description: >
+      The app must remain a bootable Vite React project. The first task should
+      verify the starter, run dependency installation, and keep the dev server
+      command intact.
+    guidance:
+      - Do not replace the project with Rails, Next.js, or another framework.
+      - Keep package.json scripts: dev, build, preview.
+      - The root page must render useful UI immediately at /.
+      - All required assets must live inside the project tree.
+      - External services must be optional and gracefully skipped when env vars are missing.
+
+  - name: Core Experience
+    phase: pipeline
+    labels: ["frontend", "interaction"]
+    description: >
+      Implement the primary user-facing experience from the PRD. For games,
+      this includes the game loop, controls, scoring, pause/restart states,
+      and responsive layout.
+    guidance:
+      - Build the actual usable app, not a marketing page.
+      - Use React state and effects deliberately; isolate game/domain logic from view code when complexity grows.
+      - Keep controls touch-friendly on mobile and keyboard-friendly on desktop.
+      - Avoid text-heavy instruction panels unless the PRD explicitly requires them.
+
+  - name: Visual System
+    phase: pipeline
+    labels: ["frontend", "design"]
+    description: >
+      Define the visual language, layout, and responsive behavior.
+    guidance:
+      - Make the first viewport immediately communicate the app/game state.
+      - Use stable dimensions for boards, canvases, toolbars, and counters so layout does not jump.
+      - Check mobile and desktop viewports before finalization.
+      - Do not use decorative gradients or generic landing-page composition for tools or games.
+
+  - name: Quality
+    phase: pipeline
+    labels: ["qa", "accessibility"]
+    description: >
+      Verify the browser app compiles, boots, and can be exercised by Playwright.
+    guidance:
+      - bun run build must pass.
+      - The app must return 200 at /.
+      - Primary controls must be clickable/tappable and keyboard accessible where applicable.
+      - Fix console errors before declaring the build complete.

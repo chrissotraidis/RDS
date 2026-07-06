@@ -1,0 +1,248 @@
+#!/usr/bin/env bash
+# bin/rds-qa-verdict — produce a spec-coverage verdict for a Playwright QA iteration.
+#
+# Usage:
+#   bin/rds-qa-verdict <build-id> --iteration=N
+#
+# Writes:
+#   builds/<id>/playwright/iter-NNN/spec-verdict.json
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck disable=SC1091
+source "$ROOT/bin/lib/common.sh"
+
+BUILD_ID="${1:-}"
+if [[ -z "$BUILD_ID" || "${BUILD_ID:0:2}" == "--" ]]; then
+  echo "Usage: bin/rds-qa-verdict <build-id> --iteration=N" >&2
+  exit 2
+fi
+shift || true
+
+ITERATION="$(parse_flag --iteration "$@" || echo "")"
+[[ -n "$ITERATION" ]] || { echo "FATAL: --iteration is required" >&2; exit 2; }
+if [[ "$ITERATION" =~ ^iter-[0-9]+$ ]]; then
+  ITER_NAME="$ITERATION"
+elif [[ "$ITERATION" =~ ^[0-9]+$ ]]; then
+  ITER_NAME="$(printf 'iter-%03d' "$ITERATION")"
+else
+  echo "FATAL: invalid --iteration=$ITERATION" >&2
+  exit 2
+fi
+
+BUILD_DIR="$RDS_BUILDS_DIR/$BUILD_ID"
+ITER_DIR="$BUILD_DIR/playwright/$ITER_NAME"
+[[ -d "$ITER_DIR" ]] || { echo "FATAL: iteration not found: $ITER_DIR" >&2; exit 2; }
+
+python3 - "$ROOT" "$BUILD_ID" "$BUILD_DIR" "$ITER_DIR" <<'PY'
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+build_id = sys.argv[2]
+build_dir = Path(sys.argv[3])
+iter_dir = Path(sys.argv[4])
+out = iter_dir / "spec-verdict.json"
+
+def read_text(path: Path, limit: int = 500_000) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="ignore")[:limit]
+    except Exception:
+        return ""
+
+def read_json(path: Path):
+    try:
+        return json.loads(read_text(path))
+    except Exception:
+        return None
+
+state = read_json(build_dir / "state.json") or {}
+summary = read_json(iter_dir / "summary.json") or {}
+gaps = read_json(iter_dir / "gaps.json") or []
+app_dest = Path(state.get("app_dest") or build_dir / "scaffold-out")
+
+spec_path = build_dir / "spec.md"
+if not spec_path.exists() and (app_dest / "spec.md").exists():
+    spec_path = app_dest / "spec.md"
+spec = read_text(spec_path)
+
+def extract_requirements(markdown: str):
+    reqs = []
+    in_relevant_section = False
+    for line in markdown.splitlines():
+        raw = line.rstrip()
+        heading = re.match(r"^(#{1,4})\s+(.+?)\s*$", raw)
+        if heading:
+            title = heading.group(2).strip().lower()
+            in_relevant_section = any(k in title for k in [
+                "requirement", "acceptance", "scope", "feature", "gameplay", "controls", "quality", "must"
+            ])
+            continue
+        bullet = re.match(r"^\s*(?:[-*]|\d+[.)])\s+(.+?)\s*$", raw)
+        if bullet and (in_relevant_section or any(w in bullet.group(1).lower() for w in ["must", "should", "use ", "allow", "display", "include", "support"])):
+            text = re.sub(r"\s+", " ", bullet.group(1)).strip()
+            if len(text) >= 12:
+                reqs.append(text)
+    if not reqs:
+        for line in markdown.splitlines():
+            bullet = re.match(r"^\s*(?:[-*]|\d+[.)])\s+(.+?)\s*$", line.rstrip())
+            if bullet:
+                text = re.sub(r"\s+", " ", bullet.group(1)).strip()
+                if len(text) >= 12:
+                    reqs.append(text)
+    seen = set()
+    unique = []
+    for req in reqs:
+        key = req.lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(req)
+    return unique[:80]
+
+requirements = extract_requirements(spec)
+
+source_exts = {".ts", ".tsx", ".js", ".jsx", ".css", ".html", ".md", ".json"}
+skip_dirs = {"node_modules", "dist", "build", ".git", ".scaffold-debug", "coverage"}
+source_chunks = []
+source_files = []
+if app_dest.exists():
+    for p in app_dest.rglob("*"):
+        if any(part in skip_dirs for part in p.parts):
+            continue
+        if p.is_file() and p.suffix.lower() in source_exts:
+            try:
+                rel = str(p.relative_to(app_dest))
+            except Exception:
+                rel = str(p)
+            text = read_text(p, 80_000)
+            if text:
+                source_files.append(rel)
+                source_chunks.append(f"\n--- {rel} ---\n{text}")
+source_blob = "\n".join(source_chunks).lower()[:900_000]
+
+runtime_chunks = []
+for page in summary.get("pages") or []:
+    if not isinstance(page, dict):
+        continue
+    runtime_chunks.append(str(page.get("url") or ""))
+    runtime_chunks.append(str(page.get("title") or ""))
+    for err in page.get("consoleErrors") or []:
+        runtime_chunks.append(str(err))
+    for el in page.get("elements") or []:
+        if not isinstance(el, dict):
+            continue
+        runtime_chunks.extend([
+            str(el.get("selector") or ""),
+            str(el.get("text") or ""),
+            str(el.get("kind") or ""),
+            str(el.get("outcome") or ""),
+            str(el.get("outcomeDetail") or ""),
+        ])
+for gap in (gaps if isinstance(gaps, list) else []):
+    if isinstance(gap, dict):
+        runtime_chunks.extend([str(gap.get("kind") or ""), str(gap.get("observed") or ""), str(gap.get("fixHint") or "")])
+runtime_blob = "\n".join(runtime_chunks).lower()[:500_000]
+
+stop = {
+    "the","and","for","with","that","this","from","into","onto","must","should","shall","will","can","use",
+    "user","app","game","system","build","when","then","than","have","has","are","was","were","been","being",
+    "each","your","their","there","where","which","while","about","also","such","through","using","include",
+    "support","allow","display","provide","make","create","ensure"
+}
+
+def tokens(text: str):
+    words = re.findall(r"[a-zA-Z][a-zA-Z0-9_-]{2,}", text.lower())
+    return [w for w in words if w not in stop and not w.isdigit()]
+
+def is_critical(text: str):
+    t = text.lower()
+    return any(k in t for k in ["must", "required", "core", "primary", "play", "control", "score", "win", "lose", "start", "keyboard", "accessible"])
+
+converged = bool(summary.get("converged"))
+gap_count = int(summary.get("gapsFound") or len(gaps) or 0)
+
+items = []
+for idx, req in enumerate(requirements, 1):
+    req_tokens = tokens(req)
+    unique = []
+    for tok in req_tokens:
+        if tok not in unique:
+            unique.append(tok)
+    source_hits = [tok for tok in unique if tok in source_blob]
+    runtime_hits = [tok for tok in unique if tok in runtime_blob]
+    hits = sorted(set(source_hits + runtime_hits), key=lambda x: unique.index(x))
+    source_ratio = (len(source_hits) / max(1, len(unique))) if unique else 0
+    runtime_ratio = (len(runtime_hits) / max(1, len(unique))) if unique else 0
+    hit_ratio = max(source_ratio, (source_ratio * 0.65) + (runtime_ratio * 0.55))
+    critical = is_critical(req)
+    if gap_count > 0 and critical:
+        status = "not_verified"
+    elif hit_ratio >= 0.62 and converged:
+        status = "verified"
+    elif hit_ratio >= 0.30 and converged:
+        status = "partially_verified"
+    else:
+        status = "not_verified" if critical else "partially_verified"
+    evidence = []
+    if converged:
+        evidence.append(f"{iter_dir.relative_to(root)}/summary.json")
+    if source_hits:
+        evidence.append(f"source hits: {', '.join(source_hits[:10])}")
+    if runtime_hits:
+        evidence.append(f"runtime hits: {', '.join(runtime_hits[:10])}")
+    if source_files:
+        evidence.append(f"scanned {len(source_files)} source files")
+    notes = "Deterministic v1 verdict based on crawler convergence plus source and runtime evidence overlap."
+    items.append({
+        "id": f"REQ-{idx:03d}",
+        "text": req,
+        "status": status,
+        "critical": critical,
+        "evidence": evidence,
+        "notes": notes,
+    })
+
+if not items:
+    overall = "unknown"
+elif any(i["critical"] and i["status"] == "not_verified" for i in items):
+    overall = "fail"
+elif any(i["status"] == "partially_verified" for i in items):
+    overall = "partial"
+else:
+    overall = "pass"
+
+payload = {
+    "schema": "rds.qa.spec-verdict.v1",
+    "build_id": build_id,
+    "iteration": iter_dir.name,
+    "overall": overall,
+    "crawler": {
+        "converged": converged,
+        "gapsFound": gap_count,
+        "pagesVisited": summary.get("pagesVisited"),
+        "summaryPath": f"{iter_dir.relative_to(root)}/summary.json",
+    },
+    "specPath": str(spec_path.relative_to(root)) if spec_path.exists() else None,
+    "appDest": str(app_dest),
+    "requirements": items,
+    "coverage": {
+        "total": len(items),
+        "verified": sum(1 for i in items if i["status"] == "verified"),
+        "partial": sum(1 for i in items if i["status"] == "partially_verified"),
+        "notVerified": sum(1 for i in items if i["status"] == "not_verified"),
+        "criticalNotVerified": sum(1 for i in items if i["critical"] and i["status"] == "not_verified"),
+        "runtimeEvidence": bool(runtime_blob.strip()),
+    },
+    "limitations": [
+        "This is a deterministic spec verdict, not full semantic proof.",
+        "Verified means crawler passed and source/runtime evidence strongly matched the requirement text.",
+        "Partially verified items should be reviewed by the operator or a later semantic verifier.",
+    ],
+}
+out.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+print(json.dumps({"overall": overall, "requirements": len(items), "path": str(out)}))
+sys.exit(1 if overall == "fail" else 0)
+PY

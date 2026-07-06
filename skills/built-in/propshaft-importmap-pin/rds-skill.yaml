@@ -1,0 +1,22 @@
+---
+slug: propshaft-importmap-pin
+name: Propshaft importmap pin
+status: ready
+default: false
+applies_to:
+- rails-web
+description: Rails asset pinning conventions for Propshaft/importmap.
+install:
+  command: bin/rds-skill-materialize propshaft-importmap-pin
+verify:
+  command: bin/rds-skill-verify propshaft-importmap-pin
+maturity: stable
+category: frontend
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should
+  understand during stack selection, skill resolution, implementation guidance, or
+  verification.
+source_links:
+- label: github.com
+  url: https://github.com/rails/propshaft
+- label: github.com
+  url: https://github.com/rails/importmap-rails

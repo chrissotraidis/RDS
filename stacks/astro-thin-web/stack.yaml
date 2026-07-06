@@ -1,0 +1,45 @@
+---
+slug: astro-thin-web
+runtime_id: astro-thin-web
+name: Astro thin web
+description: Astro content-led web stack for marketing sites, docs, portfolios, MDX
+  content, and thin interactive islands.
+category: content-led-web
+v1_status: ship
+priority: 5
+language:
+  primary: typescript
+framework:
+  name: astro
+  version: '6'
+scaffold:
+  command: stacks/astro-thin-web/init.sh
+commands:
+  install: bun install
+  run: bunx astro dev --host 0.0.0.0 --port ${HOST_PORT}
+  test: bun run build
+  doctor: stacks/astro-thin-web/doctor.sh
+ports:
+  range:
+  - 4000
+  - 4099
+health_path: "/health.json"
+deploy:
+  preview_on_zo: durable-zo-http-service
+  default_external: cloudflare-workers
+mockup_analog:
+  primary: single-html-mockup
+public_preview_model:
+  type: static-bundle
+compatible_skills:
+  primary:
+  - astro-content-collections-skill
+  universal:
+  - rds-context7-mount
+  - rds-mockup-fidelity
+  - rds-secrets-broker
+  - rds-eval-harness
+  - playwright-mcp
+agent_notes:
+  primary: claude-code
+  codex_role: Bulk MDX/page generation and build-error fixes.

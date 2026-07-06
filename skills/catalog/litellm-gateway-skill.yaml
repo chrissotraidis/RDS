@@ -1,0 +1,17 @@
+---
+slug: litellm-gateway-skill
+name: LiteLLM gateway
+status: curated
+category: llm
+maturity: stable
+applies_to:
+- python-ai-service
+description: Provider-key isolation through a LiteLLM gateway.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: docs.litellm.ai
+  url: https://docs.litellm.ai/
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

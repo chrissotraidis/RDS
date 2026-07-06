@@ -1,0 +1,59 @@
+---
+slug: game-asset-pipeline
+runtime_id: game-asset-pipeline
+name: Game asset pipeline
+description: Python/uv pipeline for processing 3D assets, validating target specs,
+  generating preview pages, and serving processed artifacts. Blender/bpy support is
+  optional until the Zo image includes Blender.
+category: asset-pipeline
+v1_status: ship
+priority: 8
+language:
+  primary: python
+  versions:
+    python: '3.12'
+framework:
+  name: headless-asset-pipeline
+  version: '1'
+scaffold:
+  command: stacks/game-asset-pipeline/init.sh
+commands:
+  install: uv sync
+  run: uv run python scripts/serve_preview.py
+  test: uv run pytest -q
+  doctor: stacks/game-asset-pipeline/doctor.sh
+ports:
+  range:
+  - 4000
+  - 4099
+health_path: "/health.json"
+deploy:
+  preview_on_zo: durable-zo-http-service
+  default_external: github-release
+mockup_analog:
+  primary: asset-target-spec
+public_preview_model:
+  type: static-bundle
+compatible_skills:
+  primary:
+  - rds-usd-validator
+  - gltf-validator-skill
+  - model-viewer-preview
+  universal:
+  - rds-context7-mount
+  - rds-mockup-fidelity
+  - rds-secrets-broker
+  - rds-eval-harness
+  - playwright-mcp
+agent_notes:
+  primary: claude-code
+  codex_role: Tight Python transform, validator, and fixture-test loops.
+failure_modes:
+- id: blender-missing
+  summary: Blender/bpy is not guaranteed on the Zo image.
+  mitigation: Keep deterministic Python fallback transforms runnable; gate Blender
+    transforms behind doctor checks.
+- id: rights-encumbered-assets
+  summary: Commercial game extraction/mod assets can be legally unsafe.
+  mitigation: Require explicit rights confirmation before ingesting copyrighted commercial
+    assets.

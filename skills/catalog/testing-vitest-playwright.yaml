@@ -1,0 +1,22 @@
+---
+slug: testing-vitest-playwright
+name: Vitest and Playwright
+status: curated
+category: testing
+maturity: stable
+applies_to:
+- nextjs-fullstack
+- astro-thin-web
+- web-3d
+- browser-extension
+description: Vitest unit testing and Playwright browser testing.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: vitest.dev
+  url: https://vitest.dev/
+- label: playwright.dev
+  url: https://playwright.dev/
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

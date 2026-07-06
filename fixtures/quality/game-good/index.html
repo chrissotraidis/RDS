@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Playable Arena Fixture</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Inter, system-ui, sans-serif;
+      background: #111317;
+      color: #f7f3ea;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+    }
+    main { width: min(820px, calc(100vw - 32px)); display: grid; gap: 12px; }
+    header { display: flex; align-items: end; justify-content: space-between; gap: 16px; }
+    h1 { margin: 0; font-size: clamp(28px, 4vw, 42px); }
+    p { margin: 0; color: #bfc6d1; line-height: 1.45; }
+    canvas { width: 100%; height: auto; background: #1c2230; border: 1px solid #445066; border-radius: 8px; }
+    .hud { display: flex; gap: 10px; flex-wrap: wrap; color: #dbe7ff; }
+    .hud span { border: 1px solid #3b4658; border-radius: 6px; padding: 6px 10px; background: #171b23; }
+    button { min-height: 44px; padding: 0 16px; border: 0; border-radius: 6px; background: #f4d35e; color: #141414; font-weight: 800; }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>Playable Arena</h1>
+        <p>Controls: arrow keys to move, Space to dash. Avoid enemies, survive waves, and press R to restart after game over.</p>
+      </div>
+      <button id="start">Start game</button>
+    </header>
+    <div class="hud" aria-live="polite">
+      <span id="score">Score: 0</span>
+      <span id="level">Level: 1</span>
+      <span id="lives">Lives: 3</span>
+      <span id="status">Ready to play</span>
+    </div>
+    <canvas id="game" width="760" height="420"></canvas>
+  </main>
+  <script>
+    const canvas = document.getElementById("game");
+    const ctx = canvas.getContext("2d");
+    const scoreEl = document.getElementById("score");
+    const levelEl = document.getElementById("level");
+    const livesEl = document.getElementById("lives");
+    const statusEl = document.getElementById("status");
+    const startBtn = document.getElementById("start");
+    const player = { x: 80, y: 210, vx: 0, vy: 0 };
+    let running = false;
+    let score = 0;
+    let level = 1;
+    let lives = 3;
+    let enemyX = 660;
+    let tick = 0;
+
+    function reset() {
+      running = true;
+      score = 0;
+      level = 1;
+      lives = 3;
+      enemyX = 660;
+      player.x = 80;
+      player.y = 210;
+      statusEl.textContent = "Wave 1 started. Enemy pressure rising.";
+      startBtn.textContent = "Restart game";
+      updateHud();
+      draw();
+    }
+
+    function updateHud() {
+      scoreEl.textContent = `Score: ${score}`;
+      levelEl.textContent = `Level: ${level}`;
+      livesEl.textContent = `Lives: ${lives}`;
+    }
+
+    function draw() {
+      ctx.fillStyle = "#1c2230";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = "#252d3e";
+      for (let x = 0; x < canvas.width; x += 40) ctx.fillRect(x, 0, 1, canvas.height);
+      for (let y = 0; y < canvas.height; y += 40) ctx.fillRect(0, y, canvas.width, 1);
+      ctx.fillStyle = "#7bdff2";
+      ctx.fillRect(player.x, player.y, 34, 34);
+      ctx.fillStyle = "#ef476f";
+      ctx.beginPath();
+      ctx.arc(enemyX, 210 + Math.sin(tick / 14) * 120, 24, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = "#f4d35e";
+      ctx.font = "18px system-ui";
+      ctx.fillText(`Score: ${score}`, 24, 34);
+      ctx.fillText(`Level: ${level}`, 24, 60);
+      if (!running && lives <= 0) ctx.fillText("Game over - press R to restart", 250, 210);
+    }
+
+    function step() {
+      tick += 1;
+      if (running) {
+        player.x = Math.max(10, Math.min(canvas.width - 44, player.x + player.vx));
+        player.y = Math.max(10, Math.min(canvas.height - 44, player.y + player.vy));
+        enemyX -= 2 + level;
+        score += 1;
+        if (score > 0 && score % 80 === 0) {
+          level += 1;
+          statusEl.textContent = `Level ${level}: enemy speed increased`;
+        }
+        if (enemyX < -30) enemyX = 760;
+        if (Math.abs(enemyX - player.x) < 35 && Math.abs(210 + Math.sin(tick / 14) * 120 - player.y) < 35) {
+          lives -= 1;
+          enemyX = 760;
+          statusEl.textContent = lives > 0 ? `Hit taken. ${lives} lives left.` : "Game over. Press R or Restart game.";
+          if (lives <= 0) running = false;
+        }
+        updateHud();
+      }
+      draw();
+      requestAnimationFrame(step);
+    }
+
+    startBtn.addEventListener("click", reset);
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "ArrowRight") player.vx = 8;
+      if (event.key === "ArrowLeft") player.vx = -8;
+      if (event.key === "ArrowDown") player.vy = 8;
+      if (event.key === "ArrowUp") player.vy = -8;
+      if (event.code === "Space") { player.x += 26; score += 10; statusEl.textContent = "Dash feedback: +10 score"; }
+      if (event.code === "KeyR") reset();
+    });
+    document.addEventListener("keyup", () => { player.vx = 0; player.vy = 0; });
+    draw();
+    step();
+  </script>
+</body>
+</html>

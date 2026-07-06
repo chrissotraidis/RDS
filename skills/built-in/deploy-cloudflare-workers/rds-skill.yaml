@@ -1,0 +1,20 @@
+---
+slug: deploy-cloudflare-workers
+name: Cloudflare Workers deploy
+status: ready
+default: false
+applies_to:
+- astro-thin-web
+description: Cloudflare Workers deployment contract for Astro.
+install:
+  command: bin/rds-skill-materialize deploy-cloudflare-workers
+verify:
+  command: bin/rds-skill-verify deploy-cloudflare-workers
+maturity: beta
+category: deploy
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should
+  understand during stack selection, skill resolution, implementation guidance, or
+  verification.
+source_links:
+- label: developers.cloudflare.com
+  url: https://developers.cloudflare.com/workers/

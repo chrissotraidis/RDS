@@ -1,0 +1,6 @@
+primary_recipe: web_app
+persona: software_architect
+detected_stack: rails
+domains_any_of:
+  - productivity
+  - social

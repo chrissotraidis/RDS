@@ -1,0 +1,68 @@
+#!/usr/bin/env ruby
+require "fileutils"
+require "optparse"
+require "securerandom"
+
+APP_ROOT = File.expand_path("..", __dir__)
+
+options = { app_name: nil, yes: false }
+OptionParser.new do |opts|
+  opts.on("--app-name=NAME") { |value| options[:app_name] = value }
+  opts.on("--yes") { options[:yes] = true }
+end.parse!(ARGV)
+
+def replace_in_file(path, replacements)
+  content = File.read(path)
+  replacements.each { |from, to| content.gsub!(from, to) }
+  File.write(path, content)
+end
+
+app_name = options[:app_name]&.strip
+unless app_name
+  print "App name (e.g. acme_storefront): "
+  app_name = STDIN.gets&.strip
+end
+
+if app_name.nil? || app_name.empty?
+  warn "App name is required."
+  exit 1
+end
+
+unless app_name.match?(/\A[a-z][a-z0-9_]*\z/)
+  warn "Use lowercase letters, numbers, and underscores only."
+  exit 1
+end
+
+module_name = app_name.split("_").map(&:capitalize).join
+
+unless options[:yes]
+  print "Configure #{module_name}? [Y/n] "
+  answer = STDIN.gets&.strip.to_s
+  exit 0 if answer.downcase == "n"
+end
+
+FileUtils.chdir APP_ROOT do
+  replace_in_file("config/application.rb", "module RailsStarter" => "module #{module_name}")
+  replace_in_file("config/database.yml", {
+    "my_app_development" => "#{app_name}_development",
+    "my_app_test" => "#{app_name}_test",
+    "my_app_production_cache" => "#{app_name}_production_cache",
+    "my_app_production_queue" => "#{app_name}_production_queue",
+    "my_app_production_cable" => "#{app_name}_production_cable",
+    "MY_APP_DATABASE_URL" => "#{app_name.upcase}_DATABASE_URL",
+    "#username: my_app" => "#username: #{app_name}"
+  })
+  replace_in_file("config/cable.yml", "my_app_production" => "#{app_name}_production")
+  replace_in_file("app/views/pwa/manifest.json.erb", {
+    '"RailsStarter"' => %("#{module_name}"),
+    "RailsStarter." => "#{module_name}."
+  })
+  replace_in_file("README.md", {
+    "bin/template-setup --app-name=my_app --yes" => "bin/template-setup --app-name=#{app_name} --yes"
+  })
+
+  FileUtils.rm_f(["config/credentials.yml.enc", "config/master.key"])
+  File.write("config/master.key", SecureRandom.hex(16) + "\n")
+  ENV["EDITOR"] = "true"
+  system("bin/rails credentials:edit", exception: false)
+end

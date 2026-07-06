@@ -1,0 +1,1084 @@
+#!/usr/bin/env bash
+# Cheap end-to-end contract checks for RDS autonomous launch/readiness behavior.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+TMP_ROOT="${TMPDIR:-/tmp}/rds-autonomy-fixture-$$"
+PORT=$((4300 + ($$ % 200)))
+SERVER_LOG="$TMP_ROOT/dashboard.log"
+RESULT_JSON="$TMP_ROOT/autonomy-fixture.json"
+FIXER_EVIDENCE_ID="autonomy-fixer-evidence-$$"
+FIXER_QUALITY_ID="autonomy-fixer-quality-$$"
+FIXER_FAILED_STAGE_ID="autonomy-fixer-failed-stage-$$"
+FIXER_SCAFFOLD_TASK_ID="autonomy-fixer-scaffold-task-$$"
+WATCHDOG_FIXER_LOOP_ID="autonomy-watchdog-loop-$$"
+APPROVAL_BLOCK_ID="autonomy-approval-block-$$"
+mkdir -p "$TMP_ROOT/cases" "$TMP_ROOT/builds"
+
+server_pid=""
+cleanup() {
+  if [[ -n "$server_pid" ]]; then
+    kill "$server_pid" 2>/dev/null || true
+  fi
+  python3 - "$ROOT" "$FIXER_EVIDENCE_ID" "$FIXER_QUALITY_ID" "$FIXER_FAILED_STAGE_ID" "$FIXER_SCAFFOLD_TASK_ID" "$WATCHDOG_FIXER_LOOP_ID" "$APPROVAL_BLOCK_ID" <<'PY' >/dev/null 2>&1 || true
+import shutil
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve()
+for build_id in sys.argv[2:]:
+    path = (root / "builds" / build_id).resolve()
+    if path.is_dir() and path.parent == root / "builds" and build_id.startswith(("autonomy-fixer-", "autonomy-watchdog-", "autonomy-approval-")):
+        shutil.rmtree(path)
+PY
+}
+trap cleanup EXIT
+
+start_dashboard() {
+  (
+    cd "$ROOT/dashboard"
+    PORT="$PORT" \
+      RDS_ROOT="$ROOT" \
+      RDS_DASHBOARD_USER=rds \
+      RDS_DASHBOARD_PASSWORD=test \
+      RDS_DASHBOARD_TOKEN=test \
+      bun run src/server.ts >"$SERVER_LOG" 2>&1
+  ) &
+  server_pid="$!"
+  for _ in $(seq 1 40); do
+    if curl -fsS -u rds:test "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  echo "FATAL: dashboard fixture server did not start on port $PORT" >&2
+  cat "$SERVER_LOG" >&2 || true
+  exit 1
+}
+
+write_json() {
+  local path="$1"
+  shift
+  mkdir -p "$(dirname "$path")"
+  printf '%s\n' "$*" > "$path"
+}
+
+run_display_name_checks() {
+  local source="$TMP_ROOT/cases/polis-title.md"
+  cat >"$source" <<'EOF'
+# POLIS — Product Requirements Document (PRD) v2Version: 2.0 (supersedes v1 04-Draft)Owner: OperatorStatus: Draft
+
+0) Executive Summary
+Polis is a two-player abstract strategy web game.
+EOF
+  local title
+  title="$(source "$ROOT/bin/lib/common.sh"; derive_source_title "$source")"
+  if [[ "$title" != "POLIS — v2" ]]; then
+    echo "FATAL: ugly PRD display name was not normalized: $title" >&2
+    exit 1
+  fi
+  jq -n --arg title "$title" '{name:"display-name", status:"pass", assertion:"PRD preamble does not become the build display name", title:$title}' >>"$TMP_ROOT/checks.jsonl"
+  printf '✓ %-22s PRD preamble name normalized\n' "display-name"
+}
+
+run_spec_readiness_checks() {
+  local case_dir="$TMP_ROOT/spec-readiness"
+  local source="$case_dir/research.md"
+  local spec="$case_dir/spec.md"
+  mkdir -p "$case_dir"
+  cat >"$source" <<'EOF'
+# Operator Review App
+
+Build a review console with a seeded operator, sample source records, provider-cost estimates, and a publish action that is not connected to production credentials yet.
+EOF
+  RDS_SPEC_PROVIDER=codex RDS_SPEC_CODEX_INFER=0 "$ROOT/bin/rds-spec" "$source" "$spec" >/tmp/rds-autonomy-spec-readiness.out 2>&1
+  grep -q "Review Readiness / Truthfulness" "$spec"
+  grep -q "what data is seeded/sample/demo" "$spec"
+  grep -q "QA must be able to see the disclosure in the running app" "$spec"
+  grep -q "review readiness/truthfulness disclosure" "$spec"
+  grep -q "Review readiness / truthfulness" "$ROOT/prompts/wiki-prd-from-research.md"
+  grep -q "visible review-readiness/truthfulness surface" "$ROOT/vendor/scaffold/prompts/task_breakdown_system.md.erb"
+  jq -n '{name:"spec-readiness", status:"pass", assertion:"spec and scaffold prompts require app-visible review readiness disclosure by default"}' >>"$TMP_ROOT/checks.jsonl"
+  printf '✓ %-22s spec requires app-visible readiness disclosure\n' "spec-readiness"
+}
+
+run_case() {
+  local name="$1" expected_stack="$2" expected_type="$3" expected_skill="$4" text="$5"
+  local source="$TMP_ROOT/cases/$name.md"
+  local cli_out="$TMP_ROOT/cases/$name.cli.json"
+  local api_out="$TMP_ROOT/cases/$name.api.json"
+  local build_dir="$TMP_ROOT/builds/$name"
+  printf '%s\n' "$text" > "$source"
+
+  "$ROOT/bin/rds-analyze-source" "$source" --root "$ROOT" --out "$cli_out" >/dev/null
+  curl -fsS -u rds:test \
+    -H 'content-type: application/json' \
+    -H 'accept: application/json' \
+    -d "$(jq -cn --arg trigger "$text" '{mode:"green", trigger:$trigger, app_type:"auto"}')" \
+    "http://127.0.0.1:$PORT/new/analyze" >"$api_out"
+
+  local cli_stack cli_type api_stack api_type
+  cli_stack="$(jq -r '.stack' "$cli_out")"
+  cli_type="$(jq -r '.appType' "$cli_out")"
+  api_stack="$(jq -r '.analysis.stack' "$api_out")"
+  api_type="$(jq -r '.analysis.appType' "$api_out")"
+
+  if [[ "$cli_stack" != "$expected_stack" || "$cli_type" != "$expected_type" ]]; then
+    echo "FATAL: $name CLI expected $expected_stack/$expected_type got $cli_stack/$cli_type" >&2
+    cat "$cli_out" >&2
+    exit 1
+  fi
+  if [[ "$api_stack" != "$cli_stack" || "$api_type" != "$cli_type" ]]; then
+    echo "FATAL: $name dashboard analyzer disagrees with CLI: api=$api_stack/$api_type cli=$cli_stack/$cli_type" >&2
+    cat "$api_out" >&2
+    exit 1
+  fi
+
+  mkdir -p "$build_dir"
+  printf '%s\n' '---' "stack: $cli_stack" >"$build_dir/build.yaml"
+  local requested
+  requested="$(jq -r '.skills | join(",")' "$cli_out")"
+  "$ROOT/bin/rds-skill-resolve" --stack="$cli_stack" --requested="$requested" --build-dir="$build_dir" >/dev/null
+  if [[ -n "$expected_skill" ]] && ! jq -e --arg slug "$expected_skill" '.resolved[] | select(.slug == $slug)' "$build_dir/skills/resolved.json" >/dev/null; then
+    echo "FATAL: $name expected resolved skill $expected_skill" >&2
+    cat "$build_dir/skills/resolved.json" >&2
+    exit 1
+  fi
+
+  jq -n \
+    --arg name "$name" \
+    --arg stack "$cli_stack" \
+    --arg appType "$cli_type" \
+    --arg skill "$expected_skill" \
+    '{name:$name, stack:$stack, appType:$appType, expectedSkill:$skill, status:"pass"}' >>"$TMP_ROOT/cases.jsonl"
+  printf '✓ %-22s analyzer=%-20s appType=%-12s skill=%s\n' "$name" "$cli_stack" "$cli_type" "$expected_skill"
+}
+
+run_readiness_checks() {
+  local id="autonomy-readiness-fail"
+  local build_dir="$TMP_ROOT/builds/$id"
+  mkdir -p "$build_dir/playwright/iter-001"
+  write_json "$build_dir/state.json" '{
+    "status": "done",
+    "app_type": "website",
+    "stages": {
+      "intake": {"status": "done"},
+      "spec": {"status": "done"},
+      "taste": {"status": "done"},
+      "skill-resolve": {"status": "done"},
+      "rails-init": {"status": "done"},
+      "skill-install": {"status": "done"},
+      "scaffold": {"status": "done"},
+      "local-run": {"status": "done"},
+      "deploy": {"status": "done"},
+      "qa": {"status": "skipped"},
+      "taste-review": {"status": "skipped"}
+    }
+  }'
+  write_json "$build_dir/playwright/iter-001/summary.json" '{"converged": true, "gapsFound": 0}'
+  write_json "$build_dir/playwright/iter-001/spec-verdict.json" '{"overall": "pass"}'
+  write_json "$build_dir/playwright/iter-001/visual-verdict.json" '{"status": "pass", "blockerCount": 0}'
+  write_json "$build_dir/playwright/iter-001/scenario-verdict.json" '{"status": "pass", "blockingFailures": 0}'
+  write_json "$build_dir/playwright/iter-001/website-verdict.json" '{"status": "pass"}'
+  write_json "$build_dir/playwright/iter-001/truthfulness-verdict.json" '{"status": "pass", "score": 100}'
+  write_json "$build_dir/playwright/iter-001/persona-verdict.json" '{"status": "pass", "score": 100}'
+  write_json "$build_dir/playwright/iter-001/prd-coverage-verdict.json" '{"status": "pass", "score": 100}'
+  write_json "$build_dir/taste-review.json" '{"status": "pass"}'
+  write_json "$build_dir/quality-ledger.json" '{"blocking": []}'
+
+  if "$ROOT/bin/rds-readiness" "$id" --root "$TMP_ROOT" >/tmp/rds-autonomy-readiness.out 2>&1; then
+    echo "FATAL: readiness allowed skipped QA/taste-review and missing preview" >&2
+    exit 1
+  fi
+  jq -e '.issues[] | select(.code == "required_quality_stage_skipped" or .code == "preview_missing")' "$build_dir/readiness.json" >/dev/null
+  "$ROOT/bin/rds-evidence-ledger" "$id" --root "$TMP_ROOT" >/tmp/rds-autonomy-evidence.out
+  jq -e '
+    .verdict == "blocked" and
+    .summary.blockerClass == "missing_or_stale_evidence" and
+    ([.blockers[].code] | index("required_quality_stage_skipped")) and
+    ([.blockers[].code] | index("preview_missing"))
+  ' "$build_dir/evidence-ledger.json" >/dev/null
+  jq -n '{name:"readiness-contract", status:"pass", assertion:"missing preview and skipped QA/taste-review block review readiness"}' >>"$TMP_ROOT/checks.jsonl"
+  printf '✓ %-22s readiness/evidence blocks missing preview/skipped QA\n' "readiness-contract"
+}
+
+run_evidence_split_brain_checks() {
+  local pending_id="autonomy-pending-blocked"
+  local pending_dir="$TMP_ROOT/builds/$pending_id"
+  mkdir -p "$pending_dir/playwright/iter-001"
+  write_json "$pending_dir/state.json" '{
+    "status": "pending_review",
+    "app_type": "game",
+    "review": {"status": "pending"},
+    "stages": {
+      "intake": {"status": "done"},
+      "spec": {"status": "done"},
+      "taste": {"status": "done"},
+      "skill-resolve": {"status": "done"},
+      "rails-init": {"status": "done"},
+      "skill-install": {"status": "done"},
+      "scaffold": {"status": "done"},
+      "local-run": {"status": "done"},
+      "deploy": {"status": "done"},
+      "qa": {"status": "done"},
+      "taste-review": {"status": "pending-review"}
+    }
+  }'
+  write_json "$pending_dir/events.jsonl" '{"event":"build_pending_review"}'
+  write_json "$pending_dir/preview-url.txt" 'https://example.invalid'
+  write_json "$pending_dir/playwright/iter-001/summary.json" '{"converged": true, "gapsFound": 0}'
+  write_json "$pending_dir/playwright/iter-001/spec-verdict.json" '{"overall": "pass"}'
+  write_json "$pending_dir/playwright/iter-001/visual-verdict.json" '{"status": "pass", "blockerCount": 0}'
+  write_json "$pending_dir/playwright/iter-001/scenario-verdict.json" '{"status": "fail", "blockingFailures": 1}'
+  write_json "$pending_dir/playwright/iter-001/game-verdict.json" '{"status": "needs_iteration", "score": 91}'
+  write_json "$pending_dir/playwright/iter-001/truthfulness-verdict.json" '{"status": "pass", "score": 100}'
+  write_json "$pending_dir/playwright/iter-001/persona-verdict.json" '{"status": "pass", "score": 100}'
+  write_json "$pending_dir/playwright/iter-001/prd-coverage-verdict.json" '{"status": "pass", "score": 100}'
+  write_json "$pending_dir/taste-review.json" '{"status": "needs_iteration", "score": 80}'
+  write_json "$pending_dir/quality-ledger.json" '{"blocking": ["game", "scenarios", "design"]}'
+  "$ROOT/bin/rds-readiness" "$pending_id" --root "$TMP_ROOT" >/tmp/rds-autonomy-pending-readiness.out 2>&1 || true
+  "$ROOT/bin/rds-evidence-ledger" "$pending_id" --root "$TMP_ROOT" >/tmp/rds-autonomy-pending-evidence.out
+  jq -e '
+    .verdict == "blocked" and
+    .summary.operatorReviewStatus == "pending" and
+    .summary.blockerClass == "product_quality" and
+    ([.blockers[].code] | index("scenario_verdict_blocking")) and
+    ([.blockers[] | select(.code == "quality_ledger_blocking")] | length == 1)
+  ' "$pending_dir/evidence-ledger.json" >/dev/null
+  jq -e '
+    .schema == "rds.autonomy.evidence.v1" and
+    .verdict == "blocked" and
+    ([.stages[] | select(.stage == "qa" and .status == "blocked" and ([.blockers[].code] | index("scenario_verdict_blocking")))] | length == 1) and
+    ([.stages[] | select(.stage == "quality-ledger" and .status == "blocked" and ([.blockers[].code] | index("quality_ledger_blocking")))] | length == 1)
+  ' "$pending_dir/autonomy/evidence.json" >/dev/null
+  jq -n '{name:"pending-review-blocked", status:"pass", assertion:"pending review does not override product-quality blockers"}' >>"$TMP_ROOT/checks.jsonl"
+  printf '✓ %-22s pending review stays blocked when evidence fails\n' "pending-review-blocked"
+
+  local orphan_id="autonomy-orphaned-running"
+  local orphan_dir="$TMP_ROOT/builds/$orphan_id"
+  mkdir -p "$orphan_dir"
+  write_json "$orphan_dir/state.json" '{
+    "status": "running",
+    "current_stage": "qa",
+    "stages": {
+      "intake": {"status": "done"},
+      "qa": {"status": "running"}
+    }
+  }'
+  write_json "$orphan_dir/run.pid" 'pid=999999'
+  write_json "$orphan_dir/events.jsonl" '{"event":"stage_started","stage":"qa"}'
+  "$ROOT/bin/rds-evidence-ledger" "$orphan_id" --root "$TMP_ROOT" >/tmp/rds-autonomy-orphan-evidence.out
+  jq -e '
+    .verdict == "blocked" and
+    .summary.blockerClass == "missing_or_stale_evidence" and
+    ([.blockers[].code] | index("orphaned_running_state"))
+  ' "$orphan_dir/evidence-ledger.json" >/dev/null
+  jq -n '{name:"orphaned-running-state", status:"pass", assertion:"dead pid with running state becomes blocked evidence"}' >>"$TMP_ROOT/checks.jsonl"
+  printf '✓ %-22s stale running state becomes blocked\n' "orphaned-running"
+
+  local recovery_id="autonomy-recovering"
+  local recovery_dir="$TMP_ROOT/builds/$recovery_id"
+  mkdir -p "$recovery_dir"
+  write_json "$recovery_dir/state.json" '{"status":"failed","stages":{"qa":{"status":"failed"}}}'
+  write_json "$recovery_dir/events.jsonl" '{"event":"fixer_started"}'
+  write_json "$recovery_dir/quality-ledger.json" '{"blocking": []}'
+  write_json "$recovery_dir/readiness.json" '{"status": "fail", "issues": [{"code": "preview_missing", "detail": "preview missing"}]}'
+  "$ROOT/bin/rds-evidence-ledger" "$recovery_id" --root "$TMP_ROOT" >/tmp/rds-autonomy-recovery-evidence.out
+  jq -e '.verdict == "recovering" and .summary.recovering == true' "$recovery_dir/evidence-ledger.json" >/dev/null
+  jq -n '{name:"recovering-state", status:"pass", assertion:"active fixer start event yields recovering truth"}' >>"$TMP_ROOT/checks.jsonl"
+  printf '✓ %-22s active recovery is explicit\n' "recovering-state"
+}
+
+write_fixer_state() {
+  local id="$1" app_type="${2:-website}" qa_status="${3:-done}" taste_status="${4:-done}"
+  local build_dir="$ROOT/builds/$id"
+  mkdir -p "$build_dir/playwright/iter-001"
+  write_json "$build_dir/state.json" "{
+    \"status\": \"failed\",
+    \"app_type\": \"$app_type\",
+    \"app_dest\": \"/tmp/rds-autonomy-fixture-app\",
+    \"current_stage\": \"readiness\",
+    \"stages\": {
+      \"intake\": {\"status\": \"done\"},
+      \"spec\": {\"status\": \"done\"},
+      \"taste\": {\"status\": \"done\"},
+      \"skill-resolve\": {\"status\": \"done\"},
+      \"rails-init\": {\"status\": \"done\"},
+      \"skill-install\": {\"status\": \"done\"},
+      \"scaffold\": {\"status\": \"done\"},
+      \"local-run\": {\"status\": \"done\"},
+      \"deploy\": {\"status\": \"done\"},
+      \"qa\": {\"status\": \"$qa_status\"},
+      \"taste-review\": {\"status\": \"$taste_status\"}
+    }
+  }"
+  write_json "$build_dir/events.jsonl" ''
+  write_json "$build_dir/playwright/iter-001/summary.json" '{"converged": true, "gapsFound": 0}'
+  write_json "$build_dir/playwright/iter-001/spec-verdict.json" '{"overall": "pass"}'
+  write_json "$build_dir/playwright/iter-001/visual-verdict.json" '{"status": "pass", "blockerCount": 0}'
+  write_json "$build_dir/playwright/iter-001/scenario-verdict.json" '{"status": "pass", "blockingFailures": 0}'
+  write_json "$build_dir/playwright/iter-001/website-verdict.json" '{"status": "pass"}'
+  write_json "$build_dir/playwright/iter-001/truthfulness-verdict.json" '{"status": "pass", "score": 100}'
+  write_json "$build_dir/playwright/iter-001/persona-verdict.json" '{"status": "pass", "score": 100}'
+  write_json "$build_dir/playwright/iter-001/prd-coverage-verdict.json" '{"status": "pass", "score": 100}'
+  write_json "$build_dir/taste-review.json" '{"status": "pass"}'
+  write_json "$build_dir/quality-ledger.json" '{"blocking": []}'
+}
+
+run_fixer_checks() {
+  local evidence_dir="$ROOT/builds/$FIXER_EVIDENCE_ID"
+  local quality_dir="$ROOT/builds/$FIXER_QUALITY_ID"
+  local failed_stage_dir="$ROOT/builds/$FIXER_FAILED_STAGE_ID"
+  local scaffold_task_dir="$ROOT/builds/$FIXER_SCAFFOLD_TASK_ID"
+
+  cleanup
+  write_fixer_state "$FIXER_EVIDENCE_ID" "website" "skipped" "skipped"
+  write_json "$evidence_dir/readiness.json" '{
+    "schema": "rds.readiness.v1",
+    "status": "fail",
+    "issues": [
+      {"code": "preview_missing", "recovery": "Reset deploy, QA, and taste-review; redeploy before review."},
+      {"code": "required_quality_stage_skipped", "recovery": "Reset QA/taste-review and rerun the required quality stages."}
+    ]
+  }'
+
+  RDS_FIX_AUTO_RETRY=0 "$ROOT/bin/rds-fix" "$FIXER_EVIDENCE_ID" --no-retry >/tmp/rds-autonomy-fixer-evidence.out
+  jq -e '
+    .stages.deploy.status == "pending" and
+    .stages.qa.status == "pending" and
+    .stages["taste-review"].status == "pending"
+  ' "$evidence_dir/state.json" >/dev/null
+  grep -Eq "deterministic (truth|readiness) recovery applied; auto-retry disabled" /tmp/rds-autonomy-fixer-evidence.out
+  jq -n '{name:"fixer-evidence", status:"pass", assertion:"missing evidence causes deterministic stage reset, not operator review"}' >>"$TMP_ROOT/checks.jsonl"
+  printf '✓ %-22s fixer resets missing evidence stages\n' "fixer-evidence"
+
+  write_fixer_state "$FIXER_SCAFFOLD_TASK_ID" "website" "done" "done"
+  local scaffold_app="$TMP_ROOT/scaffold-task-app"
+  mkdir -p "$scaffold_app/bin"
+  cat >"$scaffold_app/tasks.json" <<'JSON'
+{
+  "schema_version": 2,
+  "tasks": [
+    {"position": 0, "title": "Bootstrap", "status": "done"},
+    {"position": 1, "title": "Reference cards", "status": "blocked", "error_message": "task_verification_failed: Post-remediation verification failed"},
+    {"position": 2, "title": "Final hygiene", "status": "pending", "depends_on": [1]}
+  ]
+}
+JSON
+  cat >"$scaffold_app/bin/task" <<'SH'
+#!/usr/bin/env ruby
+require "json"
+doc = JSON.parse(File.read("tasks.json"))
+command, pos = ARGV
+abort "usage" unless command == "reset" && pos
+task = doc.fetch("tasks").find { |entry| entry["position"].to_i == pos.to_i }
+abort "missing task" unless task
+task["status"] = "pending"
+task.delete("error_message")
+File.write("tasks.json", JSON.pretty_generate(doc) + "\n")
+puts "Task #{pos} reset to pending"
+SH
+  chmod +x "$scaffold_app/bin/task"
+  tmp="$(mktemp)"
+  jq --arg app "$scaffold_app" '
+    .app_dest = $app |
+    .current_stage = "scaffold" |
+    .stages.scaffold.status = "failed" |
+    .stages["local-run"].status = "done" |
+    .stages.deploy.status = "done" |
+    .stages.qa.status = "done" |
+    .stages["taste-review"].status = "done"
+  ' "$scaffold_task_dir/state.json" >"$tmp"
+  mv "$tmp" "$scaffold_task_dir/state.json"
+  write_json "$scaffold_task_dir/readiness.json" '{
+    "schema": "rds.readiness.v1",
+    "status": "fail",
+    "issues": [
+      {"code": "preview_missing", "recovery": "Reset deploy, QA, and taste-review; redeploy before review."}
+    ]
+  }'
+
+  RDS_FIX_AUTO_RETRY=0 "$ROOT/bin/rds-fix" "$FIXER_SCAFFOLD_TASK_ID" --no-retry >/tmp/rds-autonomy-fixer-scaffold-task.out
+  jq -e '
+    .stages.scaffold.status == "pending" and
+    .stages["local-run"].status == "pending" and
+    .stages.deploy.status == "pending" and
+    .stages.qa.status == "pending" and
+    .stages["taste-review"].status == "pending"
+  ' "$scaffold_task_dir/state.json" >/dev/null
+  jq -e '.tasks[] | select(.position == 1 and .status == "pending" and (.error_message | not))' "$scaffold_app/tasks.json" >/dev/null
+  grep -q "deterministic scaffold task recovery applied" /tmp/rds-autonomy-fixer-scaffold-task.out
+  jq -n '{name:"fixer-scaffold-task", status:"pass", assertion:"blocked scaffold task ledger is reset before downstream preview recovery"}' >>"$TMP_ROOT/checks.jsonl"
+  printf '✓ %-22s fixer resets blocked scaffold task before deploy\n' "fixer-scaffold-task"
+
+  write_fixer_state "$FIXER_FAILED_STAGE_ID" "website" "done" "done"
+  tmp="$(mktemp)"
+  jq '
+    .current_stage = "scaffold" |
+    .stages.scaffold.status = "failed" |
+    .stages.deploy.status = "done" |
+    .stages.qa.status = "done" |
+    .stages["taste-review"].status = "done"
+  ' "$failed_stage_dir/state.json" >"$tmp"
+  mv "$tmp" "$failed_stage_dir/state.json"
+  write_json "$failed_stage_dir/readiness.json" '{
+    "schema": "rds.readiness.v1",
+    "status": "fail",
+    "issues": [
+      {"code": "preview_missing", "recovery": "Reset deploy, QA, and taste-review; redeploy before review."}
+    ]
+  }'
+
+  RDS_FIX_AUTO_RETRY=0 "$ROOT/bin/rds-fix" "$FIXER_FAILED_STAGE_ID" --no-retry >/tmp/rds-autonomy-fixer-failed-stage.out
+  jq -e '
+    .stages.scaffold.status == "pending" and
+    .stages["local-run"].status == "pending" and
+    .stages.deploy.status == "pending" and
+    .stages.qa.status == "pending" and
+    .stages["taste-review"].status == "pending"
+  ' "$failed_stage_dir/state.json" >/dev/null
+  grep -q "reset_from=scaffold" "$(ls -t "$failed_stage_dir"/fixer-apply-*.log | head -n1)"
+  jq -n '{name:"fixer-failed-stage-priority", status:"pass", assertion:"readiness preview issues do not mask failed upstream stages or preserve stale downstream evidence"}' >>"$TMP_ROOT/checks.jsonl"
+  printf '✓ %-22s fixer resets failed upstream stage and downstream evidence\n' "fixer-failed-stage"
+
+  write_fixer_state "$FIXER_QUALITY_ID" "website" "done" "done"
+  write_json "$quality_dir/readiness.json" '{
+    "schema": "rds.readiness.v1",
+    "status": "fail",
+    "issues": [
+      {"code": "scenario_verdict_blocking", "recovery": "Run an app iteration against the failed PRD scenario transcript."}
+    ]
+  }'
+  write_json "$quality_dir/playwright/iter-001/scenario-verdict.json" '{"status": "fail", "blockingFailures": 1}'
+
+  RDS_FIX_AUTO_RETRY=0 "$ROOT/bin/rds-fix" "$FIXER_QUALITY_ID" --no-retry >/tmp/rds-autonomy-fixer-quality.out
+  jq -e '
+    .stages.deploy.status == "done" and
+    .stages.qa.status == "done" and
+    .stages["taste-review"].status == "done"
+  ' "$quality_dir/state.json" >/dev/null
+  grep -Eq "(truth|readiness) blockers require (targeted app iteration|app iteration)" /tmp/rds-autonomy-fixer-quality.out
+  if grep -q "fixer_apply_completed" "$quality_dir/events.jsonl" 2>/dev/null; then
+    echo "FATAL: product-quality blocker triggered deterministic apply instead of stopping for iteration" >&2
+    exit 1
+  fi
+  jq -n '{name:"fixer-quality", status:"pass", assertion:"product-quality blockers require app iteration instead of blind retry"}' >>"$TMP_ROOT/checks.jsonl"
+  printf '✓ %-22s fixer refuses blind retry for quality blockers\n' "fixer-quality"
+}
+
+run_watchdog_attempt_checks() {
+  local build_dir="$ROOT/builds/$WATCHDOG_FIXER_LOOP_ID"
+  cleanup
+  mkdir -p "$build_dir"
+  write_json "$build_dir/state.json" '{
+    "status": "failed",
+    "current_stage": "scaffold",
+    "stages": {
+      "scaffold": {"status": "failed"},
+      "deploy": {"status": "pending"},
+      "qa": {"status": "pending"},
+      "taste-review": {"status": "pending"}
+    }
+  }'
+  cat >"$build_dir/events.jsonl" <<'JSONL'
+{"ts":"2026-05-28T09:16:01Z","build_id":"autonomy-watchdog-loop","event":"stage_failed","payload":{"stage":"scaffold","log_tail":"{\"event\":\"build_started\"} escaped text inside a log tail must not reset the watchdog counter"}}
+{"ts":"2026-05-28T09:16:01Z","build_id":"autonomy-watchdog-loop","event":"build_failed","payload":{"stage":"scaffold","exit_code":"1"}}
+{"ts":"2026-05-28T09:17:07Z","build_id":"autonomy-watchdog-loop","event":"fixer_retry_started","payload":{"stage":"deploy","via":"rds-resume","deterministic":"1"}}
+{"ts":"2026-05-28T09:17:08Z","build_id":"autonomy-watchdog-loop","event":"build_resumed","payload":{"stack":"nextjs"}}
+{"ts":"2026-05-28T09:17:12Z","build_id":"autonomy-watchdog-loop","event":"stage_failed","payload":{"stage":"scaffold","log_tail":"{\"event\":\"build_started\"} repeated scaffold failure with huge embedded logs"}}
+{"ts":"2026-05-28T09:17:12Z","build_id":"autonomy-watchdog-loop","event":"build_failed","payload":{"stage":"scaffold","exit_code":"1"}}
+{"ts":"2026-05-28T09:18:12Z","build_id":"autonomy-watchdog-loop","event":"fixer_retry_started","payload":{"stage":"deploy","via":"rds-resume","deterministic":"1"}}
+{"ts":"2026-05-28T09:18:14Z","build_id":"autonomy-watchdog-loop","event":"build_resumed","payload":{"stack":"nextjs"}}
+{"ts":"2026-05-28T09:18:17Z","build_id":"autonomy-watchdog-loop","event":"stage_failed","payload":{"stage":"scaffold","log_tail":"{\"event\":\"build_started\"} third failure should now be capped"}}
+{"ts":"2026-05-28T09:18:17Z","build_id":"autonomy-watchdog-loop","event":"build_failed","payload":{"stage":"scaffold","exit_code":"1"}}
+JSONL
+
+  local attempts
+  attempts="$("$ROOT/bin/rds-watchdog" --debug-attempt-count="$WATCHDOG_FIXER_LOOP_ID")"
+  if [[ "$attempts" != "4" ]]; then
+    echo "FATAL: watchdog counted repeated scaffold retries as $attempts, expected 4" >&2
+    exit 1
+  fi
+  jq -n '{name:"watchdog-attempt-counter", status:"pass", assertion:"embedded event text in log_tail does not reset failed-stage fixer attempt count"}' >>"$TMP_ROOT/checks.jsonl"
+  printf '✓ %-22s watchdog attempt cap survives embedded log JSON\n' "watchdog-attempts"
+}
+
+write_approval_ready_state() {
+  local build_dir="$1" app_type="${2:-website}"
+  mkdir -p "$build_dir/playwright/iter-001" "$build_dir/skills"
+  write_json "$build_dir/state.json" "{
+    \"status\": \"done\",
+    \"app_type\": \"$app_type\",
+    \"review\": {\"status\": \"pending\"},
+    \"stages\": {
+      \"intake\": {\"status\": \"done\"},
+      \"spec\": {\"status\": \"done\"},
+      \"taste\": {\"status\": \"done\"},
+      \"skill-resolve\": {\"status\": \"done\"},
+      \"rails-init\": {\"status\": \"done\"},
+      \"skill-install\": {\"status\": \"done\"},
+      \"scaffold\": {\"status\": \"done\"},
+      \"local-run\": {\"status\": \"done\"},
+      \"deploy\": {\"status\": \"done\"},
+      \"qa\": {\"status\": \"done\"},
+      \"taste-review\": {\"status\": \"done\"}
+    }
+  }"
+  write_json "$build_dir/preview-url.txt" 'https://example.invalid'
+  write_json "$build_dir/playwright/iter-001/summary.json" '{"converged": true, "gapsFound": 0}'
+  write_json "$build_dir/playwright/iter-001/spec-verdict.json" '{"overall": "pass"}'
+  write_json "$build_dir/playwright/iter-001/visual-verdict.json" '{"status": "pass", "blockerCount": 0}'
+  write_json "$build_dir/playwright/iter-001/scenario-verdict.json" '{"status": "pass", "blockingFailures": 0}'
+  write_json "$build_dir/playwright/iter-001/website-verdict.json" '{"status": "pass"}'
+  write_json "$build_dir/playwright/iter-001/truthfulness-verdict.json" '{"status": "pass", "score": 100}'
+  write_json "$build_dir/playwright/iter-001/persona-verdict.json" '{"status": "pass", "score": 100}'
+  write_json "$build_dir/playwright/iter-001/prd-coverage-verdict.json" '{"status": "pass", "score": 100}'
+  write_json "$build_dir/taste-review.json" '{"status": "pass"}'
+  write_json "$build_dir/quality-ledger.json" '{"blocking": []}'
+}
+
+run_readiness_truth_checks() {
+  local id="autonomy-skill-impact-fail"
+  local build_dir="$TMP_ROOT/builds/$id"
+  write_approval_ready_state "$build_dir" "website"
+  write_json "$build_dir/skills/scorecard.json" '{"totals": {"pass": 1, "partial": 0, "fail": 1}, "skills": [{"slug": "browser-game-product-quality", "verdict": "fail"}]}'
+
+  if "$ROOT/bin/rds-readiness" "$id" --root "$TMP_ROOT" >/tmp/rds-autonomy-skill-readiness.out 2>&1; then
+    echo "FATAL: readiness ignored evidence-ledger skill impact blocker" >&2
+    exit 1
+  fi
+  jq -e '.issues[] | select(.code == "evidence_ledger_blocking" and (.detail | contains("skill_impact_failed")))' "$build_dir/readiness.json" >/dev/null
+  jq -e '.verdict == "blocked" and .summary.blockerClass == "skill_impact"' "$build_dir/evidence-ledger.json" >/dev/null
+  jq -n '{name:"readiness-truth", status:"pass", assertion:"readiness consumes canonical evidence-ledger blockers"}' >>"$TMP_ROOT/checks.jsonl"
+  printf '✓ %-22s readiness consumes evidence-ledger blockers\n' "readiness-truth"
+}
+
+run_skill_scorecard_checks() {
+  local missing_id="autonomy-skill-scorecard-missing"
+  local missing_dir="$TMP_ROOT/builds/$missing_id"
+  write_approval_ready_state "$missing_dir" "website"
+  mkdir -p "$missing_dir/skills"
+  write_json "$missing_dir/skills/resolved.json" '{"resolved": [{"slug": "browser-game-product-quality"}]}'
+
+  if "$ROOT/bin/rds-readiness" "$missing_id" --root "$TMP_ROOT" >/tmp/rds-autonomy-skill-missing-readiness.out 2>&1; then
+    echo "FATAL: readiness accepted selected skills with no scorecard" >&2
+    exit 1
+  fi
+  jq -e '.issues[] | select(.code == "evidence_ledger_blocking" and (.detail | contains("skill_scorecard_missing")))' "$missing_dir/readiness.json" >/dev/null
+
+  local app="$TMP_ROOT/game-app"
+  local score_dir="$TMP_ROOT/builds/autonomy-game-scorecard"
+  mkdir -p "$app/src" "$score_dir/skills"
+  write_json "$score_dir/skills/resolved.json" '{"resolved": [{"slug": "browser-game-product-quality", "install": {"command": "bin/rds-skill-materialize browser-game-product-quality"}, "verify": {"command": "bin/rds-skill-verify browser-game-product-quality"}}]}'
+  cat > "$app/package.json" <<'JSON'
+{"dependencies":{},"devDependencies":{}}
+JSON
+  cat > "$app/src/App.tsx" <<'TSX'
+export default function App() {
+  return <main><h1>Game</h1><button>Click</button></main>;
+}
+TSX
+  mkdir -p "$app/.rds/skills"
+  cp "$ROOT/skills/built-in/browser-game-product-quality/AGENTS.md" "$app/.rds/skills/browser-game-product-quality.md"
+  cp "$ROOT/skills/built-in/browser-game-product-quality/rds-skill.yaml" "$app/.rds/skills/browser-game-product-quality.yaml"
+
+  "$ROOT/bin/rds-skill-scorecard" --build-dir "$score_dir" --app-dest "$app" --rds-root "$ROOT" >/tmp/rds-autonomy-scorecard.out
+  jq -e '.totals.fail == 1 and .skills[0].slug == "browser-game-product-quality"' "$score_dir/skills/scorecard.json" >/dev/null
+  "$ROOT/bin/rds-quality-ledger" "autonomy-game-scorecard" --root "$TMP_ROOT" >/tmp/rds-autonomy-scorecard-quality.out
+  jq -e '
+    .verdicts.skillImpact == "fail" and
+    ([.blocking[]] | index("skillImpact")) and
+    .skillImpact.blockingSkills[0].slug == "browser-game-product-quality"
+  ' "$score_dir/quality-ledger.json" >/dev/null
+
+  local shadcn_app="$TMP_ROOT/shadcn-install-only-app"
+  local shadcn_dir="$TMP_ROOT/builds/autonomy-shadcn-scorecard"
+  mkdir -p "$shadcn_app/app" "$shadcn_app/components/ui" "$shadcn_app/lib" "$shadcn_dir/skills"
+  write_json "$shadcn_dir/skills/resolved.json" '{"resolved": [{"slug": "shadcn-add", "install": {"command": "skills/built-in/shadcn-add/install.sh"}, "verify": {"command": "skills/built-in/shadcn-add/verify.sh"}}]}'
+  cat > "$shadcn_app/package.json" <<'JSON'
+{"dependencies":{"tailwindcss":"^3.4.14"},"devDependencies":{}}
+JSON
+  cat > "$shadcn_app/app/globals.css" <<'CSS'
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+CSS
+  for path in components.json tailwind.config.ts postcss.config.mjs lib/utils.ts components/ui/button.tsx components/ui/card.tsx components/ui/input.tsx components/ui/label.tsx components/ui/badge.tsx; do
+    mkdir -p "$shadcn_app/$(dirname "$path")"
+    printf 'export {}\n' > "$shadcn_app/$path"
+  done
+  mkdir -p "$shadcn_app/.rds/skills"
+  cp "$ROOT/skills/built-in/shadcn-add/AGENTS.md" "$shadcn_app/.rds/skills/shadcn-add.md"
+  cp "$ROOT/skills/built-in/shadcn-add/rds-skill.yaml" "$shadcn_app/.rds/skills/shadcn-add.yaml"
+  "$ROOT/bin/rds-skill-scorecard" --build-dir "$shadcn_dir" --app-dest "$shadcn_app" --rds-root "$ROOT" >/tmp/rds-autonomy-shadcn-scorecard.out
+  jq -e '.totals.partial == 1 and .skills[0].slug == "shadcn-add" and .skills[0].shape.evidence.ui_imports_count == 0' "$shadcn_dir/skills/scorecard.json" >/dev/null
+  "$ROOT/bin/rds-quality-ledger" "autonomy-shadcn-scorecard" --root "$TMP_ROOT" >/tmp/rds-autonomy-shadcn-quality.out
+  jq -e '
+    .verdicts.skillImpact == "partial" and
+    ([.blocking[]] | index("skillImpact")) and
+    .skillImpact.blockingSkills[0].slug == "shadcn-add"
+  ' "$shadcn_dir/quality-ledger.json" >/dev/null
+  jq -n '{name:"skill-scorecard-contract", status:"pass", assertion:"selected game skill needs generated app shape evidence"}' >>"$TMP_ROOT/checks.jsonl"
+  printf '✓ %-22s selected skills require scorecard and shape probes\n' "skill-scorecard"
+}
+
+run_scenario_selfheal_checks() {
+  # A scenario contract is generated once at build time and frozen. If it carries
+  # a bogus capability the PRD forbids (e.g. a "Submit order" workflow for a
+  # read-only dashboard), the gate must catch it and rds-qa must self-heal by
+  # regenerating from the current PRD. This guards both the gate's forbidden-noun
+  # detection and the regeneration-heals-contract invariant rds-qa depends on.
+  local id="autonomy-scenario-selfheal"
+  local build_dir="$TMP_ROOT/builds/$id"
+  mkdir -p "$build_dir"
+  write_json "$build_dir/state.json" '{"app_type": "dashboard"}'
+  cat > "$build_dir/spec.md" <<'MD'
+# Acme Financial Copilot
+
+Acme is a read-only financial copilot dashboard for an operator. The operator
+opens a daily briefing card, creates a review packet, and logs a decision in the
+decision journal. Users must be able to search holdings and filter alerts to
+build operator confidence in the advisory workflow.
+
+Read-only by construction: there is no order/trade/write API route. The app
+never submits orders and never mutates positions. It is advisory only.
+MD
+  write_json "$build_dir/qa-scenarios.json" '{
+    "schema": "rds.qa.scenarios.v1",
+    "appType": "dashboard",
+    "scenarios": [
+      {
+        "id": "primary-workflow",
+        "title": "Complete the primary workflow",
+        "mustVerify": ["main action is visible", "controls change durable state"],
+        "actions": [{"type": "click", "target": "Submit order|Create order|New order"}],
+        "expectations": [{"type": "state-change"}],
+        "blockingIfMissing": true
+      },
+      {
+        "id": "secondary-controls",
+        "title": "Exercise search/filter controls",
+        "mustVerify": ["controls are not no-ops", "sample data is realistic"],
+        "actions": [{"type": "click", "target": "Search"}],
+        "expectations": [{"type": "state-change"}],
+        "blockingIfMissing": true
+      },
+      {
+        "id": "operator-confidence",
+        "title": "Verify operator confidence and layout",
+        "mustVerify": ["state is legible", "no overflow on mobile"],
+        "expectations": [{"type": "visible", "target": "operator|workflow"}],
+        "blockingIfMissing": true
+      }
+    ]
+  }'
+
+  # 1. The gate must FAIL the frozen contract because "order" appears in the PRD
+  #    only inside a negating clause ("there is no order/trade ... read-only").
+  if "$ROOT/bin/rds-scenario-gate" "$id" --root "$TMP_ROOT" >/tmp/rds-autonomy-selfheal-pre.out 2>&1; then
+    echo "FATAL: scenario gate passed a contract testing a PRD-forbidden capability" >&2
+    cat "$build_dir/qa-scenario-gate.json" >&2
+    exit 1
+  fi
+  jq -e '
+    .status == "fail" and
+    .metrics.forbiddenActionTargets == 1 and
+    ([.issues[].code] | index("qa_scenarios_forbidden_actions"))
+  ' "$build_dir/qa-scenario-gate.json" >/dev/null
+
+  # 2. rds-qa must be wired to self-heal the contract before crawling.
+  grep -q "RDS_QA_SCENARIO_SELFHEAL" "$ROOT/bin/rds-qa"
+  grep -q "bin/rds-qa-scenarios" "$ROOT/bin/rds-qa"
+  grep -q "bin/rds-scenario-gate" "$ROOT/bin/rds-qa"
+
+  # 3. Regenerating from the current PRD (the heart of self-heal) must drop the
+  #    forbidden target and produce a contract that now passes the gate.
+  "$ROOT/bin/rds-qa-scenarios" "$id" --root "$TMP_ROOT" >/tmp/rds-autonomy-selfheal-regen.out
+  "$ROOT/bin/rds-scenario-gate" "$id" --root "$TMP_ROOT" >/tmp/rds-autonomy-selfheal-post.out
+  jq -e '.status == "pass"' "$build_dir/qa-scenario-gate.json" >/dev/null
+  if grep -q "Submit order" "$build_dir/qa-scenarios.json"; then
+    echo "FATAL: self-heal regeneration kept the PRD-forbidden order workflow" >&2
+    exit 1
+  fi
+  jq -e '
+    [.scenarios[] | select(.id == "primary-workflow") | .actions[].target] | length >= 1
+  ' "$build_dir/qa-scenarios.json" >/dev/null
+
+  jq -n '{name:"scenario-selfheal", status:"pass", assertion:"frozen PRD-forbidden scenario fails the gate and regenerating from the current PRD heals the contract"}' >>"$TMP_ROOT/checks.jsonl"
+  printf '✓ %-22s stale PRD-forbidden contract self-heals\n' "scenario-selfheal"
+}
+
+run_taste_gate_checks() {
+  local weak_id="autonomy-weak-taste"
+  local weak_dir="$TMP_ROOT/builds/$weak_id"
+  mkdir -p "$weak_dir"
+  cat > "$weak_dir/spec.md" <<'MD'
+# POLIS
+
+POLIS is a two-player abstract strategy board game with legal moves, custodial capture, turn order, victory pressure, and mobile-first play.
+MD
+  write_json "$weak_dir/taste-brief.json" '{
+    "schema": "rds.taste.brief.v1",
+    "app_type": "game",
+    "position": "Build POLIS as a good game.",
+    "quality_bar": ["Make it polished.", "Make it fun."],
+    "anti_goals": ["Do not make it generic."],
+    "acceptance": ["The game works."]
+  }'
+  write_json "$weak_dir/qa-scenarios.json" '{"scenarios": [{"name": "one"}]}'
+
+  if "$ROOT/bin/rds-taste-gate" "$weak_id" --root "$TMP_ROOT" >/tmp/rds-autonomy-weak-taste.out 2>&1; then
+    echo "FATAL: taste gate accepted a thin generic POLIS brief" >&2
+    cat "$weak_dir/taste-gate.json" >&2
+    exit 1
+  fi
+  jq -e '
+    .status == "fail" and
+    ([.issues[].code] | index("taste_brief_too_thin")) and
+    ([.issues[].code] | index("game_taste_contract_weak"))
+  ' "$weak_dir/taste-gate.json" >/dev/null
+  "$ROOT/bin/rds-evidence-ledger" "$weak_id" --root "$TMP_ROOT" >/tmp/rds-autonomy-weak-taste-evidence.out
+  jq -e '([.blockers[].code] | index("taste_gate_blocking"))' "$weak_dir/evidence-ledger.json" >/dev/null
+
+  local strong_id="autonomy-strong-taste"
+  local strong_dir="$TMP_ROOT/builds/$strong_id"
+  mkdir -p "$strong_dir"
+  cat > "$strong_dir/spec.md" <<'MD'
+# POLIS
+
+POLIS is a two-player abstract strategy board game with legal moves, custodial capture, turn order, victory pressure, selected pieces, score, restart, and mobile-first play.
+MD
+  write_json "$strong_dir/taste-brief.json" '{
+    "schema": "rds.taste.brief.v1",
+    "app_type": "game",
+    "position": "Build POLIS as a tactile abstract strategy board game where the board is the product.",
+    "quality_bar": [
+      "Make the first-screen hierarchy put the board, turn, and legal move state first.",
+      "Make selected pieces, legal moves, illegal moves, custodial capture, and next-turn feedback obvious.",
+      "Use a specific visual hierarchy for an abstract strategy board rather than an admin dashboard.",
+      "Keep the interaction model playable on desktop and mobile.",
+      "Tie score, victory pressure, restart, and move history to visible player feedback."
+    ],
+    "anti_goals": [
+      "Small static board.",
+      "Generic dashboard chrome around gameplay.",
+      "Rules copy replacing interaction feedback."
+    ],
+    "acceptance": [
+      "A new player knows whose turn it is within 10 seconds.",
+      "Selecting a piece reveals legal moves.",
+      "Captures and score/victory pressure are visible after each move.",
+      "Restart is instant and the board remains stable on mobile."
+    ]
+  }'
+  write_json "$strong_dir/qa-scenarios.json" '{"scenarios": [{"name": "turn"}, {"name": "legal moves"}, {"name": "capture"}]}'
+
+  "$ROOT/bin/rds-taste-gate" "$strong_id" --root "$TMP_ROOT" >/tmp/rds-autonomy-strong-taste.out
+  jq -e '.status == "pass" and .metrics.qaScenarios == 3' "$strong_dir/taste-gate.json" >/dev/null
+  jq -n '{name:"taste-gate", status:"pass", assertion:"thin POLIS-like briefs fail before scaffold while concrete game briefs pass"}' >>"$TMP_ROOT/checks.jsonl"
+  printf '✓ %-22s weak product direction fails before scaffold\n' "taste-gate"
+}
+
+run_scenario_gate_checks() {
+  local weak_id="autonomy-weak-scenarios"
+  local weak_dir="$TMP_ROOT/builds/$weak_id"
+  mkdir -p "$weak_dir"
+  write_json "$weak_dir/state.json" '{"app_type": "game"}'
+  write_json "$weak_dir/qa-scenarios.json" '{
+    "schema": "rds.qa.scenarios.v1",
+    "appType": "game",
+    "scenarios": [
+      {"id": "smoke", "title": "Page loads", "mustVerify": ["loads"], "blockingIfMissing": false}
+    ]
+  }'
+
+  if "$ROOT/bin/rds-scenario-gate" "$weak_id" --root "$TMP_ROOT" >/tmp/rds-autonomy-weak-scenarios.out 2>&1; then
+    echo "FATAL: scenario gate accepted a generic game smoke scenario" >&2
+    cat "$weak_dir/qa-scenario-gate.json" >&2
+    exit 1
+  fi
+  jq -e '
+    .status == "fail" and
+    ([.issues[].code] | index("qa_scenarios_too_few")) and
+    ([.issues[].code] | index("qa_scenarios_not_binding")) and
+    ([.issues[].code] | index("board_game_scenarios_weak"))
+  ' "$weak_dir/qa-scenario-gate.json" >/dev/null
+  "$ROOT/bin/rds-evidence-ledger" "$weak_id" --root "$TMP_ROOT" >/tmp/rds-autonomy-weak-scenarios-evidence.out
+  jq -e '([.blockers[].code] | index("qa_scenario_gate_blocking"))' "$weak_dir/evidence-ledger.json" >/dev/null
+
+  local strong_id="autonomy-strong-scenarios"
+  local strong_dir="$TMP_ROOT/builds/$strong_id"
+  mkdir -p "$strong_dir"
+  write_json "$strong_dir/state.json" '{"app_type": "game"}'
+  write_json "$strong_dir/qa-scenarios.json" '{
+    "schema": "rds.qa.scenarios.v1",
+    "appType": "game",
+    "scenarios": [
+      {
+        "id": "start-play-loop",
+        "title": "Start and play the POLIS board turn loop",
+        "mustVerify": ["visible start/play affordance", "board and cells dominate the first viewport", "multiple inputs change meaningful game state"],
+        "actions": [{"type": "click", "target": "start"}, {"type": "click", "target": "board|cell|piece"}, {"type": "click", "target": "legal move|cell"}],
+        "expectations": [{"type": "state-change"}],
+        "blockingIfMissing": true
+      },
+      {
+        "id": "legal-capture-victory-feedback",
+        "title": "Verify legal move, capture, score, and victory feedback",
+        "mustVerify": ["current turn is visible", "selected piece and legal moves are visible", "capture/score/victory pressure is visible"],
+        "actions": [{"type": "wait", "ms": 1200}],
+        "expectations": [{"type": "visible", "target": "turn|legal|capture|score|victory"}],
+        "blockingIfMissing": true
+      },
+      {
+        "id": "restart-mobile-board",
+        "title": "Restart and inspect mobile board playability",
+        "mustVerify": ["restart/reset control exists", "mobile board remains playable", "no clipped or overlapping controls"],
+        "actions": [{"type": "press", "key": "KeyR"}],
+        "expectations": [{"type": "text", "value": "restart|reset|new game|mobile"}],
+        "blockingIfMissing": true
+      }
+    ]
+  }'
+  "$ROOT/bin/rds-scenario-gate" "$strong_id" --root "$TMP_ROOT" >/tmp/rds-autonomy-strong-scenarios.out
+  jq -e '.status == "pass" and .metrics.scenarios == 3' "$strong_dir/qa-scenario-gate.json" >/dev/null
+
+  local generic_id="autonomy-generic-app-scenarios"
+  local generic_dir="$TMP_ROOT/builds/$generic_id"
+  mkdir -p "$generic_dir"
+  write_json "$generic_dir/state.json" '{"app_type": "web-app"}'
+  write_json "$generic_dir/qa-scenarios.json" '{
+    "schema": "rds.qa.scenarios.v1",
+    "appType": "web-app",
+    "scenarios": [
+      {
+        "id": "primary-workflow",
+        "title": "Complete the primary workflow",
+        "mustVerify": ["main action is visible", "controls change durable state"],
+        "actions": [{"type": "click", "target": "Save|Submit|Create|Approve|Apply"}],
+        "expectations": [{"type": "state-change"}],
+        "blockingIfMissing": true
+      },
+      {
+        "id": "secondary-controls",
+        "title": "Exercise search/filter/settings/export-style controls",
+        "mustVerify": ["visible controls are not no-ops", "sample data is realistic"],
+        "actions": [{"type": "click", "target": "Export|Filter|Search|Settings"}],
+        "expectations": [{"type": "state-change"}],
+        "blockingIfMissing": true
+      },
+      {
+        "id": "prd-text-only",
+        "title": "Verify PRD promise: operator sees source-backed workflow",
+        "mustVerify": ["operator sees source-backed workflow", "not implemented as placeholder text only"],
+        "expectations": [{"type": "text", "value": "operator|source|workflow"}],
+        "blockingIfMissing": true
+      }
+    ]
+  }'
+  if "$ROOT/bin/rds-scenario-gate" "$generic_id" --root "$TMP_ROOT" >/tmp/rds-autonomy-generic-scenarios.out 2>&1; then
+    echo "FATAL: scenario gate accepted generic web-app button and text-only promise scenarios" >&2
+    cat "$generic_dir/qa-scenario-gate.json" >&2
+    exit 1
+  fi
+  jq -e '
+    .status == "fail" and
+    ([.issues[].code] | index("qa_scenarios_generic_actions")) and
+    ([.issues[].code] | index("qa_scenarios_text_only_promises"))
+  ' "$generic_dir/qa-scenario-gate.json" >/dev/null
+
+  jq -n '{name:"scenario-gate", status:"pass", assertion:"generic scenarios fail before scaffold while concrete board-game scenarios pass"}' >>"$TMP_ROOT/checks.jsonl"
+  printf '✓ %-22s weak QA scenarios fail before scaffold\n' "scenario-gate"
+}
+
+run_evidence_freshness_checks() {
+  local id="autonomy-stale-evidence"
+  local build_dir="$TMP_ROOT/builds/$id"
+  write_approval_ready_state "$build_dir" "website"
+  write_json "$build_dir/events.jsonl" '{"ts":"2099-01-01T00:00:05Z","event":"qa_iteration_completed","payload":{"iteration":"1","rc":"0"}}
+{"ts":"2099-01-01T00:00:10Z","event":"iterate_deploy_completed","payload":{"exit_code":"0"}}'
+
+  if "$ROOT/bin/rds-readiness" "$id" --root "$TMP_ROOT" >/tmp/rds-autonomy-freshness-readiness.out 2>&1; then
+    echo "FATAL: readiness accepted stale evidence after a newer app-changing action" >&2
+    cat "$build_dir/readiness.json" >&2
+    exit 1
+  fi
+  jq -e '.issues[] | select(.code == "qa_evidence_stale")' "$build_dir/readiness.json" >/dev/null
+  jq -e '.issues[] | select(.code == "taste_review_stale")' "$build_dir/readiness.json" >/dev/null
+  jq -e '.issues[] | select(.code == "quality_ledger_stale")' "$build_dir/readiness.json" >/dev/null
+  "$ROOT/bin/rds-evidence-ledger" "$id" --root "$TMP_ROOT" >/tmp/rds-autonomy-freshness-evidence.out
+  jq -e '
+    .verdict == "blocked" and
+    .summary.blockerClass == "missing_or_stale_evidence" and
+    ([.blockers[].code] | index("qa_evidence_stale")) and
+    ([.blockers[].code] | index("taste_review_stale")) and
+    ([.blockers[].code] | index("quality_ledger_stale"))
+  ' "$build_dir/evidence-ledger.json" >/dev/null
+  jq -n '{name:"evidence-freshness", status:"pass", assertion:"newer app-changing work invalidates stale QA/taste/ledger evidence"}' >>"$TMP_ROOT/checks.jsonl"
+  printf '✓ %-22s stale evidence blocks review readiness\n' "evidence-freshness"
+
+  local taste_id="autonomy-stale-taste-product"
+  local taste_dir="$TMP_ROOT/builds/$taste_id"
+  write_approval_ready_state "$taste_dir" "website"
+  write_json "$taste_dir/taste-review.json" '{"status": "needs_iteration", "score": 70, "threshold": 75, "missing": ["primary_workflow"]}'
+  write_json "$taste_dir/quality-ledger.json" '{"blocking": ["taste"]}'
+  write_json "$taste_dir/events.jsonl" '{"ts":"2099-01-01T00:00:10Z","event":"qa_iteration_completed","payload":{"iteration":"1","rc":"0"}}'
+  touch -d '2099-01-01T00:00:00Z' "$taste_dir/taste-review.json" "$taste_dir/quality-ledger.json"
+  find "$taste_dir/playwright/iter-001" -type f -exec touch -d '2099-01-01T00:00:10Z' {} +
+  "$ROOT/bin/rds-readiness" "$taste_id" --root "$TMP_ROOT" >/tmp/rds-autonomy-stale-taste-readiness.out 2>&1 || true
+  "$ROOT/bin/rds-evidence-ledger" "$taste_id" --root "$TMP_ROOT" >/tmp/rds-autonomy-stale-taste-evidence.out
+  jq -e '
+    .verdict == "blocked" and
+    .summary.blockerClass == "missing_or_stale_evidence" and
+    (.summary.nextAction | test("Rerun taste review")) and
+    ([.blockers[].code] | index("taste_review_stale")) and
+    ([.blockers[].code] | index("taste_review_blocking"))
+  ' "$taste_dir/evidence-ledger.json" >/dev/null
+  jq -n '{name:"stale-taste-priority", status:"pass", assertion:"stale taste review outranks old product-quality taste blockers"}' >>"$TMP_ROOT/checks.jsonl"
+  printf '✓ %-22s stale taste outranks old product blockers\n' "stale-taste-priority"
+
+  local incomplete_id="autonomy-incomplete-iterate"
+  local incomplete_dir="$TMP_ROOT/builds/$incomplete_id"
+  write_approval_ready_state "$incomplete_dir" "website"
+  write_json "$incomplete_dir/events.jsonl" '{"ts":"2000-01-01T00:00:00Z","event":"iterate_started","payload":{"provider":"codex","request":"builds/autonomy-incomplete-iterate/iterate-20000101-000000.md"}}'
+  "$ROOT/bin/rds-evidence-ledger" "$incomplete_id" --root "$TMP_ROOT" >/tmp/rds-autonomy-incomplete-iterate-evidence.out
+  jq -e '
+    .verdict == "blocked" and
+    .summary.blockerClass == "missing_or_stale_evidence" and
+    .summary.running == false and
+    .summary.recovering == false and
+    ([.blockers[].code] | index("incomplete_iterate_session"))
+  ' "$incomplete_dir/evidence-ledger.json" >/dev/null
+  jq -n '{name:"incomplete-iterate", status:"pass", assertion:"stale iterate_started without terminal event becomes resumable evidence blocker"}' >>"$TMP_ROOT/checks.jsonl"
+  printf '✓ %-22s incomplete iterate becomes recoverable truth\n' "incomplete-iterate"
+
+  local recovered_id="autonomy-incomplete-iterate-recovered"
+  local recovered_dir="$TMP_ROOT/builds/$recovered_id"
+  write_approval_ready_state "$recovered_dir" "website"
+  write_json "$recovered_dir/events.jsonl" '{"ts":"2000-01-01T00:00:00Z","event":"iterate_started","payload":{"provider":"codex","request":"builds/autonomy-incomplete-iterate-recovered/iterate-20000101-000000.md"}}
+{"ts":"2000-01-01T00:10:00Z","event":"qa_iteration_completed","payload":{"iteration":"1","rc":"0"}}
+{"ts":"2000-01-01T00:10:01Z","event":"stage_completed","payload":{"stage":"qa"}}
+{"ts":"2000-01-01T00:10:02Z","event":"stage_completed","payload":{"stage":"taste-review"}}'
+  write_json "$recovered_dir/readiness.json" '{"schema":"rds.readiness.v1","status":"pass","issues":[]}'
+  "$ROOT/bin/rds-evidence-ledger" "$recovered_id" --root "$TMP_ROOT" >/tmp/rds-autonomy-incomplete-iterate-recovered-evidence.out
+  jq -e '
+    .verdict == "pending_review" and
+    .summary.blockerClass == "none" and
+    ([.blockers[].code] | index("incomplete_iterate_session") | not)
+  ' "$recovered_dir/evidence-ledger.json" >/dev/null
+  jq -n '{name:"incomplete-iterate-recovered", status:"pass", assertion:"later successful verification closes a stale unterminated iterate session"}' >>"$TMP_ROOT/checks.jsonl"
+  printf '✓ %-22s later verification closes incomplete iterate\n' "incomplete-iterate-recovered"
+}
+
+run_deploy_identity_checks() {
+  local id="autonomy-deploy-identity"
+  local build_dir="$TMP_ROOT/builds/$id"
+  write_approval_ready_state "$build_dir" "website"
+  write_json "$build_dir/deploy-fingerprint.json" '{"schema":"rds.deploy-fingerprint.v1","hash":"current-artifact","url":"https://example.invalid"}'
+  write_json "$build_dir/playwright/iter-001/deploy-fingerprint.json" '{"schema":"rds.deploy-fingerprint.v1","hash":"qa-artifact","url":"https://example.invalid"}'
+  write_json "$build_dir/playwright/iter-001/qa-target.json" '{"schema":"rds.qa-target.v1","baseUrl":"https://example.invalid","deployFingerprint":"playwright/iter-001/deploy-fingerprint.json"}'
+
+  if "$ROOT/bin/rds-readiness" "$id" --root "$TMP_ROOT" >/tmp/rds-autonomy-deploy-identity-readiness.out 2>&1; then
+    echo "FATAL: readiness accepted QA evidence from a different deployed artifact" >&2
+    cat "$build_dir/readiness.json" >&2
+    exit 1
+  fi
+  jq -e '.issues[] | select(.code == "deploy_fingerprint_mismatch")' "$build_dir/readiness.json" >/dev/null
+  "$ROOT/bin/rds-evidence-ledger" "$id" --root "$TMP_ROOT" >/tmp/rds-autonomy-deploy-identity-evidence.out
+  jq -e '
+    .verdict == "blocked" and
+    .summary.blockerClass == "missing_or_stale_evidence" and
+    ([.blockers[].code] | index("deploy_fingerprint_mismatch"))
+  ' "$build_dir/evidence-ledger.json" >/dev/null
+  jq -n '{name:"deploy-identity", status:"pass", assertion:"QA evidence must match the current deployed artifact fingerprint"}' >>"$TMP_ROOT/checks.jsonl"
+  printf '✓ %-22s deployed artifact mismatch blocks review\n' "deploy-identity"
+}
+
+run_service_runtime_checks() {
+  local id="autonomy-service-runtime"
+  local build_dir="$TMP_ROOT/builds/$id"
+  write_approval_ready_state "$build_dir" "website"
+  write_json "$build_dir/deploy-fingerprint.json" '{"schema":"rds.deploy-fingerprint.v1","hash":"current-artifact","runtimeMarkerPath":"/.well-known/rds-deploy-fingerprint.json","url":"https://example.invalid"}'
+  write_json "$build_dir/service-runtime.json" '{"schema":"rds.service-runtime.v1","status":"fail","expectedHash":"current-artifact","servedHash":"old-artifact","error":"runtime marker did not match deploy fingerprint"}'
+  write_json "$build_dir/playwright/iter-001/deploy-fingerprint.json" '{"schema":"rds.deploy-fingerprint.v1","hash":"current-artifact","runtimeMarkerPath":"/.well-known/rds-deploy-fingerprint.json","url":"https://example.invalid"}'
+  write_json "$build_dir/playwright/iter-001/service-runtime.json" '{"schema":"rds.service-runtime.v1","status":"pass","expectedHash":"current-artifact","servedHash":"current-artifact"}'
+  write_json "$build_dir/playwright/iter-001/qa-target.json" '{"schema":"rds.qa-target.v1","baseUrl":"https://example.invalid","deployFingerprint":"playwright/iter-001/deploy-fingerprint.json","serviceRuntime":"playwright/iter-001/service-runtime.json"}'
+
+  if "$ROOT/bin/rds-readiness" "$id" --root "$TMP_ROOT" >/tmp/rds-autonomy-service-runtime-readiness.out 2>&1; then
+    echo "FATAL: readiness accepted a live service runtime marker mismatch" >&2
+    cat "$build_dir/readiness.json" >&2
+    exit 1
+  fi
+  jq -e '.issues[] | select(.code == "service_runtime_failed")' "$build_dir/readiness.json" >/dev/null
+  "$ROOT/bin/rds-evidence-ledger" "$id" --root "$TMP_ROOT" >/tmp/rds-autonomy-service-runtime-evidence.out
+  jq -e '
+    .verdict == "blocked" and
+    .summary.blockerClass == "missing_or_stale_evidence" and
+    ([.blockers[].code] | index("service_runtime_failed"))
+  ' "$build_dir/evidence-ledger.json" >/dev/null
+  jq -n '{name:"service-runtime", status:"pass", assertion:"live runtime marker must match deploy fingerprint before review"}' >>"$TMP_ROOT/checks.jsonl"
+  printf '✓ %-22s live runtime marker mismatch blocks review\n' "service-runtime"
+}
+
+run_approval_gate_checks() {
+  local build_dir="$ROOT/builds/$APPROVAL_BLOCK_ID"
+  cleanup
+  write_approval_ready_state "$build_dir" "website"
+  write_json "$build_dir/readiness.json" '{"schema":"rds.readiness.v1","status":"fail","issues":[{"code":"scenario_verdict_blocking","detail":"scenario fails"}]}'
+
+  if "$ROOT/bin/rds-approve" "$APPROVAL_BLOCK_ID" --by=fixture >/tmp/rds-autonomy-approve-block.out 2>&1; then
+    echo "FATAL: approval CLI accepted a blocked evidence verdict" >&2
+    exit 1
+  fi
+  grep -q "refusing approval; canonical truth verdict is 'blocked'" /tmp/rds-autonomy-approve-block.out
+  jq -e '.review.status == "pending"' "$build_dir/state.json" >/dev/null
+  jq -n '{name:"approval-gate", status:"pass", assertion:"rds-approve refuses blocked canonical truth"}' >>"$TMP_ROOT/checks.jsonl"
+  printf '✓ %-22s approval refuses blocked evidence\n' "approval-gate"
+}
+
+start_dashboard
+
+run_display_name_checks
+run_spec_readiness_checks
+
+run_case "polis-game" "game-engine" "game" "browser-game-product-quality" \
+'POLIS is a two-player abstract strategy web game. Non-Goals: Native iOS/Android apps and online matchmaking.'
+
+run_case "ops-dashboard" "rails-web" "dashboard" "postgres-mcp" \
+'Build an operator dashboard for approvals, audit history, records, filters, exports, forms, admin workflows, and Postgres-backed CRUD.'
+
+run_case "marketing-site" "astro-thin-web" "website" "astro-content-collections-skill" \
+'Build a marketing website with a landing page, SEO content, case studies, newsletter capture, and responsive sections.'
+
+run_case "browser-extension" "browser-extension" "web-app" "wxt-config-skill" \
+'Build a Chrome extension using Manifest V3 with a popup, content script, browser storage sync, and selected-page permissions.'
+
+run_case "mobile-native" "mobile-native" "web-app" "expo-router-codegen" \
+'Build an iOS and Android mobile app with Expo, React Native, phone-first navigation, offline-friendly screens, and EAS build readiness.'
+
+run_case "rag-service" "python-ai-service" "web-app" "llm-pydantic-ai" \
+'Build a FastAPI Python agent service with Pydantic AI, typed extraction, embeddings, vector search, webhook endpoints, and evaluation criteria.'
+
+run_readiness_checks
+run_evidence_split_brain_checks
+run_readiness_truth_checks
+run_skill_scorecard_checks
+run_scenario_gate_checks
+run_scenario_selfheal_checks
+run_taste_gate_checks
+run_evidence_freshness_checks
+run_deploy_identity_checks
+run_service_runtime_checks
+run_approval_gate_checks
+run_watchdog_attempt_checks
+run_fixer_checks
+
+jq -n \
+  --slurpfile cases "$TMP_ROOT/cases.jsonl" \
+  --slurpfile checks "$TMP_ROOT/checks.jsonl" \
+  '{schema:"rds.autonomy-fixture.v1", status:"pass", cases:$cases, checks:$checks}' \
+  >"$RESULT_JSON"
+
+echo "Autonomy fixtures passed."
+echo "Artifacts: $TMP_ROOT"
+echo "Result: $RESULT_JSON"

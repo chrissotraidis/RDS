@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+RDS_ROOT="$ROOT"
+source "$ROOT/bin/lib/common.sh"
+source "$ROOT/bin/lib/agents.sh"
+
+ID="${1:-}"
+[[ -n "$ID" ]] || { echo "usage: bin/rds-agent-status <session-id>" >&2; exit 2; }
+JSON_PATH="$(agent_find_session_json "$ID")" || { echo "No agent session named $ID" >&2; exit 1; }
+WORKTREE="$(agent_json_get "$JSON_PATH" '.worktree_path')"
+TMUX_SESSION="$(agent_json_get "$JSON_PATH" '.tmux_session')"
+LOG_REL="$(agent_json_get "$JSON_PATH" '.log_path')"
+LOG_PATH="$ROOT/$LOG_REL"
+STATUS="$(agent_json_get "$JSON_PATH" '.status')"
+if agent_tmux_exists "$TMUX_SESSION"; then
+  STATUS="running"
+elif [[ "$STATUS" == "running" || "$STATUS" == "starting" ]]; then
+  STATUS="exited"
+fi
+changed="$(agent_changed_files_json "$WORKTREE")"
+agent_update_json "$JSON_PATH" --arg status "$STATUS" --arg now "$(agent_now)" --argjson changed "$changed" '.status = $status | .updated_at = $now | .changed_files = $changed'
+jq --arg tmux_exists "$(agent_tmux_exists "$TMUX_SESSION" && echo true || echo false)" --arg log_tail "$(tail -n 40 "$LOG_PATH" 2>/dev/null || true)" '. + {tmux_exists: ($tmux_exists == "true"), log_tail: $log_tail}' "$JSON_PATH"
+

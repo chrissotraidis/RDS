@@ -1,0 +1,48 @@
+---
+slug: python-ai-service
+runtime_id: python-ai-service
+name: Python AI service
+description: FastAPI backend for LLM agents, structured extraction, RAG services,
+  and API-first AI workflows.
+category: llm-backend
+v1_status: ship
+priority: 4
+language:
+  primary: python
+  versions:
+    python: '3.12'
+framework:
+  name: fastapi
+  version: '0.136'
+scaffold:
+  command: stacks/python-ai-service/init.sh
+commands:
+  install: python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt
+  run: uvicorn app.main:app --host 0.0.0.0 --port ${HOST_PORT}
+  test: pytest -q
+  lint: python -m compileall app tests
+  doctor: stacks/python-ai-service/doctor.sh
+ports:
+  range:
+  - 4000
+  - 4099
+health_path: "/health"
+deploy:
+  preview_on_zo: durable-zo-http-service
+  default_external: fly
+mockup_analog:
+  primary: single-html-mockup
+public_preview_model:
+  type: api-docs
+compatible_skills:
+  primary:
+  - llm-pydantic-ai
+  universal:
+  - rds-context7-mount
+  - rds-secrets-broker
+  - rds-mockup-fidelity
+  - rds-eval-harness
+  - playwright-mcp
+agent_notes:
+  primary: claude-code
+  codex_role: Prompt variant generation and narrow endpoint patches.

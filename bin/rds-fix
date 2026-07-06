@@ -1,0 +1,1381 @@
+#!/usr/bin/env bash
+# bin/rds-fix — diagnose AND apply a fix for a stuck or failed build.
+#
+# Phase 1 (diagnose): reads state.json, the tail of events.jsonl, and the
+# latest stage log, then asks the build's selected provider to identify the root cause and
+# propose ONE concrete action. The diagnosis is written to
+# builds/<id>/fixer-<ts>.md and emitted as a fixer_started/fixer_completed
+# event pair on the build's event stream.
+#
+# Phase 2 (apply): if the diagnosis is marked "SAFE-TO-APPLY: yes" and
+# auto-apply is enabled (default), spawns a second provider pass with edit
+# permissions inside --app-dest to execute the proposed action. Output is
+# written to builds/<id>/fixer-apply-<ts>.log and bracketed by
+# fixer_apply_started/fixer_apply_completed events.
+#
+# Phase 3 (retry): if apply succeeded and auto-retry is enabled (default),
+# spawns `bin/rds-resume <id> --detach` so the failed/incomplete stage runs
+# again with the fix in place. One retry per fix attempt; the watchdog's
+# MAX_FIX_ATTEMPTS cap is what prevents infinite fix→retry→fail loops.
+# Bracketed by fixer_retry_started events; the resumed build emits its own
+# build_resumed / stage_started / build_completed|build_failed events.
+#
+# Usage:
+#   bin/rds-fix <build-id> [--max-budget-usd=N] [--diagnose-budget-usd=N]
+#               [--apply-budget-usd=N] [--no-apply] [--no-retry]
+#
+# Env:
+#   RDS_FIX_BUDGET_USD          default 2.0  (legacy global; fallback for both phases)
+#   RDS_FIX_DIAGNOSE_BUDGET_USD default 0.5  (diagnose-phase cap; LLM only writes a short MD)
+#   RDS_FIX_APPLY_BUDGET_USD    default 2.0  (apply-phase cap; LLM may edit project files)
+#   RDS_FIX_AUTO_APPLY          default 1    (set to 0 to diagnose only)
+#   RDS_FIX_AUTO_RETRY          default 1    (set to 0 to skip resume after apply)
+#   IS_SANDBOX                  forwarded to Claude where applicable (set to 1 inside Zo)
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck disable=SC1091
+source "$ROOT/bin/lib/common.sh"
+
+BUILD_ID="${1:-}"
+shift || true
+[[ -n "$BUILD_ID" ]] || { echo "usage: bin/rds-fix <build-id> [--max-budget-usd=N]" >&2; exit 1; }
+
+BUDGET="${RDS_FIX_BUDGET_USD:-2.0}"
+DIAGNOSE_BUDGET="${RDS_FIX_DIAGNOSE_BUDGET_USD:-0.5}"
+APPLY_BUDGET="${RDS_FIX_APPLY_BUDGET_USD:-2.0}"
+AUTO_APPLY="${RDS_FIX_AUTO_APPLY:-1}"
+AUTO_RETRY="${RDS_FIX_AUTO_RETRY:-1}"
+BUDGET_EXPLICIT=0
+for arg in "$@"; do
+  case "$arg" in
+    --max-budget-usd=*)      BUDGET="${arg#*=}"; BUDGET_EXPLICIT=1 ;;
+    --diagnose-budget-usd=*) DIAGNOSE_BUDGET="${arg#*=}" ;;
+    --apply-budget-usd=*)    APPLY_BUDGET="${arg#*=}" ;;
+    --no-apply)              AUTO_APPLY=0 ;;
+    --no-retry)              AUTO_RETRY=0 ;;
+    -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
+    *) echo "unknown arg: $arg" >&2; exit 1 ;;
+  esac
+done
+# Honor a legacy --max-budget-usd by spreading it across both phases unless
+# per-phase budgets were also explicitly overridden via env.
+if (( BUDGET_EXPLICIT == 1 )); then
+  [[ -n "${RDS_FIX_DIAGNOSE_BUDGET_USD:-}" ]] || DIAGNOSE_BUDGET="$BUDGET"
+  [[ -n "${RDS_FIX_APPLY_BUDGET_USD:-}"    ]] || APPLY_BUDGET="$BUDGET"
+fi
+
+BUILD_DIR="$RDS_BUILDS_DIR/$BUILD_ID"
+[[ -d "$BUILD_DIR" ]] || { echo "no such build: $BUILD_DIR" >&2; exit 1; }
+
+state="$(cat "$BUILD_DIR/state.json" 2>/dev/null || echo '{}')"
+app_dest="$(jq -r '.app_dest // empty' "$BUILD_DIR/state.json" 2>/dev/null || true)"
+PROVIDER="$(rds_build_provider_from_state "$BUILD_DIR")"
+PROVIDER="${PROVIDER:-${RDS_INFERENCE_PROVIDER:-claude}}"
+build_claude_model="$(jq -r '.inference.claude_model // empty' "$BUILD_DIR/state.json" 2>/dev/null || true)"
+build_codex_model="$(jq -r '.inference.codex_model // empty' "$BUILD_DIR/state.json" 2>/dev/null || true)"
+export RDS_CLAUDE_MODEL="${build_claude_model:-${RDS_CLAUDE_MODEL:-claude-opus-4-6}}"
+export RDS_CODEX_MODEL="${build_codex_model:-${RDS_CODEX_MODEL:-}}"
+events="$(tail -n 80 "$BUILD_DIR/events.jsonl" 2>/dev/null || true)"
+if [[ -x "$ROOT/bin/rds-evidence-ledger" ]]; then
+  "$ROOT/bin/rds-evidence-ledger" "$BUILD_ID" >/dev/null 2>&1 || true
+fi
+readiness="$(cat "$BUILD_DIR/readiness.json" 2>/dev/null || echo '{}')"
+truth="$(cat "$BUILD_DIR/truth.json" 2>/dev/null || echo '{}')"
+
+# Pick the most recently modified per-stage log; that's where things broke.
+stage_log=""
+if [[ -d "$BUILD_DIR/logs" ]]; then
+  stage_log="$(ls -t "$BUILD_DIR"/logs/*.log 2>/dev/null | head -n1 || true)"
+fi
+log_tail=""
+if [[ -n "$stage_log" ]]; then
+  log_tail="$(tail -n 200 "$stage_log")"
+fi
+
+# Also include the live shm log if it's still there.
+shm_log="/dev/shm/${BUILD_ID}-launch-build.log"
+shm_tail=""
+if [[ -f "$shm_log" ]]; then
+  shm_tail="$(tail -n 80 "$shm_log")"
+fi
+
+ts="$(date -u +%Y%m%d-%H%M%S)"
+out="$BUILD_DIR/fixer-$ts.md"
+
+deterministic_scaffold_budget_recovery() {
+  local combined="$log_tail"$'\n'"$shm_tail"
+  [[ "$combined" == *"Exceeded USD budget"* || "$combined" == *"session_exhausted"* ]] || return 1
+  [[ "$combined" == *"FATAL: scaffold incomplete"* || "$combined" == *"Task "*" marked error"* ]] || return 1
+
+  local plan="$BUILD_DIR/build-plan.json"
+  [[ -f "$plan" ]] || return 1
+
+  local state_failed task_errors
+  state_failed="$(jq -r '
+    ((.error // null) != null) or
+    ([.stages[]?.status] | any(. == "failed"))
+  ' "$BUILD_DIR/state.json" 2>/dev/null || echo false)"
+  task_errors="false"
+  if [[ -n "$app_dest" && -f "$app_dest/tasks.json" ]]; then
+    task_errors="$(jq -r '
+      [.tasks[]?.status] | any(. == "error" or . == "blocked")
+    ' "$app_dest/tasks.json" 2>/dev/null || echo false)"
+  fi
+  [[ "$state_failed" == "true" || "$task_errors" == "true" ]] || return 1
+
+  local app_type stack current_budget current_turns target_budget target_turns
+  app_type="$(jq -r '.app_type // "auto"' "$plan" 2>/dev/null || echo auto)"
+  stack="$(jq -r '.stack // "unknown"' "$plan" 2>/dev/null || echo unknown)"
+  current_budget="$(jq -r '.claude_budget_usd // 0' "$plan" 2>/dev/null || echo 0)"
+  current_turns="$(jq -r '.claude_max_turns // 0' "$plan" 2>/dev/null || echo 0)"
+
+  target_budget="${RDS_FIX_SCAFFOLD_BUDGET_USD:-2.0}"
+  target_turns="${RDS_FIX_SCAFFOLD_MAX_TURNS:-120}"
+  if [[ "$app_type" == "game" || "$stack" == "react" ]]; then
+    target_budget="${RDS_FIX_SCAFFOLD_BUDGET_USD:-3.0}"
+    target_turns="${RDS_FIX_SCAFFOLD_MAX_TURNS:-160}"
+  fi
+
+  local changed
+  changed="$(jq -n \
+    --argjson current_budget "${current_budget:-0}" \
+    --argjson current_turns "${current_turns:-0}" \
+    --argjson target_budget "$target_budget" \
+    --argjson target_turns "$target_turns" \
+    '$current_budget < $target_budget or $current_turns < $target_turns')"
+
+  "$ROOT/bin/rds-event" fixer_started \
+    --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+    budget_usd="$BUDGET" provider="deterministic" stage_log="${stage_log#$ROOT/}" recovery="scaffold_budget" \
+    >/dev/null 2>&1 || true
+
+  {
+    echo "## Root cause"
+    echo
+    echo "Scaffold failed because a Claude task exhausted its per-task budget/turn cap before completing."
+    echo
+    echo "## Proposed action"
+    echo
+    echo "Raise this build's scaffold Claude budget to \$$target_budget and max turns to $target_turns, reset errored scaffold tasks, then resume the build automatically."
+    echo
+    echo "## Safe to apply"
+    echo
+    echo "SAFE-TO-APPLY: yes — deterministic recovery for scaffold session_exhausted/budget exhaustion."
+  } > "$out"
+
+  if [[ "$changed" == "true" ]]; then
+    local tmp="$plan.tmp.$$"
+    jq --argjson budget "$target_budget" --argjson turns "$target_turns" '
+      .claude_budget_usd = ([.claude_budget_usd // 0, $budget] | max) |
+      .claude_max_turns = ([.claude_max_turns // 0, $turns] | max) |
+      .task_timeout_sec = ([.task_timeout_sec // 0, 900] | max) |
+      .claude_task_timeout_sec = ([.claude_task_timeout_sec // 0, 900] | max) |
+      .reasons = ((.reasons // []) + ["auto-heal raised scaffold budget after session_exhausted"])
+    ' "$plan" > "$tmp"
+    mv "$tmp" "$plan"
+
+    local state_file="$BUILD_DIR/state.json"
+    if [[ -f "$state_file" ]]; then
+      tmp="$state_file.tmp.$$"
+      jq --slurpfile plan "$plan" --arg rel "builds/$BUILD_ID/build-plan.json" --arg now "$(date -u +%FT%TZ)" '
+        .build_plan = ($plan[0] + { path: $rel }) |
+        .error = null |
+        .updated_at = $now
+      ' "$state_file" > "$tmp"
+      mv "$tmp" "$state_file"
+    fi
+  fi
+
+  if [[ -n "$app_dest" && -d "$app_dest" && -x "$app_dest/bin/task" && -f "$app_dest/tasks.json" ]]; then
+    (
+      cd "$app_dest"
+      ruby -rjson -e '
+        data = JSON.parse(File.read("tasks.json"))
+        Array(data["tasks"]).select { |task| %w[error blocked in_progress].include?(task["status"].to_s) }.each do |task|
+          system("ruby", "bin/task", "reset", task["position"].to_s)
+        end
+      '
+    ) >> "$BUILD_DIR/fixer-apply-$ts.log" 2>&1 || true
+  fi
+
+  "$ROOT/bin/rds-event" fixer_completed \
+    --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+    output_file="builds/$BUILD_ID/$(basename "$out")" exit_code="0" deterministic="1" \
+    >/dev/null 2>&1 || true
+
+  "$ROOT/bin/rds-event" fixer_apply_started \
+    --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+    budget_usd="0" provider="deterministic" diagnosis="builds/$BUILD_ID/$(basename "$out")" \
+    >/dev/null 2>&1 || true
+
+  {
+    echo "[rds-fix] deterministic scaffold budget recovery"
+    echo "[rds-fix] build_plan=$plan"
+    echo "[rds-fix] claude_budget_usd=$(jq -r '.claude_budget_usd' "$plan")"
+    echo "[rds-fix] claude_max_turns=$(jq -r '.claude_max_turns' "$plan")"
+  } >> "$BUILD_DIR/fixer-apply-$ts.log"
+
+  "$ROOT/bin/rds-event" fixer_apply_completed \
+    --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+    output_file="builds/$BUILD_ID/fixer-apply-$ts.log" exit_code="0" deterministic="1" \
+    >/dev/null 2>&1 || true
+
+  if [[ "$AUTO_RETRY" == "1" ]]; then
+    "$ROOT/bin/rds-event" fixer_retry_started \
+      --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+      stage="scaffold" via="rds-resume" deterministic="1" \
+      >/dev/null 2>&1 || true
+    "$ROOT/bin/rds-resume" "$BUILD_ID" --detach >> "$BUILD_DIR/fixer-retry-$ts.log" 2>&1
+  fi
+
+  echo "[rds-fix] deterministic scaffold budget recovery applied; resume launched"
+  return 0
+}
+
+if deterministic_scaffold_budget_recovery; then
+  exit 0
+fi
+
+deterministic_zo_token_recovery() {
+  local combined="$log_tail"$'\n'"$shm_tail"
+  [[ "$combined" == *"ZO_CLIENT_IDENTITY_TOKEN environment variable is required"* || "$combined" == *"Token has expired"* || "$combined" == *"HTTP 401"* || "$combined" == *"Status 401"* ]] || return 1
+  [[ "$combined" == *"FATAL: zo registration command failed"* || "$combined" == *"stage deploy failed"* ]] || return 1
+
+  "$ROOT/bin/rds-event" fixer_started \
+    --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+    budget_usd="$BUDGET" provider="deterministic" stage_log="${stage_log#$ROOT/}" recovery="zo_identity_token" \
+    >/dev/null 2>&1 || true
+
+  {
+    echo "## Root cause"
+    echo
+    echo "Deploy failed because the RDS dashboard/watchdog process launched rds-zo-register without ZO_CLIENT_IDENTITY_TOKEN, so Zo service registration could not authenticate."
+    echo
+    echo "## Proposed action"
+    echo
+    if [[ "$combined" == *"Token has expired"* || "$combined" == *"HTTP 401"* || "$combined" == *"Status 401"* ]]; then
+      echo "Refresh the rds service identity token or adopt an existing matching Zo service; do not retry the same deploy with the expired token."
+      echo
+      echo "## Safe to apply"
+      echo
+      echo "SAFE-TO-APPLY: no — this is an external Zo authentication failure, not an app-code fix."
+    elif [[ -n "${ZO_CLIENT_IDENTITY_TOKEN:-}" ]]; then
+      echo "Use the now-present Zo identity token and resume the build from the failed deploy stage."
+      echo
+      echo "## Safe to apply"
+      echo
+      echo "SAFE-TO-APPLY: yes — no project files need changes; retrying deploy with a valid Zo identity token is deterministic and idempotent."
+    else
+      echo "Repair the rds service environment so ZO_CLIENT_IDENTITY_TOKEN is available, then resume the build."
+      echo
+      echo "## Safe to apply"
+      echo
+      echo "SAFE-TO-APPLY: no — this rds-fix process still lacks ZO_CLIENT_IDENTITY_TOKEN, so retrying deploy would fail again."
+    fi
+  } > "$out"
+
+  "$ROOT/bin/rds-event" fixer_completed \
+    --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+    output_file="builds/$BUILD_ID/$(basename "$out")" exit_code="0" deterministic="1" \
+    >/dev/null 2>&1 || true
+
+  if [[ "$combined" == *"Token has expired"* || "$combined" == *"HTTP 401"* || "$combined" == *"Status 401"* ]]; then
+    echo "[rds-fix] deterministic Zo token recovery diagnosed expired/unauthorized token; not resuming"
+    return 0
+  fi
+
+  [[ -n "${ZO_CLIENT_IDENTITY_TOKEN:-}" ]] || {
+    echo "[rds-fix] deterministic Zo token recovery diagnosed; token still missing, not resuming"
+    return 0
+  }
+
+  "$ROOT/bin/rds-event" fixer_apply_started \
+    --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+    budget_usd="0" provider="deterministic" diagnosis="builds/$BUILD_ID/$(basename "$out")" \
+    >/dev/null 2>&1 || true
+
+  {
+    echo "[rds-fix] deterministic Zo token recovery"
+    echo "[rds-fix] ZO_CLIENT_IDENTITY_TOKEN is present in fixer environment"
+    echo "[rds-fix] no file changes required"
+  } > "$BUILD_DIR/fixer-apply-$ts.log"
+
+  "$ROOT/bin/rds-event" fixer_apply_completed \
+    --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+    output_file="builds/$BUILD_ID/fixer-apply-$ts.log" exit_code="0" deterministic="1" \
+    >/dev/null 2>&1 || true
+
+  if [[ "$AUTO_RETRY" == "1" ]]; then
+    "$ROOT/bin/rds-event" fixer_retry_started \
+      --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+      stage="deploy" via="rds-resume" deterministic="1" \
+      >/dev/null 2>&1 || true
+    "$ROOT/bin/rds-resume" "$BUILD_ID" --detach >> "$BUILD_DIR/fixer-retry-$ts.log" 2>&1
+  fi
+
+  echo "[rds-fix] deterministic Zo token recovery applied; resume launched"
+  return 0
+}
+
+if deterministic_zo_token_recovery; then
+  exit 0
+fi
+
+deterministic_provider_limit_recovery() {
+  local combined="$log_tail"$'\n'"$shm_tail"
+  [[ "$combined" == *"You've hit your usage limit"* || "$combined" == *"usage limit"* ]] || return 1
+  [[ "$combined" == *"try again at"* || "$combined" == *"purchase more credits"* ]] || return 1
+
+  local fallback_provider=""
+  if [[ "$PROVIDER" == "codex" && "${RDS_FIX_PROVIDER_LIMIT_FALLBACK:-1}" == "1" ]] && command -v claude >/dev/null 2>&1; then
+    fallback_provider="claude"
+  fi
+
+  "$ROOT/bin/rds-event" fixer_started \
+    --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+    budget_usd="$BUDGET" provider="deterministic" stage_log="${stage_log#$ROOT/}" recovery="provider_usage_limit" \
+    >/dev/null 2>&1 || true
+
+  {
+    echo "## Root cause"
+    echo
+    echo "The scaffold agent did not fail on app code; the selected provider hit its usage limit before completing the remaining Scaffold tasks."
+    echo
+    echo "## Proposed action"
+    echo
+    if [[ -n "$fallback_provider" ]]; then
+      echo "Do not ask the same limited provider to diagnose itself. Switch this build's remaining Scaffold tasks to $fallback_provider and resume from the pending task."
+    else
+      echo "Do not ask the same limited provider to diagnose itself. Park the build until the provider limit window has passed, then resume from the pending task."
+    fi
+    echo
+    echo "## Safe to apply"
+    echo
+    if [[ -n "$fallback_provider" ]]; then
+      echo "SAFE-TO-APPLY: yes — this recovery only changes the build runner provider in RDS state, then retries the existing scaffold stage from current task state; it does not edit project files."
+    else
+      echo "SAFE-TO-APPLY: no — no fallback provider is available, and immediate retry would hit the same quota limit."
+    fi
+  } > "$out"
+
+  "$ROOT/bin/rds-event" fixer_completed \
+    --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+    output_file="builds/$BUILD_ID/$(basename "$out")" exit_code="0" deterministic="1" \
+    >/dev/null 2>&1 || true
+
+  if [[ -z "$fallback_provider" ]]; then
+    echo "[rds-fix] provider usage limit diagnosed; no fallback provider available, not retrying"
+    return 0
+  fi
+
+  "$ROOT/bin/rds-event" fixer_apply_started \
+    --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+    budget_usd="0" provider="deterministic" diagnosis="builds/$BUILD_ID/$(basename "$out")" \
+    >/dev/null 2>&1 || true
+
+  local state_file="$BUILD_DIR/state.json"
+  if [[ -f "$state_file" ]]; then
+    local tmp="$state_file.tmp.$$"
+    jq --arg provider "$fallback_provider" --arg now "$(date -u +%FT%TZ)" '
+      .inference.provider = $provider |
+      .build_plan.provider = $provider |
+      .error = null |
+      .status = null |
+      .updated_at = $now
+    ' "$state_file" > "$tmp"
+    mv "$tmp" "$state_file"
+  fi
+
+  local plan_file="$BUILD_DIR/build-plan.json"
+  if [[ -f "$plan_file" ]]; then
+    local tmp="$plan_file.tmp.$$"
+    jq --arg provider "$fallback_provider" '
+      .provider = $provider |
+      .reasons = ((.reasons // []) + ["auto-heal switched provider after usage limit"])
+    ' "$plan_file" > "$tmp"
+    mv "$tmp" "$plan_file"
+  fi
+
+  {
+    echo "[rds-fix] deterministic provider usage-limit recovery"
+    echo "[rds-fix] previous_provider=$PROVIDER"
+    echo "[rds-fix] fallback_provider=$fallback_provider"
+    echo "[rds-fix] updated RDS state/build plan only; no project files changed"
+  } > "$BUILD_DIR/fixer-apply-$ts.log"
+
+  "$ROOT/bin/rds-event" fixer_apply_completed \
+    --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+    output_file="builds/$BUILD_ID/fixer-apply-$ts.log" exit_code="0" deterministic="1" fallback_provider="$fallback_provider" \
+    >/dev/null 2>&1 || true
+
+  if [[ "$AUTO_RETRY" == "1" ]]; then
+    "$ROOT/bin/rds-event" fixer_retry_started \
+      --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+      stage="scaffold" via="rds-resume" deterministic="1" fallback_provider="$fallback_provider" \
+      >/dev/null 2>&1 || true
+    "$ROOT/bin/rds-resume" "$BUILD_ID" --detach >> "$BUILD_DIR/fixer-retry-$ts.log" 2>&1
+    echo "[rds-fix] deterministic provider usage-limit recovery applied; resume launched"
+  else
+    echo "[rds-fix] deterministic provider usage-limit recovery diagnosed; auto-retry disabled"
+  fi
+  return 0
+}
+
+if deterministic_provider_limit_recovery; then
+  exit 0
+fi
+
+deterministic_scaffold_task_recovery() {
+  local failed_stage task_file task_summary blocked_count
+  failed_stage="$(jq -r '
+    (.current_stage // empty) as $current |
+    if $current != "" and (.stages[$current].status == "failed") then $current
+    else ((.stages // {} | to_entries | map(select(.value.status == "failed")) | .[0].key) // "")
+    end
+  ' "$BUILD_DIR/state.json" 2>/dev/null || true)"
+  [[ "$failed_stage" == "scaffold" ]] || return 1
+  [[ -n "$app_dest" && -d "$app_dest" ]] || return 1
+  task_file="$app_dest/tasks.json"
+  [[ -f "$task_file" ]] || return 1
+
+  blocked_count="$(jq -r '
+    [.tasks[]? | select((.status // "") as $s | $s == "blocked" or $s == "error" or $s == "in_progress")] | length
+  ' "$task_file" 2>/dev/null || echo 0)"
+  [[ "$blocked_count" =~ ^[0-9]+$ ]] || blocked_count=0
+  (( blocked_count > 0 )) || return 1
+
+  task_summary="$(jq -r '
+    [.tasks[]? | select((.status // "") as $s | $s == "blocked" or $s == "error" or $s == "in_progress") |
+      "\(.position): \(.title // "untitled") [\(.status // "unknown")] \(.error_message // "")"
+    ] | .[:8] | join("\n")
+  ' "$task_file" 2>/dev/null || true)"
+
+  "$ROOT/bin/rds-event" fixer_started \
+    --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+    budget_usd="$BUDGET" provider="deterministic" recovery="scaffold_task_blocked" \
+    >/dev/null 2>&1 || true
+
+  {
+    echo "## Root cause"
+    echo
+    echo "Scaffold failed because its task ledger contains blocked/error/in-progress task state, so launch-build had no eligible work to run."
+    echo
+    echo "Blocked task ledger:"
+    printf '%s\n' "$task_summary"
+    echo
+    echo "## Proposed action"
+    echo
+    echo "Reset the blocked Scaffold task state to pending, reset only the RDS scaffold stage, and resume from Scaffold before considering downstream deploy/readiness evidence."
+    echo
+    echo "## Safe to apply"
+    echo
+    echo "SAFE-TO-APPLY: yes — deterministic task-ledger recovery; it changes task status and RDS stage state only, not generated app source."
+  } > "$out"
+
+  "$ROOT/bin/rds-event" fixer_completed \
+    --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+    output_file="builds/$BUILD_ID/$(basename "$out")" exit_code="0" deterministic="1" \
+    >/dev/null 2>&1 || true
+
+  "$ROOT/bin/rds-event" fixer_apply_started \
+    --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+    budget_usd="0" provider="deterministic" diagnosis="builds/$BUILD_ID/$(basename "$out")" \
+    >/dev/null 2>&1 || true
+
+  {
+    echo "[rds-fix] deterministic scaffold task recovery"
+    echo "[rds-fix] task_file=$task_file"
+    echo "[rds-fix] reset_tasks:"
+    printf '%s\n' "$task_summary"
+  } > "$BUILD_DIR/fixer-apply-$ts.log"
+
+  if [[ -x "$app_dest/bin/task" ]]; then
+    while IFS= read -r pos; do
+      [[ "$pos" =~ ^[0-9]+$ ]] || continue
+      (cd "$app_dest" && ruby bin/task reset "$pos") >> "$BUILD_DIR/fixer-apply-$ts.log" 2>&1 || true
+    done < <(jq -r '.tasks[]? | select((.status // "") as $s | $s == "blocked" or $s == "error" or $s == "in_progress") | .position' "$task_file")
+  else
+    local task_tmp="$task_file.tmp.$$"
+    jq '
+      .tasks |= map(
+        if ((.status // "") == "blocked" or (.status // "") == "error" or (.status // "") == "in_progress")
+        then .status = "pending" | del(.error_message)
+        else .
+        end
+      )
+    ' "$task_file" > "$task_tmp"
+    mv "$task_tmp" "$task_file"
+  fi
+
+  local state_file="$BUILD_DIR/state.json"
+  local state_tmp="$state_file.tmp.$$"
+  jq --arg now "$(date -u +%FT%TZ)" '
+    .error = null |
+    .status = null |
+    .current_stage = null |
+    .updated_at = $now |
+    .stages.scaffold.status = "pending" |
+    .stages["local-run"].status = "pending" |
+    .stages.deploy.status = "pending" |
+    .stages.qa.status = "pending" |
+    .stages["taste-review"].status = "pending"
+  ' "$state_file" > "$state_tmp"
+  mv "$state_tmp" "$state_file"
+
+  "$ROOT/bin/rds-event" fixer_apply_completed \
+    --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+    output_file="builds/$BUILD_ID/fixer-apply-$ts.log" exit_code="0" deterministic="1" reset_tasks="$blocked_count" \
+    >/dev/null 2>&1 || true
+
+  if [[ "$AUTO_RETRY" == "1" ]]; then
+    "$ROOT/bin/rds-event" fixer_retry_started \
+      --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+      stage="scaffold" via="rds-resume" deterministic="1" \
+      >/dev/null 2>&1 || true
+    "$ROOT/bin/rds-resume" "$BUILD_ID" --detach >> "$BUILD_DIR/fixer-retry-$ts.log" 2>&1
+    echo "[rds-fix] deterministic scaffold task recovery applied; resume launched"
+  else
+    echo "[rds-fix] deterministic scaffold task recovery applied; auto-retry disabled"
+  fi
+  return 0
+}
+
+if deterministic_scaffold_task_recovery; then
+  exit 0
+fi
+
+deterministic_truth_recovery() {
+  [[ -f "$BUILD_DIR/truth.json" ]] || return 1
+  local verdict blocker_class codes
+  verdict="$(jq -r '.verdict // "unknown"' "$BUILD_DIR/truth.json" 2>/dev/null || echo unknown)"
+  [[ "$verdict" == "blocked" ]] || return 1
+  blocker_class="$(jq -r '.blockerClass // "unknown"' "$BUILD_DIR/truth.json" 2>/dev/null || echo unknown)"
+  codes="$(jq -r '.topBlockers[]?.code' "$BUILD_DIR/truth.json" 2>/dev/null | sort -u | tr '\n' ' ')"
+  [[ -n "$codes" ]] || return 1
+
+  local reset_from="" action="" safe="yes" reason=""
+  if grep -Eq '\b(incomplete_iterate_session)\b' <<<"$codes"; then
+    safe="verify_current"
+    reset_from="qa"
+    action="Continue the incomplete iteration from the current app state: skip provider apply, then run checks, deploy, QA, taste review, and refresh ledgers."
+  fi
+  if [[ "$safe" == "verify_current" ]]; then
+    :
+  elif [[ "$blocker_class" == "product_quality" ]]; then
+    safe="no"
+    reset_from="qa"
+    reason="truth ledger found $blocker_class blockers that require targeted app iteration"
+    action="Run bin/rds-iterate using truth.json/evidence-ledger.json blockers as the prompt, then rerun QA and taste review."
+  elif [[ "$blocker_class" == "skill_impact" ]]; then
+    safe="no"
+    reset_from="skill-resolve"
+    reason="truth ledger found skill-impact blockers that require operator scope/configuration changes"
+    action="Resolve the missing or failed skill capability, then rerun skill resolution/readiness."
+  else
+    local failed_stage
+    failed_stage="$(jq -r '
+      (.current_stage // empty) as $current |
+      if $current != "" and (.stages[$current].status == "failed") then $current
+      else ((.stages // {} | to_entries | map(select(.value.status == "failed")) | .[0].key) // "")
+      end
+    ' "$BUILD_DIR/state.json" 2>/dev/null || true)"
+    if [[ -n "$failed_stage" && "$failed_stage" != "deploy" && "$failed_stage" != "qa" && "$failed_stage" != "taste-review" ]]; then
+      reset_from="$failed_stage"
+      action="Reset the failed $failed_stage stage and resume from there before evaluating downstream preview evidence."
+    elif grep -Eq '\b(preview_missing|preview_pending)\b' <<<"$codes"; then
+      reset_from="deploy"
+      action="Reset deploy, QA, and taste-review so RDS re-registers the preview and revalidates the deployed artifact."
+    elif grep -Eq '\b(orphaned_running_state)\b' <<<"$codes"; then
+      reset_from="$(jq -r '
+        (.stages // {} | to_entries | map(select(.value.status == "running")) | .[0].key) // (.current_stage // "qa")
+      ' "$BUILD_DIR/state.json" 2>/dev/null || echo qa)"
+      action="Reset the orphaned running stage to pending and resume from there."
+    elif grep -Eq '\b(qa_evidence_stale|qa_iteration_missing|qa_summary_missing|required_quality_stage_skipped|spec_verdict_missing|visual_verdict_missing|scenario_verdict_missing|typed_uat_missing)\b' <<<"$codes"; then
+      reset_from="qa"
+      action="Reset QA and taste-review so RDS regenerates missing browser/verdict evidence."
+    elif grep -Eq '\b(taste_review_missing)\b' <<<"$codes"; then
+      reset_from="taste-review"
+      action="Reset taste-review so RDS evaluates current QA evidence."
+    else
+      return 1
+    fi
+  fi
+
+  "$ROOT/bin/rds-event" fixer_started \
+    --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+    budget_usd="$BUDGET" provider="deterministic" recovery="truth" \
+    >/dev/null 2>&1 || true
+
+  {
+    echo "## Root cause"
+    echo
+    echo "The build's canonical truth ledger is blocked. Blocker class: $blocker_class. Blocker codes: $codes"
+    echo
+    echo "Truth next action:"
+    jq -r '.nextAction // "inspect truth.json"' "$BUILD_DIR/truth.json" 2>/dev/null || true
+    echo
+    echo "## Proposed action"
+    echo
+    echo "$action"
+    echo
+    echo "## Safe to apply"
+    if [[ "$safe" == "yes" ]]; then
+      echo "SAFE-TO-APPLY: yes — deterministic truth recovery; it only resets affected RDS stages and resumes the build."
+    elif [[ "$safe" == "verify_current" ]]; then
+      echo "SAFE-TO-APPLY: yes — deterministic incomplete-iteration recovery; it verifies the current app without another provider edit."
+    elif [[ "$safe" == "iterate" ]]; then
+      echo "SAFE-TO-APPLY: yes — deterministic product-quality recovery; it runs a bounded targeted RDS iteration using the recorded QA/taste evidence."
+    else
+      echo "SAFE-TO-APPLY: no — $reason."
+    fi
+  } > "$out"
+
+  "$ROOT/bin/rds-event" fixer_completed \
+    --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+    output_file="builds/$BUILD_ID/$(basename "$out")" exit_code="0" deterministic="1" \
+    >/dev/null 2>&1 || true
+
+  if [[ "$safe" == "iterate" ]]; then
+    "$ROOT/bin/rds-event" fixer_apply_started \
+      --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+      budget_usd="$APPLY_BUDGET" provider="deterministic" diagnosis="builds/$BUILD_ID/$(basename "$out")" recovery="product_iteration" \
+      >/dev/null 2>&1 || true
+
+    local iteration_prompt="$BUILD_DIR/fixer-product-iteration-$ts.md"
+    {
+      if [[ -s "$BUILD_DIR/taste-iteration-prompt.md" ]]; then
+        cat "$BUILD_DIR/taste-iteration-prompt.md"
+      else
+        echo "RDS truth ledger found product-quality blockers."
+        echo
+        echo "Use the highest-signal QA and evidence-ledger blockers to repair the generated app, then rerun checks, deploy, QA, and taste review."
+      fi
+      echo
+      echo "Additional canonical blockers:"
+      jq -r '.topBlockers[]? | "- " + (.code // "blocker") + ": " + (.message // "") + " Recovery: " + (.recovery // "")' "$BUILD_DIR/truth.json" 2>/dev/null || true
+      echo
+      echo "Do not stop after diagnosis. Apply the product/design fix inside the generated app."
+    } > "$iteration_prompt"
+
+    "$ROOT/bin/rds-event" fixer_retry_started \
+      --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+      stage="$reset_from" via="rds-iterate" deterministic="1" \
+      >/dev/null 2>&1 || true
+
+    local iteration_log="$BUILD_DIR/fixer-product-iteration-$ts.log"
+    set +e
+    "$ROOT/bin/rds-iterate" "$BUILD_ID" --prompt="$(cat "$iteration_prompt")" --yes > "$iteration_log" 2>&1
+    local iteration_rc=$?
+    set -e
+
+    "$ROOT/bin/rds-event" fixer_apply_completed \
+      --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+      output_file="builds/$BUILD_ID/$(basename "$iteration_log")" exit_code="$iteration_rc" deterministic="1" recovery="product_iteration" \
+      >/dev/null 2>&1 || true
+
+    "$ROOT/bin/rds-evidence-ledger" "$BUILD_ID" >/dev/null 2>&1 || true
+    if [[ "$iteration_rc" -ne 0 ]]; then
+      echo "[rds-fix] targeted product iteration failed (rc=$iteration_rc); see $iteration_log" >&2
+      return "$iteration_rc"
+    fi
+    echo "[rds-fix] targeted product iteration completed; see $iteration_log"
+    return 0
+  fi
+
+  if [[ "$safe" == "verify_current" ]]; then
+    "$ROOT/bin/rds-event" fixer_apply_started \
+      --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+      budget_usd="0" provider="deterministic" diagnosis="builds/$BUILD_ID/$(basename "$out")" recovery="verify_current_iteration" \
+      >/dev/null 2>&1 || true
+
+    local verify_prompt="$BUILD_DIR/fixer-verify-current-$ts.md"
+    {
+      echo "RDS found an incomplete iteration session."
+      echo
+      echo "Do not edit the app. Verify the current app state by running checks, deploy, QA, taste review, and evidence refresh."
+    } > "$verify_prompt"
+
+    "$ROOT/bin/rds-event" fixer_retry_started \
+      --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+      stage="qa" via="rds-iterate-skip-apply" deterministic="1" \
+      >/dev/null 2>&1 || true
+
+    local verify_log="$BUILD_DIR/fixer-verify-current-$ts.log"
+    set +e
+    RDS_ITERATE_SKIP_APPLY=1 "$ROOT/bin/rds-iterate" "$BUILD_ID" --prompt="$(cat "$verify_prompt")" --yes > "$verify_log" 2>&1
+    local verify_rc=$?
+    set -e
+
+    "$ROOT/bin/rds-event" fixer_apply_completed \
+      --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+      output_file="builds/$BUILD_ID/$(basename "$verify_log")" exit_code="$verify_rc" deterministic="1" recovery="verify_current_iteration" \
+      >/dev/null 2>&1 || true
+
+    "$ROOT/bin/rds-evidence-ledger" "$BUILD_ID" >/dev/null 2>&1 || true
+    if [[ "$verify_rc" -ne 0 ]]; then
+      echo "[rds-fix] verify-current iteration recovery failed (rc=$verify_rc); see $verify_log" >&2
+      return "$verify_rc"
+    fi
+    echo "[rds-fix] verify-current iteration recovery completed; see $verify_log"
+    return 0
+  fi
+
+  if [[ "$safe" != "yes" ]]; then
+    echo "[rds-fix] truth blockers require targeted app iteration; diagnosis written, not blindly resuming"
+    return 0
+  fi
+
+  "$ROOT/bin/rds-event" fixer_apply_started \
+    --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+    budget_usd="0" provider="deterministic" diagnosis="builds/$BUILD_ID/$(basename "$out")" \
+    >/dev/null 2>&1 || true
+
+  local state_file="$BUILD_DIR/state.json"
+  local tmp="$state_file.tmp.$$"
+  case "$reset_from" in
+    deploy)
+      jq --arg now "$(date -u +%FT%TZ)" '
+        .error = null |
+        .status = null |
+        .current_stage = null |
+        .updated_at = $now |
+        .stages.deploy.status = "pending" |
+        .stages.qa.status = "pending" |
+        .stages["taste-review"].status = "pending"
+      ' "$state_file" > "$tmp"
+      ;;
+    qa)
+      jq --arg now "$(date -u +%FT%TZ)" '
+        .error = null |
+        .status = null |
+        .current_stage = null |
+        .updated_at = $now |
+        .stages.qa.status = "pending" |
+        .stages["taste-review"].status = "pending"
+      ' "$state_file" > "$tmp"
+      ;;
+    taste-review)
+      jq --arg now "$(date -u +%FT%TZ)" '
+        .error = null |
+        .status = null |
+        .current_stage = null |
+        .updated_at = $now |
+        .stages["taste-review"].status = "pending"
+      ' "$state_file" > "$tmp"
+      ;;
+    *)
+      if [[ "$reset_from" == "scaffold" ]]; then
+        jq --arg now "$(date -u +%FT%TZ)" '
+          .error = null |
+          .status = null |
+          .current_stage = null |
+          .updated_at = $now |
+          .stages.scaffold.status = "pending" |
+          .stages["local-run"].status = "pending" |
+          .stages.deploy.status = "pending" |
+          .stages.qa.status = "pending" |
+          .stages["taste-review"].status = "pending"
+        ' "$state_file" > "$tmp"
+      else
+        jq --arg stage "$reset_from" --arg now "$(date -u +%FT%TZ)" '
+          .error = null |
+          .status = null |
+          .current_stage = null |
+          .updated_at = $now |
+          .stages[$stage].status = "pending"
+        ' "$state_file" > "$tmp"
+      fi
+      ;;
+  esac
+  mv "$tmp" "$state_file"
+
+  {
+    echo "[rds-fix] deterministic truth recovery"
+    echo "[rds-fix] verdict=$verdict"
+    echo "[rds-fix] blocker_class=$blocker_class"
+    echo "[rds-fix] issue_codes=$codes"
+    echo "[rds-fix] reset_from=$reset_from"
+    echo "[rds-fix] action=$action"
+  } > "$BUILD_DIR/fixer-apply-$ts.log"
+
+  "$ROOT/bin/rds-event" fixer_apply_completed \
+    --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+    output_file="builds/$BUILD_ID/fixer-apply-$ts.log" exit_code="0" deterministic="1" \
+    >/dev/null 2>&1 || true
+
+  "$ROOT/bin/rds-evidence-ledger" "$BUILD_ID" >/dev/null 2>&1 || true
+
+  if [[ "$AUTO_RETRY" == "1" ]]; then
+    "$ROOT/bin/rds-event" fixer_retry_started \
+      --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+      stage="$reset_from" via="rds-resume" deterministic="1" \
+      >/dev/null 2>&1 || true
+    "$ROOT/bin/rds-resume" "$BUILD_ID" --detach >> "$BUILD_DIR/fixer-retry-$ts.log" 2>&1
+    echo "[rds-fix] deterministic truth recovery applied; resume launched at $reset_from"
+  else
+    echo "[rds-fix] deterministic truth recovery applied; auto-retry disabled"
+  fi
+  return 0
+}
+
+if deterministic_truth_recovery; then
+  exit 0
+fi
+
+deterministic_readiness_recovery() {
+  [[ -f "$BUILD_DIR/readiness.json" ]] || return 1
+  local readiness_status
+  readiness_status="$(jq -r '.status // "unknown"' "$BUILD_DIR/readiness.json" 2>/dev/null || echo unknown)"
+  [[ "$readiness_status" == "fail" ]] || return 1
+
+  local codes evidence_codes
+  codes="$(jq -r '.issues[]?.code' "$BUILD_DIR/readiness.json" 2>/dev/null | sort -u | tr '\n' ' ')"
+  evidence_codes="$(jq -r '.blockers[]?.code | select(. == "taste_review_stale" or . == "quality_ledger_stale")' "$BUILD_DIR/evidence-ledger.json" 2>/dev/null | sort -u | tr '\n' ' ')"
+  codes="$(printf '%s %s\n' "$codes" "$evidence_codes" | tr ' ' '\n' | awk 'NF && !seen[$0]++' | tr '\n' ' ')"
+  [[ -n "$codes" ]] || return 1
+
+  local reset_from="" action="" safe="yes" reason="" failed_stage=""
+  failed_stage="$(jq -r '
+    .stages // {} |
+    to_entries |
+    map(select((.value.status // "") == "failed")) |
+    map(.key) |
+    map(select(. != "deploy" and . != "qa" and . != "taste-review")) |
+    .[0] // ""
+  ' "$BUILD_DIR/state.json" 2>/dev/null || true)"
+  if [[ -n "$failed_stage" ]]; then
+    reset_from="$failed_stage"
+    action="Reset failed upstream stage $failed_stage first; downstream preview/readiness evidence cannot recover until the failed stage succeeds."
+  elif grep -Eq '\b(preview_missing|preview_pending)\b' <<<"$codes"; then
+    reset_from="deploy"
+    action="Reset deploy, QA, and taste-review so RDS re-registers the preview and re-validates the deployed artifact."
+  elif grep -Eq '\b(qa_evidence_stale|qa_iteration_missing|qa_summary_missing|required_quality_stage_skipped|spec_verdict_missing|visual_verdict_missing|scenario_verdict_missing|typed_uat_missing)\b' <<<"$codes"; then
+    reset_from="qa"
+    action="Reset QA and taste-review so RDS regenerates missing browser/verdict evidence before review."
+  elif grep -Eq '\b(taste_review_missing|taste_review_stale|quality_ledger_stale)\b' <<<"$codes"; then
+    reset_from="taste-review"
+    action="Reset taste-review so RDS evaluates the current QA evidence before review, then regenerate quality/readiness evidence."
+  elif grep -Eq '\b(qa_not_converged|spec_verdict_blocking|visual_verdict_blocking|scenario_verdict_blocking|typed_uat_blocking|design_review_blocking|taste_review_blocking|quality_ledger_blocking)\b' <<<"$codes"; then
+    safe="no"
+    reason="readiness found product-quality blockers that require an app iteration, not a blind stage retry"
+    action="Use the provider diagnosis/apply path with readiness.json as evidence, or run bin/rds-iterate with the taste/readiness blockers as the prompt."
+  else
+    return 1
+  fi
+
+  "$ROOT/bin/rds-event" fixer_started \
+    --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+    budget_usd="$BUDGET" provider="deterministic" recovery="readiness" \
+    >/dev/null 2>&1 || true
+
+  {
+    echo "## Root cause"
+    echo
+    echo "The build failed the final autonomous readiness gate. Readiness issue codes: $codes"
+    echo
+    echo "Readiness recovery hints:"
+    jq -r '.issues[]? | "- " + (.code // "unknown") + ": " + (.recovery // .detail // "inspect evidence")' "$BUILD_DIR/readiness.json" 2>/dev/null || true
+    echo
+    echo "## Proposed action"
+    echo
+    echo "$action"
+    echo
+    echo "## Safe to apply"
+    if [[ "$safe" == "yes" ]]; then
+      echo "SAFE-TO-APPLY: yes — deterministic readiness recovery; it only resets affected RDS stages and resumes the build."
+    else
+      echo "SAFE-TO-APPLY: no — $reason."
+    fi
+  } > "$out"
+
+  "$ROOT/bin/rds-event" fixer_completed \
+    --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+    output_file="builds/$BUILD_ID/$(basename "$out")" exit_code="0" deterministic="1" \
+    >/dev/null 2>&1 || true
+
+  if [[ "$safe" != "yes" ]]; then
+    echo "[rds-fix] readiness blockers require app iteration; diagnosis written, not blindly resuming"
+    return 0
+  fi
+
+  "$ROOT/bin/rds-event" fixer_apply_started \
+    --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+    budget_usd="0" provider="deterministic" diagnosis="builds/$BUILD_ID/$(basename "$out")" \
+    >/dev/null 2>&1 || true
+
+  local state_file="$BUILD_DIR/state.json"
+  local tmp="$state_file.tmp.$$"
+  case "$reset_from" in
+    deploy)
+      jq --arg now "$(date -u +%FT%TZ)" '
+        .error = null |
+        .status = null |
+        .current_stage = null |
+        .updated_at = $now |
+        .stages.deploy.status = "pending" |
+        .stages.qa.status = "pending" |
+        .stages["taste-review"].status = "pending"
+      ' "$state_file" > "$tmp"
+      ;;
+    qa)
+      jq --arg now "$(date -u +%FT%TZ)" '
+        .error = null |
+        .status = null |
+        .current_stage = null |
+        .updated_at = $now |
+        .stages.qa.status = "pending" |
+        .stages["taste-review"].status = "pending"
+      ' "$state_file" > "$tmp"
+      ;;
+    taste-review)
+      jq --arg now "$(date -u +%FT%TZ)" '
+        .error = null |
+        .status = null |
+        .current_stage = null |
+        .updated_at = $now |
+        .stages["taste-review"].status = "pending"
+      ' "$state_file" > "$tmp"
+      ;;
+    *)
+      if [[ "$reset_from" == "scaffold" ]]; then
+        jq --arg now "$(date -u +%FT%TZ)" '
+          .error = null |
+          .status = null |
+          .current_stage = null |
+          .updated_at = $now |
+          .stages.scaffold.status = "pending" |
+          .stages["local-run"].status = "pending" |
+          .stages.deploy.status = "pending" |
+          .stages.qa.status = "pending" |
+          .stages["taste-review"].status = "pending"
+        ' "$state_file" > "$tmp"
+      else
+        jq --arg stage "$reset_from" --arg now "$(date -u +%FT%TZ)" '
+          .error = null |
+          .status = null |
+          .current_stage = null |
+          .updated_at = $now |
+          .stages[$stage].status = "pending"
+        ' "$state_file" > "$tmp"
+      fi
+      ;;
+  esac
+  mv "$tmp" "$state_file"
+
+  {
+    echo "[rds-fix] deterministic readiness recovery"
+    echo "[rds-fix] issue_codes=$codes"
+    echo "[rds-fix] reset_from=$reset_from"
+    echo "[rds-fix] action=$action"
+  } > "$BUILD_DIR/fixer-apply-$ts.log"
+
+  "$ROOT/bin/rds-event" fixer_apply_completed \
+    --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+    output_file="builds/$BUILD_ID/fixer-apply-$ts.log" exit_code="0" deterministic="1" \
+    >/dev/null 2>&1 || true
+
+  if [[ "$AUTO_RETRY" == "1" ]]; then
+    "$ROOT/bin/rds-event" fixer_retry_started \
+      --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+      stage="$reset_from" via="rds-resume" deterministic="1" \
+      >/dev/null 2>&1 || true
+    "$ROOT/bin/rds-resume" "$BUILD_ID" --detach >> "$BUILD_DIR/fixer-retry-$ts.log" 2>&1
+    echo "[rds-fix] deterministic readiness recovery applied; resume launched at $reset_from"
+  else
+    echo "[rds-fix] deterministic readiness recovery applied; auto-retry disabled"
+  fi
+  return 0
+}
+
+if deterministic_readiness_recovery; then
+  exit 0
+fi
+
+# Find the most recently modified file matching a glob, or empty.
+_latest_match() {
+  ls -t $1 2>/dev/null | head -n1 || true
+}
+
+# Class: HMR/dev-mode console errors. The taste/QA pipeline failed because
+# the deployed service was still running `next dev` (or another HMR-heavy
+# dev server), so workflow-uat captured WebSocket / Fast-Refresh / Turbopack
+# reconnect errors as `no_console_errors` violations. After P2.5 the stack
+# manifest now deploys with `next start` and the UAT filters HMR patterns,
+# so the deterministic recovery is to reset deploy+qa+taste-review and
+# resume — the failure was infrastructure, not app code.
+deterministic_hmr_console_recovery() {
+  local verdict
+  verdict="$(ls -t "$BUILD_DIR"/playwright/iter-*/workflow-verdict.json 2>/dev/null | head -n1 || true)"
+  [[ -n "$verdict" && -f "$verdict" ]] || return 1
+  # Single failing criterion, and it is no_console_errors.
+  local failed_count failing_name
+  failed_count="$(jq '[.criteria[]? | select(.ok == false)] | length' "$verdict" 2>/dev/null || echo 0)"
+  failing_name="$(jq -r '[.criteria[]? | select(.ok == false)] | .[0].name // ""' "$verdict" 2>/dev/null || echo "")"
+  [[ "$failed_count" == "1" && "$failing_name" == "no_console_errors" ]] || return 1
+  local evidence
+  evidence="$(jq -r '[.criteria[]? | select(.ok == false)] | .[0].evidence // ""' "$verdict" 2>/dev/null || echo "")"
+  # Evidence is purely HMR / dev-mode noise.
+  printf '%s' "$evidence" | grep -Eiq 'webpack-hmr|_next/webpack|turbopack|fast refresh|\[hmr\]|hmr-client|hot[ -]?reload' || return 1
+
+  "$ROOT/bin/rds-event" fixer_started \
+    --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+    budget_usd="$BUDGET" provider="deterministic" stage_log="${verdict#$ROOT/}" recovery="hmr_console" \
+    >/dev/null 2>&1 || true
+
+  {
+    echo "## Root cause"
+    echo
+    echo "Workflow UAT failed \`no_console_errors\` because the deployed service was still running an HMR-enabled dev server (Next.js \`next dev\` / Turbopack). The captured console errors are framework reconnect noise, not application defects."
+    echo
+    echo "## Proposed action"
+    echo
+    echo "Reset deploy, qa, and taste-review stages so the build redeploys using the updated stack manifest (\`next build && next start\`) and the workflow-uat HMR-noise filter, then resume."
+    echo
+    echo "## Safe to apply"
+    echo
+    echo "SAFE-TO-APPLY: yes — only resets RDS stage state in state.json; no project files are modified."
+  } > "$out"
+
+  "$ROOT/bin/rds-event" fixer_completed \
+    --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+    output_file="builds/$BUILD_ID/$(basename "$out")" exit_code="0" deterministic="1" \
+    >/dev/null 2>&1 || true
+
+  "$ROOT/bin/rds-event" fixer_apply_started \
+    --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+    budget_usd="0" provider="deterministic" diagnosis="builds/$BUILD_ID/$(basename "$out")" \
+    >/dev/null 2>&1 || true
+
+  local state_file="$BUILD_DIR/state.json"
+  if [[ -f "$state_file" ]]; then
+    local tmp="$state_file.tmp.$$"
+    jq --arg now "$(date -u +%FT%TZ)" '
+      .error = null |
+      .status = null |
+      .current_stage = null |
+      .updated_at = $now |
+      .stages.deploy.status = "pending" |
+      .stages.qa.status = "pending" |
+      .stages["taste-review"].status = "pending"
+    ' "$state_file" > "$tmp"
+    mv "$tmp" "$state_file"
+  fi
+
+  {
+    echo "[rds-fix] deterministic HMR/dev-mode console recovery"
+    echo "[rds-fix] verdict=$verdict"
+    echo "[rds-fix] reset stages: deploy, qa, taste-review"
+  } > "$BUILD_DIR/fixer-apply-$ts.log"
+
+  "$ROOT/bin/rds-event" fixer_apply_completed \
+    --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+    output_file="builds/$BUILD_ID/fixer-apply-$ts.log" exit_code="0" deterministic="1" \
+    >/dev/null 2>&1 || true
+
+  if [[ "$AUTO_RETRY" == "1" ]]; then
+    "$ROOT/bin/rds-event" fixer_retry_started \
+      --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+      stage="deploy" via="rds-resume" deterministic="1" recovery="hmr_console" \
+      >/dev/null 2>&1 || true
+    "$ROOT/bin/rds-resume" "$BUILD_ID" --detach >> "$BUILD_DIR/fixer-retry-$ts.log" 2>&1
+    echo "[rds-fix] deterministic HMR/dev-mode console recovery applied; resume launched"
+  else
+    echo "[rds-fix] deterministic HMR/dev-mode console recovery applied; auto-retry disabled"
+  fi
+  return 0
+}
+
+if deterministic_hmr_console_recovery; then
+  exit 0
+fi
+
+# Class: shadcn-missing. The build was resolved with `shadcn-add` as a stack
+# primary, but the materialized app_dest is missing the install artifacts
+# (components.json, tailwind.config.ts, lib/utils.ts) — i.e. the skill was
+# metadata-only (pre-P1.3) or its install.sh failed silently. Result: bland
+# UI, mockup_fidelity blockers, design-review complaints. The deterministic
+# recovery is to run the skill's install.sh in app_dest, then reset qa and
+# taste-review so the build is re-evaluated with the components present.
+deterministic_shadcn_missing_recovery() {
+  [[ -n "$app_dest" && -d "$app_dest" ]] || return 1
+  # Was shadcn-add part of resolved skills?
+  grep -Eq 'skills_resolved.*shadcn-add' "$BUILD_DIR/events.jsonl" 2>/dev/null || return 1
+  # Are install artifacts missing?
+  local missing=0
+  [[ -f "$app_dest/components.json" ]] || missing=$((missing + 1))
+  [[ -f "$app_dest/tailwind.config.ts" || -f "$app_dest/tailwind.config.js" ]] || missing=$((missing + 1))
+  [[ -f "$app_dest/lib/utils.ts" ]] || missing=$((missing + 1))
+  (( missing >= 2 )) || return 1
+  local installer="$ROOT/skills/built-in/shadcn-add/install.sh"
+  [[ -x "$installer" ]] || return 1
+
+  "$ROOT/bin/rds-event" fixer_started \
+    --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+    budget_usd="$BUDGET" provider="deterministic" recovery="shadcn_missing" \
+    >/dev/null 2>&1 || true
+
+  {
+    echo "## Root cause"
+    echo
+    echo "The build resolved \`shadcn-add\` as a primary skill, but the materialized app at \`$app_dest\` is missing the install artifacts (components.json, tailwind.config, lib/utils). The skill was registered but never installed, so the UI uses raw HTML without the design system."
+    echo
+    echo "## Proposed action"
+    echo
+    echo "Run \`skills/built-in/shadcn-add/install.sh\` against app_dest to materialize Tailwind, components.json, lib/utils, and starter components; then reset qa and taste-review so the deployed UI is re-evaluated with the design system present."
+    echo
+    echo "## Safe to apply"
+    echo
+    echo "SAFE-TO-APPLY: yes — install.sh is idempotent (it merges into package.json and only writes missing files) and only edits within app_dest."
+  } > "$out"
+
+  "$ROOT/bin/rds-event" fixer_completed \
+    --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+    output_file="builds/$BUILD_ID/$(basename "$out")" exit_code="0" deterministic="1" \
+    >/dev/null 2>&1 || true
+
+  "$ROOT/bin/rds-event" fixer_apply_started \
+    --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+    budget_usd="0" provider="deterministic" diagnosis="builds/$BUILD_ID/$(basename "$out")" \
+    >/dev/null 2>&1 || true
+
+  {
+    echo "[rds-fix] deterministic shadcn-missing recovery"
+    echo "[rds-fix] running $installer in $app_dest"
+  } > "$BUILD_DIR/fixer-apply-$ts.log"
+  if ! ( cd "$app_dest" && APP_DEST="$app_dest" RDS_ROOT="$ROOT" "$installer" ) >> "$BUILD_DIR/fixer-apply-$ts.log" 2>&1; then
+    echo "[rds-fix] shadcn install.sh failed; see $BUILD_DIR/fixer-apply-$ts.log" >&2
+    "$ROOT/bin/rds-event" fixer_apply_completed \
+      --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+      output_file="builds/$BUILD_ID/fixer-apply-$ts.log" exit_code="1" deterministic="1" \
+      >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  local state_file="$BUILD_DIR/state.json"
+  if [[ -f "$state_file" ]]; then
+    local tmp="$state_file.tmp.$$"
+    jq --arg now "$(date -u +%FT%TZ)" '
+      .error = null |
+      .status = null |
+      .current_stage = null |
+      .updated_at = $now |
+      .stages.qa.status = "pending" |
+      .stages["taste-review"].status = "pending"
+    ' "$state_file" > "$tmp"
+    mv "$tmp" "$state_file"
+  fi
+
+  "$ROOT/bin/rds-event" fixer_apply_completed \
+    --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+    output_file="builds/$BUILD_ID/fixer-apply-$ts.log" exit_code="0" deterministic="1" \
+    >/dev/null 2>&1 || true
+
+  if [[ "$AUTO_RETRY" == "1" ]]; then
+    "$ROOT/bin/rds-event" fixer_retry_started \
+      --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+      stage="qa" via="rds-resume" deterministic="1" recovery="shadcn_missing" \
+      >/dev/null 2>&1 || true
+    "$ROOT/bin/rds-resume" "$BUILD_ID" --detach >> "$BUILD_DIR/fixer-retry-$ts.log" 2>&1
+    echo "[rds-fix] deterministic shadcn-missing recovery applied; resume launched"
+  else
+    echo "[rds-fix] deterministic shadcn-missing recovery applied; auto-retry disabled"
+  fi
+  return 0
+}
+
+if deterministic_shadcn_missing_recovery; then
+  exit 0
+fi
+
+prompt=$(cat <<EOF
+You are diagnosing an RDS build that has stalled or failed.
+
+RDS is a stack-aware chat-to-deployed-app pipeline:
+  1. intake   2. spec   3. taste brief   4. stack-init   5. scaffold   6. local-run   7. deploy   8. qa   9. taste review
+
+Build ID: $BUILD_ID
+
+state.json:
+\`\`\`json
+$state
+\`\`\`
+
+Last 80 events from events.jsonl:
+\`\`\`jsonl
+$events
+\`\`\`
+
+readiness.json:
+\`\`\`json
+$readiness
+\`\`\`
+
+Most recent stage log: $stage_log (last 200 lines):
+\`\`\`
+$log_tail
+\`\`\`
+
+Live shell tail ($shm_log, last 80 lines):
+\`\`\`
+$shm_tail
+\`\`\`
+
+Your task:
+1. Identify the root cause in 1-2 sentences.
+2. Propose ONE concrete next action. Either an exact shell command (with cwd) OR a code change (file path + diff).
+3. Mark "SAFE-TO-APPLY: yes" only if the action is clearly correct, reversible, and within the build directory or its app-dest. Otherwise "SAFE-TO-APPLY: no — <reason>".
+4. Be terse. Do not speculate beyond the evidence. Do not reformat the whole pipeline.
+
+Output format:
+## Root cause
+...
+
+## Proposed action
+...
+
+## Safe to apply
+SAFE-TO-APPLY: yes|no — ...
+EOF
+)
+
+# Emit a fixer_started event so the dashboard timeline reflects this.
+"$ROOT/bin/rds-event" fixer_started \
+  --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+  budget_usd="$DIAGNOSE_BUDGET" phase="diagnose" provider="$PROVIDER" stage_log="${stage_log#$ROOT/}" \
+  >/dev/null 2>&1 || true
+
+echo "[rds-fix] diagnosing build $BUILD_ID (diagnose_budget=\$$DIAGNOSE_BUDGET apply_budget=\$$APPLY_BUDGET)..."
+echo "[rds-fix] provider=$PROVIDER"
+if printf '%s\n' "$prompt" \
+  | rds_infer "$PROVIDER" "$ROOT" 80 "$DIAGNOSE_BUDGET" "" > "$out" 2>&1; then
+  rc=0
+else
+  rc=$?
+  echo "[rds-fix] provider $PROVIDER exited $rc" >&2
+fi
+
+"$ROOT/bin/rds-event" fixer_completed \
+  --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+  output_file="builds/$BUILD_ID/$(basename "$out")" exit_code="$rc" \
+  >/dev/null 2>&1 || true
+
+echo "[rds-fix] wrote $out"
+echo "----"
+cat "$out"
+
+# ---- Phase 2: apply -----------------------------------------------------------
+# Skip apply if diagnosis errored, auto-apply is off, or the diagnosis didn't
+# mark itself safe.
+if (( rc != 0 )); then
+  echo "[rds-fix] diagnose phase exited $rc — skipping apply"
+  exit "$rc"
+fi
+if [[ "$AUTO_APPLY" != "1" ]]; then
+  echo "[rds-fix] auto-apply disabled (RDS_FIX_AUTO_APPLY=$AUTO_APPLY); diagnose only"
+  exit 0
+fi
+# Match "SAFE-TO-APPLY: yes" anywhere in the diagnosis (case-insensitive),
+# but reject any "no" verdict to avoid applying explicitly-unsafe actions.
+if grep -qiE '^[[:space:]]*SAFE-TO-APPLY[[:space:]]*:[[:space:]]*no\b' "$out"; then
+  echo "[rds-fix] diagnosis marked SAFE-TO-APPLY: no — skipping apply"
+  exit 0
+fi
+if ! grep -qiE '^[[:space:]]*SAFE-TO-APPLY[[:space:]]*:[[:space:]]*yes\b' "$out"; then
+  echo "[rds-fix] no SAFE-TO-APPLY: yes verdict found — skipping apply"
+  exit 0
+fi
+
+# Pull app_dest from state.json so the applier can cd into the project.
+apply_cwd="$BUILD_DIR"
+if [[ -n "$app_dest" && -d "$app_dest" ]]; then
+  apply_cwd="$app_dest"
+fi
+
+apply_log="$BUILD_DIR/fixer-apply-$ts.log"
+diagnosis="$(cat "$out")"
+
+apply_prompt=$(cat <<EOF
+You are applying a previously-diagnosed fix for an RDS build.
+
+The diagnosis below has already been judged SAFE-TO-APPLY by an earlier
+reviewer. Your job is narrow: execute the action in the "Proposed action"
+section exactly as written. Do NOT expand scope, refactor unrelated code,
+or invent additional fixes. After applying, write 1-2 sentences confirming
+what you did, then stop.
+
+Build ID:  $BUILD_ID
+Build dir: $BUILD_DIR
+App dest:  ${app_dest:-<none>}
+Working directory: $apply_cwd
+
+Diagnosis (verbatim):
+$diagnosis
+
+Apply the proposed action now.
+EOF
+)
+
+"$ROOT/bin/rds-event" fixer_apply_started \
+  --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+  budget_usd="$APPLY_BUDGET" phase="apply" provider="$PROVIDER" diagnosis="builds/$BUILD_ID/$(basename "$out")" \
+  >/dev/null 2>&1 || true
+
+echo "[rds-fix] applying fix in $apply_cwd (budget=\$$APPLY_BUDGET)..."
+if ( cd "$apply_cwd" && printf '%s\n' "$apply_prompt" \
+  | rds_infer "$PROVIDER" "$apply_cwd" 80 "$APPLY_BUDGET" "" > "$apply_log" 2>&1 ); then
+  arc=0
+else
+  arc=$?
+  echo "[rds-fix] apply provider $PROVIDER exited $arc" >&2
+fi
+
+"$ROOT/bin/rds-event" fixer_apply_completed \
+  --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+  output_file="builds/$BUILD_ID/$(basename "$apply_log")" exit_code="$arc" \
+  >/dev/null 2>&1 || true
+
+echo "[rds-fix] apply log: $apply_log"
+echo "----"
+cat "$apply_log"
+
+# ---- Phase 3: retry the failed stage ----------------------------------------
+# If the apply succeeded, resume the build so the failed/incomplete stage
+# actually runs again with the fix in place. Cap is enforced naturally:
+# rds-fix runs once per fix attempt, so this spawns at most one resume per
+# attempt. The watchdog's MAX_FIX_ATTEMPTS prevents fix→retry→fail loops
+# from running forever.
+if (( arc != 0 )); then
+  echo "[rds-fix] apply phase exited $arc — skipping auto-retry"
+  exit "$arc"
+fi
+if [[ "$AUTO_RETRY" != "1" ]]; then
+  echo "[rds-fix] auto-retry disabled (RDS_FIX_AUTO_RETRY=$AUTO_RETRY) — apply only"
+  exit 0
+fi
+
+# Identify which stage will be retried (purely informational for the event).
+failed_stage="$(jq -r '
+  (.stages | to_entries
+    | map(select(.value.status == "failed" or .value.status == "running"))
+    | .[0].key) // "unknown"
+' "$BUILD_DIR/state.json" 2>/dev/null || echo unknown)"
+
+"$ROOT/bin/rds-event" fixer_retry_started \
+  --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+  stage="$failed_stage" via="rds-resume" \
+  >/dev/null 2>&1 || true
+
+echo "[rds-fix] auto-retry: spawning bin/rds-resume $BUILD_ID --detach (failed_stage=$failed_stage)"
+if ! "$ROOT/bin/rds-resume" "$BUILD_ID" --detach >> "$BUILD_DIR/fixer-retry-$ts.log" 2>&1; then
+  rrc=$?
+  echo "[rds-fix] rds-resume exited $rrc — see builds/$BUILD_ID/fixer-retry-$ts.log" >&2
+  "$ROOT/bin/rds-event" fixer_retry_failed \
+    --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+    exit_code="$rrc" \
+    >/dev/null 2>&1 || true
+  exit "$rrc"
+fi
+
+echo "[rds-fix] resume launched in background; subsequent build_resumed/stage_* events will follow"
+exit 0

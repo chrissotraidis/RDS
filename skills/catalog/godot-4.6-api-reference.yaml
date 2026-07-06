@@ -1,0 +1,17 @@
+---
+slug: godot-4.6-api-reference
+name: Godot 4.6 API reference
+status: curated
+category: docs
+maturity: stable
+applies_to:
+- game-engine
+description: Pinned Godot 4.6 API reference context.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: docs.godotengine.org
+  url: https://docs.godotengine.org/
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

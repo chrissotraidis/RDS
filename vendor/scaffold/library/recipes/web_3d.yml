@@ -1,0 +1,86 @@
+name: Web 3D Experience
+type: web_3d
+keywords:
+  - three
+  - webgl
+  - webgpu
+  - react-three-fiber
+  - r3f
+  - 3d
+  - product configurator
+  - gltf
+description: >
+  Browser-rendered 3D experience built with Vite, React, Three.js, and
+  React Three Fiber. Use this for 3D portfolio scenes, product configurators,
+  WebGL explainers, and browser-native 3D prototypes.
+
+framework:
+  primary: React Three Fiber
+  renderer: Three.js
+  bundler: Vite
+  language: TypeScript
+  runtime: Bun
+  deployment: Zo HTTP service
+
+workflow:
+  capabilities:
+    browser_ui: true
+    webgl_canvas: true
+    static_assets: true
+    visual_qa: true
+    native_tests: false
+    database: false
+
+finalization:
+  commands:
+    - bun install
+    - bun run build
+  checks:
+    - name: Vite build
+      command: bun run build
+      type: compilation
+      required: true
+    - name: Canvas render
+      command: browser screenshot and canvas nonblank check
+      type: visual
+      required: true
+
+verification:
+  setup_commands:
+    - bun install
+  boot_command: bunx --bun vite --host 0.0.0.0 --port 3000
+  health_checks:
+    - url: "http://localhost:3000/"
+      expected_status: 200
+  test_command: bun run build
+
+sections:
+  - name: Runtime Contract
+    phase: pipeline
+    labels: ["setup", "frontend"]
+    description: Keep the generated app a bootable Vite + R3F project.
+    guidance:
+      - Preserve package scripts: dev, build, preview, test.
+      - Preserve a rendered canvas at /.
+      - Do not replace this project with Rails, Next.js, or a static mockup.
+      - Put GLTF and texture assets in public/models and public/textures.
+
+  - name: Scene Construction
+    phase: pipeline
+    labels: ["3d", "design"]
+    description: Build the scene from the PRD and scene spec.
+    guidance:
+      - Keep camera, lighting, materials, and motion explicit.
+      - Avoid per-frame React state; mutate refs inside useFrame.
+      - Budget assets and draw calls for mobile unless the PRD says desktop-only.
+      - Favor semantic components for objects, lights, controls, and overlays.
+
+  - name: Quality
+    phase: pipeline
+    labels: ["qa", "visual"]
+    description: Verify the app compiles and renders nonblank 3D output.
+    guidance:
+      - bun run build must pass.
+      - The root page must return 200.
+      - Check the browser canvas at desktop and mobile sizes.
+      - Fix console errors before declaring the build complete.

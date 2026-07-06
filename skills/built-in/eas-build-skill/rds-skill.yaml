@@ -1,0 +1,20 @@
+---
+slug: eas-build-skill
+name: EAS build
+status: ready
+default: false
+applies_to:
+- mobile-native
+description: Expo Application Services build profile and artifact handoff.
+install:
+  command: bin/rds-skill-materialize eas-build-skill
+verify:
+  command: bin/rds-skill-verify eas-build-skill
+maturity: stable
+category: deploy
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should
+  understand during stack selection, skill resolution, implementation guidance, or
+  verification.
+source_links:
+- label: docs.expo.dev
+  url: https://docs.expo.dev/build/introduction/

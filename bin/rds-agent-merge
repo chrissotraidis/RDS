@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+RDS_ROOT="$ROOT"
+source "$ROOT/bin/lib/common.sh"
+source "$ROOT/bin/lib/agents.sh"
+ID="${1:-}"
+CONFIRM="$(parse_flag --confirm "$@" || echo "")"
+[[ -n "$ID" ]] || { echo "usage: bin/rds-agent-merge <session-id> --confirm=MERGE" >&2; exit 2; }
+[[ "$CONFIRM" == "MERGE" ]] || { echo "FATAL: merge requires --confirm=MERGE" >&2; exit 2; }
+JSON_PATH="$(agent_find_session_json "$ID")" || { echo "No agent session named $ID" >&2; exit 1; }
+TMUX_SESSION="$(agent_json_get "$JSON_PATH" '.tmux_session')"
+agent_tmux_exists "$TMUX_SESSION" && { echo "FATAL: session is still running; stop it before merge" >&2; exit 2; }
+REPO="$(agent_json_get "$JSON_PATH" '.repo_root')"
+BRANCH="$(agent_json_get "$JSON_PATH" '.branch')"
+BASE="$(agent_json_get "$JSON_PATH" '.base_branch')"
+git -C "$REPO" switch "$BASE"
+git -C "$REPO" merge --no-ff "$BRANCH"
+agent_update_json "$JSON_PATH" --arg now "$(agent_now)" '.status = "merged" | .updated_at = $now'
+echo "merged $BRANCH into $BASE locally"
+

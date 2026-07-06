@@ -1,0 +1,20 @@
+---
+slug: apple-credentials-skill
+name: Apple credentials
+status: ready
+default: false
+applies_to:
+- mobile-native
+description: Records Apple Developer credential requirements for iOS builds.
+install:
+  command: bin/rds-skill-materialize apple-credentials-skill
+verify:
+  command: bin/rds-skill-verify apple-credentials-skill
+maturity: beta
+category: deploy
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should
+  understand during stack selection, skill resolution, implementation guidance, or
+  verification.
+source_links:
+- label: developer.apple.com
+  url: https://developer.apple.com/help/account/

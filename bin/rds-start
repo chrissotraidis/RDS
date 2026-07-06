@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+# bin/rds-start — idempotent build launcher (TD-012).
+#
+# Wraps bin/rds-build so the operator can fire-and-forget a build:
+#   - detaches into the background via setsid + nohup (survives shell exit)
+#   - new process group, so 'rds-stop' can kill the whole tree
+#   - writes a per-build PID file at $BUILD_DIR/run.pid
+#   - tees stdout+stderr to /dev/shm/<build-id>-launch-build.log (the path
+#     the dashboard / TD-001 watches via SSE) AND $BUILD_DIR/logs/launch.log
+#   - emits build_started event (TD-014) and notify_build_started (TD-011)
+#
+# Idempotency: if any current build's run.pid is alive, refuses to start a
+# new build by default and exits 0 with a status line. Pass --force to ignore.
+#
+# Usage (mirrors rds-build):
+#   bin/rds-start <research-trigger> --app-dest=<abs-path> [--app-type=<type>] [...]
+#   bin/rds-start --repo=<git-url> --prd=<prd-source> --app-dest=<abs-path> [--app-type=<type>] [...]
+#
+# Extra flags:
+#   --force          start even if another build is in flight
+#   --no-notify      skip the Telegram ping (event still logged)
+#   --foreground     don't detach; useful for debugging
+#
+# After start, the operator typically:
+#   tail -f /dev/shm/<build-id>-launch-build.log
+#   bin/rds-status <build-id>
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck disable=SC1091
+source "$ROOT/bin/lib/common.sh"
+
+# --- Argument parsing (only the flags we own; the rest pass through) -------
+FORCE=0
+NOTIFY=1
+FOREGROUND=0
+
+passthrough=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --force)       FORCE=1; shift ;;
+    --no-notify)   NOTIFY=0; shift ;;
+    --foreground)  FOREGROUND=1; shift ;;
+    -h|--help)     sed -n '2,32p' "$0"; exit 0 ;;
+    *)             passthrough+=("$1"); shift ;;
+  esac
+done
+
+# --- Idempotency: check for an in-flight build -----------------------------
+running_build_id=""
+if [[ -d "$RDS_BUILDS_DIR" ]]; then
+  shopt -s nullglob
+  for pidfile in "$RDS_BUILDS_DIR"/*/run.pid; do
+    pid="$(awk -F= '/^pid=/{print $2; exit}' "$pidfile" 2>/dev/null || true)"
+    [[ -z "$pid" || ! "$pid" =~ ^[0-9]+$ ]] && continue
+    build_id="$(basename "$(dirname "$pidfile")")"
+    if rds_pid_is_build_runner "$pid" "$build_id"; then
+      running_build_id="$build_id"
+      break
+    fi
+  done
+  shopt -u nullglob
+fi
+
+if [[ -n "$running_build_id" && "$FORCE" -ne 1 ]]; then
+  cat <<MSG >&2
+[rds-start] another build is already running: $running_build_id
+  (PID-file: $RDS_BUILDS_DIR/$running_build_id/run.pid)
+  Use 'bin/rds-stop $running_build_id' to terminate it, or
+  pass --force to start a second build anyway. Exiting.
+MSG
+  exit 0  # idempotent: starting when one's already up is a no-op
+fi
+
+# --- Compute build_id ahead of time so PID-file + log path are predictable -
+# We mirror rds-build's id-derivation logic so the operator sees the same id.
+EXPLICIT_ID="$(parse_flag --build-id "${passthrough[@]}" || echo "")"
+REPO_URL="$(parse_flag --repo        "${passthrough[@]}" || echo "")"
+PRD_SOURCE="$(parse_flag --prd       "${passthrough[@]}" || echo "")"
+APP_DEST="$(parse_flag --app-dest    "${passthrough[@]}" || echo "")"
+
+# Trigger is the first positional arg.
+TRIGGER="$(first_positional_arg "${passthrough[@]}" || echo "")"
+
+if [[ -z "$APP_DEST" ]]; then
+  echo "FATAL: --app-dest=<abs-path> is required (rds-build will reject otherwise)." >&2
+  exit 1
+fi
+
+if [[ -n "$REPO_URL" ]]; then
+  MODE=brown
+  REPO_URL="$(normalize_repo_url "$REPO_URL")"
+  SLUG="$(basename "${REPO_URL%.git}")"
+  SLUG="$(derive_slug "$SLUG")"
+else
+  MODE=green
+  if [[ -z "$TRIGGER" ]]; then
+    echo "FATAL: green-field requires a research trigger (rds-build will reject otherwise)." >&2
+    exit 1
+  fi
+  SLUG="$(derive_slug "$TRIGGER")"
+fi
+
+BUILD_ID="${EXPLICIT_ID:-$SLUG-$(date -u +%Y%m%d-%H%M%S)}"
+BUILD_DIR="$RDS_BUILDS_DIR/$BUILD_ID"
+mkdir -p "$BUILD_DIR/logs"
+
+# Pin the build_id for the child rds-build invocation so we don't drift.
+# (If the user already passed --build-id, this is a no-op.)
+if [[ -z "$EXPLICIT_ID" ]]; then
+  passthrough+=("--build-id=$BUILD_ID")
+fi
+
+# Validate --stack early (so we fail before detaching) — defaults to rails.
+STACK="$(parse_flag --stack "${passthrough[@]}" || echo "${RDS_DEFAULT_STACK:-rails}")"
+stack_validate "$STACK"
+
+PIDFILE="$BUILD_DIR/run.pid"
+SHM_LOG="/dev/shm/${BUILD_ID}-launch-build.log"
+LAUNCH_LOG="$BUILD_DIR/logs/launch.log"
+
+# --- Emit lifecycle event + Telegram ping (best-effort) --------------------
+if [[ "$NOTIFY" -eq 1 ]]; then
+  "$ROOT/bin/rds-notify" build_started \
+    --build-id "$BUILD_ID" \
+    --build-dir "$BUILD_DIR" \
+    || true
+else
+  # Still log to the event stream even if Telegram is suppressed.
+  "$ROOT/bin/rds-event" build_started \
+    --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+    mode="$MODE" slug="$SLUG" \
+    || true
+fi
+
+# --- Foreground mode (debug) -----------------------------------------------
+if [[ "$FOREGROUND" -eq 1 ]]; then
+  echo "[rds-start] foreground build_id=$BUILD_ID"
+  exec "$ROOT/bin/rds-build" "${passthrough[@]}"
+fi
+
+# --- Detach into the background --------------------------------------------
+# setsid puts the child in its own session/pgid, so 'kill -TERM -<pgid>' in
+# rds-stop reaps the whole tree. nohup masks SIGHUP. The bash -c body runs
+# rds-build under a tee that splits to /dev/shm and builds/<id>/logs.
+echo "[rds-start] launching build_id=$BUILD_ID in background"
+echo "[rds-start]   live log: $SHM_LOG"
+echo "[rds-start]   archive : $LAUNCH_LOG"
+
+# Touch logs up front so 'tail -f' works immediately even before the child
+# has produced output.
+: > "$SHM_LOG"
+: >> "$LAUNCH_LOG"
+
+setsid nohup bash -c '
+  shm_log="$1"; launch_log="$2"; build="$3"; shift 3
+  "$build" "$@" 2>&1 | tee -a "$shm_log" >> "$launch_log"
+' rds-start "$SHM_LOG" "$LAUNCH_LOG" "$ROOT/bin/rds-build" "${passthrough[@]}" \
+  </dev/null >/dev/null 2>&1 &
+
+child=$!
+
+# Persist the PID file synchronously so rds-status / rds-stop see it the
+# moment this script returns. The PID we record is the bash session leader,
+# which is also the pgid (because of setsid).
+{
+  printf 'pid=%s\n'        "$child"
+  printf 'pgid=%s\n'       "$child"
+  printf 'build_id=%s\n'   "$BUILD_ID"
+  printf 'slug=%s\n'       "$SLUG"
+  printf 'mode=%s\n'       "$MODE"
+  printf 'started_at=%s\n' "$(date -u +%FT%TZ)"
+  printf 'host=%s\n'       "$(hostname)"
+  printf 'log=%s\n'        "$SHM_LOG"
+  printf 'archive=%s\n'    "$LAUNCH_LOG"
+} > "$PIDFILE.tmp"
+mv "$PIDFILE.tmp" "$PIDFILE"
+
+echo "[rds-start] pid=$child → $PIDFILE"
+echo "[rds-start] follow with: tail -f $SHM_LOG"
+echo "[rds-start] check with : bin/rds-status $BUILD_ID"
+exit 0

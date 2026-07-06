@@ -1,0 +1,20 @@
+---
+slug: payments-stripe-mcp
+name: Stripe payments MCP
+status: curated
+category: payments
+maturity: stable
+applies_to:
+- rails-web
+- nextjs-fullstack
+- python-ai-service
+- mobile-native
+description: Stripe payments and webhook capability via MCP-aware setup.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: docs.stripe.com
+  url: https://docs.stripe.com/mcp
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

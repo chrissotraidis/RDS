@@ -1,0 +1,23 @@
+{
+  "schema": "rds.qa.scenarios.v1",
+  "scenarios": [
+    {
+      "title": "Approve selected request",
+      "objective": "Approve changes visible status.",
+      "actions": [{ "type": "click", "target": "Approve selected" }],
+      "expectations": [{ "type": "business-state", "target": "Fixture review", "value": "Approved" }]
+    },
+    {
+      "title": "Reject selected request",
+      "objective": "Reject changes visible status.",
+      "actions": [{ "type": "click", "target": "Reject selected" }],
+      "expectations": [{ "type": "business-state", "target": "Fixture review", "value": "Rejected" }]
+    },
+    {
+      "title": "Export report",
+      "objective": "Export produces a visible result or download.",
+      "actions": [{ "type": "click", "target": "Export report" }],
+      "expectations": [{ "type": "text", "value": "Export ready" }]
+    }
+  ]
+}

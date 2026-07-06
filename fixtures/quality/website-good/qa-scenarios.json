@@ -1,0 +1,22 @@
+{
+  "schema": "rds.qa.scenarios.v1",
+  "scenarios": [
+    {
+      "title": "Visitor understands the offer",
+      "objective": "Confirm first-screen message is clear.",
+      "expectations": [{ "type": "text", "value": "Design systems for focused product teams" }]
+    },
+    {
+      "title": "Visitor can inspect work",
+      "objective": "Open the work page from primary navigation.",
+      "actions": [{ "type": "click", "target": "Work|View work" }],
+      "expectations": [{ "type": "url", "value": "work" }]
+    },
+    {
+      "title": "Visitor can contact the team",
+      "objective": "Open contact from the hero CTA.",
+      "actions": [{ "type": "click", "target": "Contact" }],
+      "expectations": [{ "type": "url", "value": "contact" }]
+    }
+  ]
+}

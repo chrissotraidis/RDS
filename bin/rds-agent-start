@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+RDS_ROOT="$ROOT"
+source "$ROOT/bin/lib/common.sh"
+source "$ROOT/bin/lib/agents.sh"
+
+usage() {
+  sed -n '2,80p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+PROVIDER="$(agent_normalize_provider "$(parse_flag --provider "$@" || echo claude-code)")"
+MODE="$(parse_flag --mode "$@" || echo interactive)"
+REPO="$(parse_flag --repo "$@" || echo "")"
+TASK="$(parse_flag --task "$@" || echo "")"
+BUILD_ID="$(parse_flag --build-id "$@" || echo "")"
+BASE_BRANCH="$(parse_flag --base-branch "$@" || echo "")"
+BRANCH_IN="$(parse_flag --branch "$@" || echo "")"
+WORKTREE_IN="$(parse_flag --worktree "$@" || echo "")"
+STARTED_BY="$(parse_flag --started-by "$@" || echo dashboard)"
+HANDOFF_FROM="$(parse_flag --handoff-from "$@" || echo "")"
+PROMPT_FILE="$(parse_flag --prompt-file "$@" || echo "")"
+
+for arg in "$@"; do
+  case "$arg" in
+    -h|--help) usage; exit 0 ;;
+  esac
+done
+
+[[ -n "$TASK" ]] || { echo "FATAL: --task is required" >&2; exit 2; }
+[[ "$MODE" == "interactive" || "$MODE" == "print" || "$MODE" == "batch" ]] || { echo "FATAL: --mode must be interactive, print, or batch" >&2; exit 2; }
+if [[ -z "$REPO" && -n "$BUILD_ID" && -f "$RDS_BUILDS_DIR/$BUILD_ID/state.json" ]]; then
+  REPO="$(jq -r '.app_dest // empty' "$RDS_BUILDS_DIR/$BUILD_ID/state.json")"
+fi
+[[ -n "$REPO" ]] || { echo "FATAL: --repo is required when --build-id has no app_dest" >&2; exit 2; }
+[[ -d "$REPO/.git" || -f "$REPO/.git" ]] || { echo "FATAL: repo is not a git checkout: $REPO" >&2; exit 2; }
+
+provider_file="$(agent_provider_file "$PROVIDER")"
+source "$provider_file"
+version="$(rds_agent_provider_detect || true)"
+[[ -n "$version" ]] || { echo "FATAL: provider '$PROVIDER' is not installed or not authenticated enough to launch" >&2; exit 2; }
+command -v tmux >/dev/null 2>&1 || { echo "FATAL: tmux is required for RDS Agent Sessions" >&2; exit 2; }
+
+slug="$(agent_slug "$TASK")"
+BASE_BRANCH="${BASE_BRANCH:-$(agent_repo_branch "$REPO")}"
+BRANCH="${BRANCH_IN:-$(agent_unique_branch "$REPO" "rds/$slug")}"
+WORKTREE="${WORKTREE_IN:-$(agent_unique_worktree_path "$REPO" "$slug")}"
+SESSION_ID="agent-$(date -u +%Y%m%d-%H%M%S)-$(printf '%s' "$slug" | cut -c1-18)"
+SESSION_ROOT="$(agent_session_root "$BUILD_ID")"
+mkdir -p "$SESSION_ROOT"
+LOG_PATH="$SESSION_ROOT/$SESSION_ID.log"
+JSON_PATH="$SESSION_ROOT/$SESSION_ID.json"
+TMUX_SESSION="rds-${SESSION_ID}"
+
+git -C "$REPO" fetch --all --prune >/dev/null 2>&1 || true
+if [[ ! -d "$WORKTREE" ]]; then
+  mkdir -p "$(dirname "$WORKTREE")"
+  git -C "$REPO" worktree add "$WORKTREE" -b "$BRANCH" "$BASE_BRANCH"
+fi
+
+now="$(agent_now)"
+jq -n \
+  --arg id "$SESSION_ID" \
+  --arg build_id "$BUILD_ID" \
+  --arg provider "$PROVIDER" \
+  --arg mode "$MODE" \
+  --arg task "$TASK" \
+  --arg repo_root "$REPO" \
+  --arg base_branch "$BASE_BRANCH" \
+  --arg branch "$BRANCH" \
+  --arg worktree_path "$WORKTREE" \
+  --arg tmux_session "$TMUX_SESSION" \
+  --arg status "starting" \
+  --arg created_at "$now" \
+  --arg updated_at "$now" \
+  --arg started_by "$STARTED_BY" \
+  --arg log_path "${LOG_PATH#$ROOT/}" \
+  --arg handoff_from "$HANDOFF_FROM" \
+  '{
+    id: $id,
+    build_id: (if $build_id == "" then null else $build_id end),
+    provider: $provider,
+    mode: $mode,
+    task: $task,
+    repo_root: $repo_root,
+    base_branch: $base_branch,
+    branch: $branch,
+    worktree_path: $worktree_path,
+    tmux_session: $tmux_session,
+    status: $status,
+    created_at: $created_at,
+    updated_at: $updated_at,
+    started_by: $started_by,
+    log_path: $log_path,
+    last_exit_code: null,
+    handoff_from: (if $handoff_from == "" then null else $handoff_from end),
+    handoff_to: null
+  }' >"$JSON_PATH"
+
+agent_write_context_packet "$WORKTREE" "$JSON_PATH"
+{
+  echo "[$now] RDS Agent Session $SESSION_ID"
+  echo "provider=$PROVIDER mode=$MODE repo=$REPO worktree=$WORKTREE branch=$BRANCH"
+  echo "task=$TASK"
+  echo
+} >>"$LOG_PATH"
+
+if [[ "$MODE" == "interactive" ]]; then
+  provider_cmd="$(rds_agent_provider_interactive_command "$TMUX_SESSION")"
+  tmux new-session -d -s "$TMUX_SESSION" "cd $(printf '%q' "$WORKTREE") && printf '%s\n\n' 'Context: .agent-session/context.md' && $provider_cmd"
+  tmux pipe-pane -o -t "$TMUX_SESSION" "cat >> $(printf '%q' "$LOG_PATH")"
+  agent_update_json "$JSON_PATH" --arg now "$(agent_now)" '.status = "running" | .updated_at = $now'
+elif [[ "$MODE" == "print" ]]; then
+  provider_cmd="$(rds_agent_provider_print_command)"
+  prompt="$TASK"
+  if [[ -n "$PROMPT_FILE" && -f "$PROMPT_FILE" ]]; then
+    prompt="$(cat "$PROMPT_FILE")"
+  fi
+  {
+    echo "[$(agent_now)] one-shot started"
+    printf '%s\n' "$prompt" | bash -lc "cd $(printf '%q' "$WORKTREE") && $provider_cmd"
+    rc=$?
+    echo "[$(agent_now)] one-shot exited $rc"
+    exit "$rc"
+  } >>"$LOG_PATH" 2>&1 || rc=$?
+  rc="${rc:-0}"
+  agent_update_json "$JSON_PATH" --arg now "$(agent_now)" --argjson rc "$rc" '.status = (if $rc == 0 then "exited" else "failed" end) | .last_exit_code = $rc | .updated_at = $now'
+else
+  agent_update_json "$JSON_PATH" --arg now "$(agent_now)" '.status = "queued" | .updated_at = $now'
+fi
+
+printf 'session_id=%s\njson=%s\nlog=%s\nworktree=%s\nbranch=%s\nattach=tmux attach -t %s\n' "$SESSION_ID" "$JSON_PATH" "$LOG_PATH" "$WORKTREE" "$BRANCH" "$TMUX_SESSION"

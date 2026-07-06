@@ -1,0 +1,23 @@
+#!/usr/bin/env ruby
+# Normalize every stack contract and manifest to the V1 Zo preview port range.
+
+require "json"
+require "yaml"
+
+root = File.expand_path("..", __dir__)
+range = [4000, 4099]
+
+Dir[File.join(root, "stacks", "*", "manifest.json")].sort.each do |path|
+  data = JSON.parse(File.read(path))
+  data["default_port_range"] = range
+  File.write(path, JSON.pretty_generate(data) + "\n")
+  puts "updated #{path.sub("#{root}/", "")}"
+end
+
+Dir[File.join(root, "stacks", "*", "stack.yaml")].sort.each do |path|
+  data = YAML.load_file(path) || {}
+  data["ports"] ||= {}
+  data["ports"]["range"] = range
+  File.write(path, data.to_yaml)
+  puts "updated #{path.sub("#{root}/", "")}"
+end

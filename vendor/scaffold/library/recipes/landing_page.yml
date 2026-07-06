@@ -1,0 +1,275 @@
+name: Landing Page
+type: landing_page
+keywords:
+  - landing
+  - marketing
+  - homepage
+  - launch
+  - waitlist
+  - coming soon
+  - signup
+  - conversion
+  - seo
+  - static
+  - brochure
+  - portfolio
+description: >
+  Marketing or product landing page built with Rails 8+. Primarily
+  static content with dynamic elements for lead capture, waitlists,
+  or early signups. Uses Rails for form handling, email delivery,
+  and simple admin. Can serve as the public face of a larger Rails
+  application or stand alone.
+
+framework:
+  primary: Rails 8+
+  frontend: ERB views with Turbo for form interactions
+  css: Tailwind CSS via tailwindcss-rails
+  deployment: Kamal 2 (or static export if purely static)
+
+workflow:
+  capabilities:
+    browser_ui: true
+    http_routes: true
+    background_work: true
+    email_delivery: true
+    seed_data: true
+    accessibility: true
+    native_tests: true
+
+mcp:
+  capabilities:
+    - database_schema
+    - docs_lookup
+  hints:
+    database_schema:
+      adapter: sqlite3
+      schema_paths: ["db/schema.rb"]
+      migration_paths: ["db/migrate"]
+      model_paths: ["app/models"]
+    docs_lookup:
+      frameworks: ["rails", "tailwindcss"]
+
+finalization:
+  commands:
+    - bundle install
+    - bin/rails db:prepare
+  checks:
+    - name: Boot check
+      command: "bin/rails runner 'puts Rails.version'"
+      type: custom
+      required: true
+
+verification:
+  setup_commands:
+    - bin/setup
+  boot_command: bin/rails server -p 3000 -d
+  health_checks:
+    - url: "http://localhost:3000/up"
+      expected_status: 200
+    - url: "http://localhost:3000/"
+      expected_status: 200
+  test_command: bin/rails test:all
+  cleanup_command: kill $(cat tmp/pids/server.pid)
+
+sections:
+  - name: Local Development
+    phase: pipeline
+    labels: ["setup"]
+    description: >
+      Development environment setup that ensures the landing page
+      renders locally with zero external dependencies. This is the
+      foundation for pipeline iteration — every tier gate check depends
+      on the page being viewable at localhost.
+    rails_tools:
+      - bin/setup (Rails default setup script)
+      - bin/dev (Procfile.dev via foreman)
+      - SQLite (Rails 8 default, zero-dependency database)
+    guidance:
+      - The bootstrap task (task 0) MUST produce a project that starts with bin/dev
+      - bin/setup MUST run successfully (bundle install + db:prepare) with no manual steps
+      - >
+        Do NOT manually create Procfile.dev — the scaffold provides one.
+        If it is missing or needs changes, use this canonical content:
+          web: bin/rails server
+          css: bin/rails "tailwindcss:watch[always]"
+        Add `queue: bin/jobs` only if Solid Queue is installed. The [always]
+        flag is REQUIRED — without it the CSS watcher exits immediately
+        when foreman closes stdin.
+      - Use SQLite for development and test databases (Rails 8 default)
+      - The root route MUST render the landing page immediately after bootstrap
+      - Analytics scripts (Plausible, PostHog, GA) should be conditional on ENV vars — page works without them
+      - Create .env.example listing optional integration variables (none required to boot)
+      - Do NOT generate tasks for production hosting, domain config, or SSL during pipeline execution
+    solid_stack_setup: >
+      Landing pages typically only need Solid Queue (for email delivery via
+      ActionMailer + deliver_later). Solid Cache and Solid Cable can usually
+      be skipped. If Solid Queue is used, it requires its own SQLite
+      database in development.
+
+      If background email delivery is needed:
+
+      1. Run the install generator:
+           bin/rails solid_queue:install
+
+      2. Verify database.yml has the queue entry under development:
+
+           development:
+             primary:
+               <<: *default
+               database: storage/development.sqlite3
+             queue:
+               <<: *default
+               database: storage/development_queue.sqlite3
+               migrations_paths: db/queue_migrate
+
+      3. Verify config/application.rb (not just production.rb) contains:
+           config.solid_queue.connects_to = { database: { writing: :queue } }
+
+      4. Run bin/rails db:prepare to create and load all database schemas.
+
+      Alternative: For a simple landing page, skip Solid Queue entirely
+      and use config.active_job.queue_adapter = :async in development.
+      The :async adapter runs jobs in-process with no database setup
+      needed. This is the simplest path if email delivery is the only
+      background work.
+
+      ANTI-PATTERNS — common mistakes AI agents make with Procfile.dev:
+      - Do NOT add `cable: bin/rails solid_cable:start` — there is no such
+        command. Solid Cable polls from within the Puma process.
+      - Do NOT use bare `tailwindcss:watch` — it exits immediately when
+        stdin is closed (which foreman does). Use `tailwindcss:watch[always]`.
+
+  - name: Content & Layout
+    phase: pipeline
+    labels: ["frontend"]
+    description: >
+      Page sections, copy structure, visual hierarchy, and responsive
+      design across devices.
+    rails_tools:
+      - ActionView (ERB templates, partials for each section)
+      - Tailwind CSS (utility-first responsive styling)
+    guidance:
+      - Structure page as composable partials (hero, features, pricing, CTA, footer)
+      - Design mobile-first; test at 320px, 768px, and 1280px breakpoints
+      - Keep above-the-fold content focused on one clear value proposition
+      - Use partials so sections can be reordered or A/B tested easily
+      - Include social proof section (testimonials, logos, stats)
+
+  - name: Lead Capture & Forms
+    phase: pipeline
+    labels: ["frontend", "backend"]
+    description: >
+      Email signup forms, waitlist registration, contact forms, and
+      form submission handling.
+    rails_tools:
+      - ActionController (form handling)
+      - ActiveRecord (Lead, Subscriber, or Contact model)
+      - ActionMailer (confirmation emails)
+      - Turbo Streams (inline form success/error feedback)
+    guidance:
+      - Use Turbo for form submission to avoid full page reloads
+      - Validate email format server-side; show inline errors
+      - Send confirmation or welcome email via ActionMailer + Solid Queue
+      - Store UTM parameters and referrer with each lead for attribution
+      - Implement honeypot or rate limiting for spam prevention
+      - In development, emails are captured by Rails letter_opener or logged — no SMTP config needed
+
+  - name: SEO & Meta
+    phase: pipeline
+    labels: ["frontend"]
+    description: >
+      Search engine optimization, social sharing metadata, and
+      structured data.
+    rails_tools:
+      - ActionView helpers (meta tags, title, canonical URL)
+      - Custom SEO concern or helper module
+    guidance:
+      - Set unique title, description, and OG tags per page
+      - Include Open Graph and Twitter Card meta for social sharing
+      - Generate sitemap.xml (sitemap_generator gem or manual)
+      - Use semantic HTML (h1, h2, article, section) for crawlability
+      - Implement canonical URLs to prevent duplicate content
+
+  - name: Analytics & Tracking
+    phase: pipeline
+    labels: ["frontend"]
+    description: >
+      Conversion tracking, visitor analytics, and A/B testing hooks.
+    guidance:
+      - Integrate analytics (Plausible, PostHog, or Google Analytics)
+      - Track form submissions as conversion events
+      - Set up goal funnels (visit → scroll → form start → submit)
+      - Plan A/B testing for headlines and CTAs (simple cookie-based variant assignment)
+      - Respect Do Not Track and cookie consent requirements
+      - Analytics scripts MUST be conditional on ENV vars — page renders fully without them
+
+  - name: Admin & Data Access
+    phase: pipeline
+    labels: ["backend"]
+    description: >
+      Simple admin interface to view leads, export data, and manage
+      page content.
+    rails_tools:
+      - Simple controller with authentication for admin views
+      - CSV export via Ruby CSV library
+    guidance:
+      - Build a minimal admin behind authentication (even HTTP Basic is fine early on)
+      - Show lead count, daily signups, and source breakdown
+      - Provide CSV export for leads
+      - Don't over-build admin; this is a landing page, not a CMS
+
+  - name: Performance & Delivery
+    phase: pipeline
+    labels: ["backend", "frontend"]
+    description: >
+      Page load speed, asset optimization, and caching for fast
+      first impressions.
+    rails_tools:
+      - Propshaft (asset pipeline)
+      - Solid Cache (page caching)
+    guidance:
+      - Target under 2 second load time on 3G connection
+      - Use page-level caching; landing pages rarely change per-request
+      - Optimize images (WebP, responsive srcset)
+      - Minimize external scripts; each one adds latency
+
+  - name: Testing
+    phase: pipeline
+    labels: ["testing"]
+    description: >
+      System tests for page rendering, form submission, and admin
+      flows. Tests are generated alongside feature tasks and must be
+      runnable locally with zero external dependencies. The spec's
+      GIVEN/WHEN/THEN scenarios are the primary source for test cases.
+    rails_tools:
+      - Minitest (default)
+      - Capybara with headless Chrome (system tests)
+      - Fixtures or FactoryBot
+    guidance:
+      - Every page or form task MUST ship with at least one relevant system, browser, or executable experience test derived from the spec's GIVEN/WHEN/THEN scenarios
+      - All tests MUST pass with bin/rails test:all using only local resources
+      - System tests MUST use headless Chrome (driven_by :selenium, using: :headless_chrome)
+      - No test may depend on network access, deployed services, or production credentials
+      - Test that the landing page renders all key sections
+      - Test form submission success and validation error flows
+      - Test admin access and CSV export
+      - Use fixtures or factories that mirror db/seeds.rb structure
+
+  - name: Deployment
+    phase: post_pipeline
+    description: >
+      Production hosting, domain setup, and SSL. This section is NOT
+      executed during pipeline iterations. Tasks derived from this
+      section should only be generated after the implementation has
+      passed analysis and the pipeline has converged on a working
+      local build.
+    rails_tools:
+      - Kamal 2 (deployment)
+      - Thruster (auto SSL via Let's Encrypt)
+    guidance:
+      - Deploy with Kamal to a single small VPS (landing pages are low-traffic)
+      - Configure custom domain and SSL via Thruster
+      - Set up redirects (www → apex or vice versa)
+      - Plan for scaling up if a launch goes viral (Kamal can add servers)
+      - DO NOT generate deployment tasks during pipeline iterations
+      - Deployment configuration is deferred until the project passes all tier gates and analysis

@@ -1,0 +1,41 @@
+{
+  "id": "nextjs",
+  "name": "Next.js full-stack",
+  "language": "typescript",
+  "runtime": {
+    "bun": ">=1.1.0"
+  },
+  "framework": {
+    "name": "next",
+    "version": "16"
+  },
+  "database": "postgresql-15",
+  "default_port_range": [
+    4000,
+    4099
+  ],
+  "health_path": "/api/health",
+  "stages": [
+    "intake",
+    "spec",
+    "init",
+    "scaffold",
+    "local-run",
+    "deploy"
+  ],
+  "init": "stacks/nextjs/init.sh",
+  "local_run": "stacks/nextjs/local-run.sh",
+  "doctor": "stacks/nextjs/doctor.sh",
+  "scaffold_recipe": "nextjs_fullstack",
+  "service_entrypoint": "bash -c 'bun install --frozen-lockfile || bun install; bunx next build; mkdir -p .next/standalone/.next; cp -R .next/static .next/standalone/.next/static; cp -R public .next/standalone/public 2>/dev/null || true; cd .next/standalone; HOSTNAME=0.0.0.0 PORT=%(ENV_PORT)s exec bun server.js'",
+  "service_env": {
+    "NODE_ENV": "production",
+    "NEXT_TELEMETRY_DISABLED": "1"
+  },
+  "supports_modes": [
+    "green",
+    "brown"
+  ],
+  "status": "ready",
+  "notes": "Ready V1 Phase 1a stack for Next.js App Router apps. Runs on Bun and previews through Zo HTTP services."
+}

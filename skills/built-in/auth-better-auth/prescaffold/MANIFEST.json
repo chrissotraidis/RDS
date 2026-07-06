@@ -1,0 +1,19 @@
+{
+  "writes": [
+    {
+      "path": "lib/auth.ts",
+      "source": "lib/auth.ts",
+      "replace_if_contains_any": []
+    },
+    {
+      "path": "lib/auth-client.ts",
+      "source": "lib/auth-client.ts",
+      "replace_if_contains_any": []
+    },
+    {
+      "path": "app/api/auth/[...all]/route.ts",
+      "source": "app/api/auth/[...all]/route.ts",
+      "replace_if_contains_any": []
+    }
+  ]
+}

@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Overlap Fixture</title>
+  <style>
+    body { margin: 0; font-family: Inter, system-ui, sans-serif; color: #111; }
+    main { padding: 40px 24px; }
+    h1 { font-size: 42px; max-width: 720px; }
+    .panel { position: relative; min-height: 260px; max-width: 760px; border: 1px solid #d0d0d0; padding: 24px; }
+    button { position: absolute; top: 96px; left: 24px; width: 220px; height: 44px; border-radius: 6px; }
+    .secondary { left: 120px; top: 108px; }
+    @media (max-width: 520px) { h1 { font-size: 34px; } .panel { min-width: 620px; } }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Mobile layout with overlapping controls</h1>
+    <p>The controls below overlap and the panel overflows on mobile. The visual audit should block this.</p>
+    <div class="panel">
+      <button>Approve build</button>
+      <button class="secondary">Reject build</button>
+    </div>
+  </main>
+</body>
+</html>

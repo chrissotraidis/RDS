@@ -1,0 +1,17 @@
+---
+slug: expo-mcp-server
+name: Expo MCP server
+status: curated
+category: mcp
+maturity: beta
+applies_to:
+- mobile-native
+description: Expo documentation and tooling MCP mount.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: docs.expo.dev
+  url: https://docs.expo.dev/
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

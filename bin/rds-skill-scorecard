@@ -1,0 +1,374 @@
+#!/usr/bin/env python3
+"""rds-skill-scorecard — per-build evaluation of whether each resolved skill
+actually shaped the app output.
+
+For every entry in `builds/<id>/skills/resolved.json`:
+  - Runs the skill's `verify.command` (if any) against the materialized app
+    so install artifacts are confirmed to exist.
+  - Runs a small slug-specific "shape probe" that counts evidence the skill
+    actually influenced app code (e.g., shadcn components imported, auth
+    routes wired up, drizzle schema present).
+  - Emits a per-skill verdict: ``pass`` / ``partial`` / ``fail`` /
+    ``not-installable`` / ``unknown``.
+
+Output is written to `builds/<id>/skills/scorecard.json` and printed to
+stdout. The dashboard renders these alongside the resolved-skills panel so an
+operator can see at a glance which skills were noise (e.g., a metadata-only
+``shadcn-add`` with zero components imported) versus which actually shaped
+the app.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+
+def _read_json(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+    except Exception:
+        return None
+
+
+def _count_matches(root: Path, glob: str, pattern: str) -> int:
+    count = 0
+    rx = re.compile(pattern, re.I)
+    for fp in root.rglob(glob):
+        if not fp.is_file():
+            continue
+        # Skip vendored / build outputs.
+        parts = set(fp.parts)
+        if parts & {"node_modules", ".next", "dist", "build", ".turbo"}:
+            continue
+        try:
+            text = fp.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        count += len(rx.findall(text))
+        if count > 1000:
+            break
+    return count
+
+
+def _file_contains(path: Path, pattern: str) -> bool:
+    if not path.exists() or not path.is_file():
+        return False
+    try:
+        return re.search(pattern, path.read_text(encoding="utf-8", errors="ignore"), re.I) is not None
+    except Exception:
+        return False
+
+
+def _run_verify(rds_root: Path, app_dest: Path, build_dir: Path, command: str) -> tuple[int, str]:
+    """Run a verify command in the app_dest with RDS_ROOT/APP_DEST exported."""
+    if not command:
+        return 0, "no verify command"
+    env = {
+        "APP_DEST": str(app_dest),
+        "RDS_APP_DEST": str(app_dest),
+        "RDS_ROOT": str(rds_root),
+        "RDS_BUILD_DIR": str(build_dir),
+        "PATH": __import__("os").environ.get("PATH", "/usr/bin:/bin"),
+    }
+    # Resolve relative paths against rds_root.
+    parts = command.split()
+    if parts and not parts[0].startswith("/"):
+        candidate = rds_root / parts[0]
+        if candidate.exists():
+            parts[0] = str(candidate)
+            command = " ".join(parts)
+    try:
+        proc = subprocess.run(
+            command, shell=True, cwd=str(app_dest), env=env, timeout=60,
+            capture_output=True, text=True,
+        )
+        return proc.returncode, ((proc.stdout or "") + (proc.stderr or "")).strip()[:400]
+    except subprocess.TimeoutExpired:
+        return 124, "verify timed out after 60s"
+    except Exception as exc:
+        return 2, f"verify error: {exc}"
+
+
+# ---- per-skill shape probes -------------------------------------------------
+
+def probe_shadcn_add(app: Path) -> dict[str, Any]:
+    ui_dir = app / "components" / "ui"
+    components_present = sorted(p.stem for p in ui_dir.glob("*.tsx")) if ui_dir.exists() else []
+    imports = _count_matches(app, "*.tsx", r"from\s+['\"]@/components/ui/")
+    globals_css = (app / "app" / "globals.css")
+    has_tailwind_directive = _file_contains(globals_css, r"@tailwind\s+base")
+    pkg = _read_json(app / "package.json") or {}
+    deps = {**(pkg.get("dependencies") or {}), **(pkg.get("devDependencies") or {})}
+    has_tailwind_dep = "tailwindcss" in deps
+    has_components_json = (app / "components.json").exists()
+    install_score = sum([
+        bool(components_present),
+        has_tailwind_directive,
+        has_tailwind_dep,
+        has_components_json,
+    ])
+    if install_score >= 3 and imports >= 3:
+        verdict = "pass"
+    elif install_score >= 2 or imports >= 1:
+        verdict = "partial"
+    else:
+        verdict = "fail"
+    return {
+        "verdict": verdict,
+        "evidence": {
+            "components_present": components_present,
+            "ui_imports_count": imports,
+            "has_tailwind_directive": has_tailwind_directive,
+            "has_tailwind_dep": has_tailwind_dep,
+            "has_components_json": has_components_json,
+        },
+        "note": f"{len(components_present)} components present, {imports} app imports",
+    }
+
+
+def probe_auth_better_auth(app: Path) -> dict[str, Any]:
+    pkg = _read_json(app / "package.json") or {}
+    deps = {**(pkg.get("dependencies") or {}), **(pkg.get("devDependencies") or {})}
+    has_dep = "better-auth" in deps
+    refs = _count_matches(app, "*.ts", r"better-auth") + _count_matches(app, "*.tsx", r"better-auth")
+    has_auth_route = any((app / "app" / "api" / "auth").rglob("route.ts")) if (app / "app" / "api" / "auth").exists() else False
+    score = sum([has_dep, refs >= 1, has_auth_route])
+    verdict = "pass" if score >= 2 else "partial" if score == 1 else "fail"
+    return {
+        "verdict": verdict,
+        "evidence": {"has_dep": has_dep, "refs": refs, "has_auth_route": has_auth_route},
+        "note": f"dep={has_dep}, refs={refs}, route={has_auth_route}",
+    }
+
+
+def probe_drizzle_introspect(app: Path) -> dict[str, Any]:
+    pkg = _read_json(app / "package.json") or {}
+    deps = {**(pkg.get("dependencies") or {}), **(pkg.get("devDependencies") or {})}
+    has_dep = "drizzle-orm" in deps or "drizzle-kit" in deps
+    config_files = [p.name for p in app.glob("drizzle.config.*") if p.is_file()]
+    schema_files = [str(p.relative_to(app)) for p in app.rglob("schema.ts") if "node_modules" not in p.parts][:5]
+    score = sum([has_dep, bool(config_files), bool(schema_files)])
+    verdict = "pass" if score >= 2 else "partial" if score == 1 else "fail"
+    return {
+        "verdict": verdict,
+        "evidence": {"has_dep": has_dep, "config_files": config_files, "schema_files": schema_files},
+        "note": f"dep={has_dep}, config={len(config_files)}, schema={len(schema_files)}",
+    }
+
+
+def probe_storage_s3_r2(app: Path) -> dict[str, Any]:
+    pkg = _read_json(app / "package.json") or {}
+    deps = {**(pkg.get("dependencies") or {}), **(pkg.get("devDependencies") or {})}
+    has_dep = "@aws-sdk/client-s3" in deps
+    refs = _count_matches(app, "*.ts", r"@aws-sdk/client-s3|S3Client|PutObjectCommand") + \
+           _count_matches(app, "*.tsx", r"@aws-sdk/client-s3|S3Client|PutObjectCommand")
+    verdict = "pass" if has_dep and refs >= 1 else "partial" if has_dep or refs else "fail"
+    return {
+        "verdict": verdict,
+        "evidence": {"has_dep": has_dep, "refs": refs},
+        "note": f"dep={has_dep}, refs={refs}",
+    }
+
+
+def probe_browser_game_product_quality(app: Path) -> dict[str, Any]:
+    tsx_refs = _count_matches(app, "*.tsx", r"\b(board|grid|canvas|game-area|play-surface|cell|tile|piece)\b")
+    engine_refs = (
+        _count_matches(app, "*.ts", r"\b(turn|player|legal|valid|move|capture|win|winner|victory|score|restart|reset)\b")
+        + _count_matches(app, "*.tsx", r"\b(turn|player|legal|valid|move|capture|win|winner|victory|score|restart|reset)\b")
+    )
+    feedback_refs = _count_matches(app, "*.tsx", r"\b(selected|hover|focus|legal|invalid|thinking|history|last move|status|toast)\b")
+    replay_refs = _count_matches(app, "*.tsx", r"\b(restart|reset|new game|play again)\b")
+    responsive_refs = (
+        _count_matches(app, "*.css", r"@media|max-width|minmax|clamp|aspect-ratio")
+        + _count_matches(app, "*.tsx", r"\b(sm:|md:|lg:|grid-cols-|aspect-|min-h-|max-w-)\b")
+    )
+    has_tests = bool(list(app.rglob("*.test.ts")) or list(app.rglob("*.spec.ts")) or list(app.rglob("*.test.tsx")) or list(app.rglob("*.spec.tsx")))
+    score = sum([
+        tsx_refs >= 6,
+        engine_refs >= 8,
+        feedback_refs >= 4,
+        replay_refs >= 1,
+        responsive_refs >= 3,
+        has_tests,
+    ])
+    verdict = "pass" if score >= 5 else "partial" if score >= 3 else "fail"
+    return {
+        "verdict": verdict,
+        "evidence": {
+            "play_surface_refs": tsx_refs,
+            "engine_rule_refs": engine_refs,
+            "feedback_refs": feedback_refs,
+            "replay_refs": replay_refs,
+            "responsive_refs": responsive_refs,
+            "has_tests": has_tests,
+        },
+        "note": f"game product score={score}/6, surface={tsx_refs}, rules={engine_refs}, feedback={feedback_refs}",
+    }
+
+
+def probe_playwright_canvas_snapshot(app: Path) -> dict[str, Any]:
+    pkg = _read_json(app / "package.json") or {}
+    deps = {**(pkg.get("dependencies") or {}), **(pkg.get("devDependencies") or {})}
+    has_playwright = "@playwright/test" in deps or "playwright" in deps
+    canvas_refs = _count_matches(app, "*.tsx", r"<canvas\b|getContext\(|toDataURL|WebGL|three|@react-three/fiber")
+    screenshot_refs = (
+        _count_matches(app, "*.ts", r"screenshot\(|toHaveScreenshot|pixel|canvas")
+        + _count_matches(app, "*.tsx", r"screenshot\(|toHaveScreenshot|pixel|canvas")
+    )
+    config_files = [str(p.relative_to(app)) for p in app.glob("playwright.config.*") if p.is_file()]
+    score = sum([has_playwright, canvas_refs >= 1, screenshot_refs >= 1, bool(config_files)])
+    verdict = "pass" if score >= 3 else "partial" if score >= 2 else "fail"
+    return {
+        "verdict": verdict,
+        "evidence": {
+            "has_playwright_dep": has_playwright,
+            "canvas_refs": canvas_refs,
+            "screenshot_refs": screenshot_refs,
+            "config_files": config_files,
+        },
+        "note": f"canvas={canvas_refs}, screenshot_refs={screenshot_refs}, playwright={has_playwright}",
+    }
+
+
+def probe_zustand_game_state(app: Path) -> dict[str, Any]:
+    pkg = _read_json(app / "package.json") or {}
+    deps = {**(pkg.get("dependencies") or {}), **(pkg.get("devDependencies") or {})}
+    has_dep = "zustand" in deps
+    refs = _count_matches(app, "*.ts", r"create\(|zustand|use[A-Z][A-Za-z0-9]*Store") + _count_matches(app, "*.tsx", r"create\(|zustand|use[A-Z][A-Za-z0-9]*Store")
+    game_terms = _count_matches(app, "*.ts", r"\b(turn|score|state|actions|move|reset|restart|winner)\b") + _count_matches(app, "*.tsx", r"\b(turn|score|state|actions|move|reset|restart|winner)\b")
+    verdict = "pass" if has_dep and refs >= 2 and game_terms >= 4 else "partial" if has_dep or refs >= 1 else "fail"
+    return {
+        "verdict": verdict,
+        "evidence": {"has_dep": has_dep, "refs": refs, "game_terms": game_terms},
+        "note": f"dep={has_dep}, store_refs={refs}, game_terms={game_terms}",
+    }
+
+
+SHAPE_PROBES = {
+    "shadcn-add": probe_shadcn_add,
+    "auth-better-auth": probe_auth_better_auth,
+    "drizzle-introspect-skill": probe_drizzle_introspect,
+    "storage-s3-r2": probe_storage_s3_r2,
+    "browser-game-product-quality": probe_browser_game_product_quality,
+    "playwright-canvas-snapshot": probe_playwright_canvas_snapshot,
+    "zustand-game-state": probe_zustand_game_state,
+}
+
+STRICT_SHAPE_SKILLS = {
+    "shadcn-add",
+    "browser-game-product-quality",
+    "playwright-canvas-snapshot",
+    "zustand-game-state",
+}
+
+
+def score_skill(rds_root: Path, app_dest: Path, build_dir: Path, skill: dict[str, Any]) -> dict[str, Any]:
+    slug = skill.get("slug", "")
+    install = skill.get("install") or {}
+    install_mode = install.get("mode")
+    install_command = install.get("command")
+    verify = skill.get("verify") or {}
+    verify_command = verify.get("command")
+
+    # Metadata-only skills have nothing to verify on disk; mark them as
+    # not-installable so they don't artificially inflate scorecards.
+    if install_mode == "metadata" and not install_command:
+        return {
+            "slug": slug,
+            "verdict": "not-installable",
+            "installMode": install_mode,
+            "verify": None,
+            "shape": None,
+            "note": "metadata-only skill — no on-disk artifacts to verify",
+        }
+
+    verify_rc, verify_out = _run_verify(rds_root, app_dest, build_dir, verify_command or "")
+    shape: dict[str, Any] | None = None
+    probe = SHAPE_PROBES.get(slug)
+    if probe is not None:
+        try:
+            shape = probe(app_dest)
+        except Exception as exc:
+            shape = {"verdict": "unknown", "evidence": {}, "note": f"probe error: {exc}"}
+
+    verify_ok = (verify_rc == 0) if verify_command else None
+    if shape is None:
+        if verify_ok is None:
+            verdict = "unknown"
+        else:
+            verdict = "pass" if verify_ok else "fail"
+    else:
+        if slug in STRICT_SHAPE_SKILLS and shape["verdict"] == "fail":
+            verdict = "fail"
+        elif verify_ok is False:
+            verdict = "fail"
+        elif shape["verdict"] == "pass" and (verify_ok is True or verify_ok is None):
+            verdict = "pass"
+        elif shape["verdict"] == "fail" and (verify_ok is True):
+            verdict = "partial"
+        else:
+            verdict = shape["verdict"]
+
+    return {
+        "slug": slug,
+        "verdict": verdict,
+        "installMode": install_mode or ("imperative" if install_command else None),
+        "verify": {"command": verify_command, "exitCode": verify_rc, "output": verify_out} if verify_command else None,
+        "shape": shape,
+        "note": shape["note"] if shape else (verify_out[:160] if verify_out else "no probe"),
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--build-dir", required=True, help="Path to the RDS build directory")
+    parser.add_argument("--app-dest", default=None, help="Path to materialized app (default: state.app_dest)")
+    parser.add_argument("--rds-root", default=str(Path(__file__).resolve().parents[1]))
+    parser.add_argument("--out", default=None, help="Output path (default: <build-dir>/skills/scorecard.json)")
+    args = parser.parse_args()
+
+    build_dir = Path(args.build_dir).resolve()
+    rds_root = Path(args.rds_root).resolve()
+    resolved_path = build_dir / "skills" / "resolved.json"
+    resolved = _read_json(resolved_path) or {}
+    skills_in: list[dict[str, Any]] = resolved.get("resolved") if isinstance(resolved.get("resolved"), list) else []
+
+    app_dest = args.app_dest
+    if not app_dest:
+        state = _read_json(build_dir / "state.json") or {}
+        app_dest = state.get("app_dest")
+    if not app_dest:
+        print(f"FATAL: app_dest unknown (pass --app-dest or set state.app_dest)", file=sys.stderr)
+        return 2
+    app_path = Path(app_dest).resolve()
+    if not app_path.exists() or not app_path.is_dir():
+        print(f"FATAL: app_dest does not exist: {app_path}", file=sys.stderr)
+        return 2
+
+    scorecards = [score_skill(rds_root, app_path, build_dir, skill) for skill in skills_in]
+    by_verdict: dict[str, int] = {}
+    for sc in scorecards:
+        by_verdict[sc["verdict"]] = by_verdict.get(sc["verdict"], 0) + 1
+    payload = {
+        "schema": "rds.skill.scorecard.v1",
+        "buildId": build_dir.name,
+        "appDest": str(app_path),
+        "totals": by_verdict,
+        "skills": scorecards,
+    }
+    out_path = Path(args.out) if args.out else (build_dir / "skills" / "scorecard.json")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    json.dump(payload, sys.stdout, indent=2)
+    print()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

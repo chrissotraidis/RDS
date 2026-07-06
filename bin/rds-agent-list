@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+RDS_ROOT="$ROOT"
+source "$ROOT/bin/lib/common.sh"
+source "$ROOT/bin/lib/agents.sh"
+
+BUILD_ID="$(parse_flag --build-id "$@" || echo "")"
+if [[ -n "$BUILD_ID" && ! -d "$RDS_BUILDS_DIR/$BUILD_ID/agent-sessions" ]]; then
+  printf '[]\n'
+  exit 0
+fi
+
+roots=()
+if [[ -n "$BUILD_ID" ]]; then
+  roots+=("$RDS_BUILDS_DIR/$BUILD_ID/agent-sessions")
+else
+  [[ -d "$ROOT/agent-sessions" ]] && roots+=("$ROOT/agent-sessions")
+  [[ -d "$RDS_BUILDS_DIR" ]] && roots+=("$RDS_BUILDS_DIR")
+fi
+
+if (( ${#roots[@]} == 0 )); then
+  printf '[]\n'
+  exit 0
+fi
+
+{
+  find "${roots[@]}" -path '*/agent-sessions/*.json' -type f 2>/dev/null || true
+} | sort | while read -r file; do
+  id="$(agent_json_get "$file" '.id')"
+  "$ROOT/bin/rds-agent-status" "$id" 2>/dev/null | jq -c '{id, build_id, provider, mode, task, status, branch, worktree_path, tmux_session, updated_at, changed_files}'
+done | jq -s '.'

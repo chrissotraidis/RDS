@@ -1,0 +1,25 @@
+{
+  "name": "wiki",
+  "version": "0.3.0",
+  "description": "Analyze codebases into product wikis and as-built specifications. Includes specialist agents for gap analysis, UX review, research, and product-owner question management with spec sync.",
+  "author": {
+    "name": "RDS Contributors",
+    "email": "noreply@example.com"
+  },
+  "homepage": "https://github.com/chrissotraidis/RDS",
+  "repository": "https://github.com/chrissotraidis/RDS",
+  "license": "MIT",
+  "keywords": [
+    "product-wiki",
+    "spec-synthesis",
+    "codebase-analysis",
+    "as-built-spec",
+    "ux-review",
+    "research",
+    "knowledge-index",
+    "gap-analysis",
+    "product-owner",
+    "spec-sync"
+  ],
+  "skills": "./skills/"
+}

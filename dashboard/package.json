@@ -1,0 +1,18 @@
+{
+  "name": "rds-dashboard",
+  "version": "0.1.0",
+  "description": "Persistent build dashboard for RDS.",
+  "type": "module",
+  "scripts": {
+    "start": "bun run src/server.ts",
+    "dev": "bun run --hot src/server.ts",
+    "selftest": "bun run tests/selftest.ts"
+  },
+  "dependencies": {
+    "hono": "^4.6.0"
+  },
+  "devDependencies": {
+    "bun-types": "^1.3.13",
+    "playwright": "^1.48.0"
+  }
+}

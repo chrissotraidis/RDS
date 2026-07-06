@@ -1,0 +1,23 @@
+---
+slug: auth-better-auth
+name: Better Auth
+status: ready
+default: false
+applies_to:
+- nextjs-fullstack
+- astro-thin-web
+- mobile-native
+- browser-extension
+description: Adds the TypeScript authentication implementation contract for Better Auth.
+install:
+  command: bin/rds-skill-materialize auth-better-auth
+verify:
+  command: bin/rds-skill-verify auth-better-auth
+maturity: operational
+category: auth
+rationale: TypeScript app builds often need account/session behavior. This skill gives RDS a concrete auth choice and verification expectations instead of improvising login flows.
+source_links:
+- label: Better Auth
+  url: https://www.better-auth.com/
+- label: Better Auth Installation
+  url: https://www.better-auth.com/docs/installation

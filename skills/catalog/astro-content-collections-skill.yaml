@@ -1,0 +1,17 @@
+---
+slug: astro-content-collections-skill
+name: Astro content collections
+status: curated
+category: content
+maturity: stable
+applies_to:
+- astro-thin-web
+description: Content collection schema and routing conventions for Astro.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: docs.astro.build
+  url: https://docs.astro.build/en/guides/content-collections/
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

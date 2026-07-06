@@ -1,0 +1,20 @@
+---
+slug: solid-queue
+name: Solid Queue jobs
+status: ready
+default: false
+applies_to:
+- rails-web
+description: Adds the Rails background jobs and queue verification contract.
+install:
+  command: bin/rds-skill-materialize solid-queue
+verify:
+  command: bin/rds-skill-verify solid-queue
+maturity: operational
+category: jobs
+rationale: Rails async work should use the framework-aligned queue path. This skill makes queue schema, worker process, and retry behavior explicit.
+source_links:
+- label: Rails Active Job
+  url: https://guides.rubyonrails.org/active_job_basics.html
+- label: Solid Queue
+  url: https://github.com/rails/solid_queue

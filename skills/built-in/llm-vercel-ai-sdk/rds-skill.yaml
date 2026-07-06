@@ -1,0 +1,22 @@
+---
+slug: llm-vercel-ai-sdk
+name: Vercel AI SDK
+status: ready
+default: false
+applies_to:
+- nextjs-fullstack
+- astro-thin-web
+- browser-extension
+description: Adds the TypeScript LLM streaming and tool-call implementation contract.
+install:
+  command: bin/rds-skill-materialize llm-vercel-ai-sdk
+verify:
+  command: bin/rds-skill-verify llm-vercel-ai-sdk
+maturity: operational
+category: llm
+rationale: TypeScript AI product builds need a known streaming/tool-call path and model/provider abstraction. This skill makes those choices inspectable.
+source_links:
+- label: Vercel AI SDK
+  url: https://ai-sdk.dev/docs
+- label: Vercel AI SDK GitHub
+  url: https://github.com/vercel/ai

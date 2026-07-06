@@ -1,0 +1,18 @@
+---
+slug: rds-mockup-fidelity
+name: RDS mockup fidelity
+status: ready
+default: true
+applies_to:
+- universal
+description: Runs the stack-specific mockup analog verifier and writes a diff report under builds/<id>/mockup-diff.
+install:
+  mode: metadata
+verify:
+  command: skills/built-in/rds-mockup-fidelity/scripts/verify.sh
+maturity: operational
+category: verification
+rationale: Default RDS skill because visual output must be compared against the intended mockup or analog before claiming the preview is done.
+source_links:
+- label: playwright.dev
+  url: https://playwright.dev/

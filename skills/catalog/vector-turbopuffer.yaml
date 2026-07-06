@@ -1,0 +1,18 @@
+---
+slug: vector-turbopuffer
+name: Turbopuffer vectors
+status: curated
+category: vector-db
+maturity: beta
+applies_to:
+- nextjs-fullstack
+- python-ai-service
+description: Managed vector search alternative.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: turbopuffer.com
+  url: https://turbopuffer.com/docs
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

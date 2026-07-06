@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>No Progression Game Fixture</title>
+  <style>
+    body { margin: 0; font-family: Inter, system-ui, sans-serif; background: #101113; color: #f4f4f4; display: grid; place-items: center; min-height: 100vh; }
+    main { width: min(760px, calc(100vw - 32px)); }
+    canvas { width: 100%; height: auto; background: #1e2228; border: 1px solid #3d4652; }
+    button { margin-top: 12px; min-height: 44px; padding: 0 16px; border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Static Arena</h1>
+    <p>Use arrow keys to move. Score: 0. Press start to play.</p>
+    <canvas id="game" width="640" height="360"></canvas>
+    <button id="start">Start game</button>
+  </main>
+  <script>
+    const canvas = document.getElementById("game");
+    const ctx = canvas.getContext("2d");
+    function draw() {
+      ctx.fillStyle = "#1e2228";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = "#78d0ff";
+      ctx.fillRect(296, 156, 48, 48);
+      ctx.fillStyle = "#f4d35e";
+      ctx.fillText("Score: 0", 24, 32);
+    }
+    draw();
+  </script>
+</body>
+</html>

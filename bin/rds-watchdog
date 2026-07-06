@@ -1,0 +1,836 @@
+#!/usr/bin/env bash
+# bin/rds-watchdog — opt-in auto-fixer for stuck *and* failed builds.
+#
+# Two recovery paths:
+#
+#   1. Stuck (live build, no activity)
+#      Polls every running build (has a live $BUILD_DIR/run.pid) and, when
+#      events.jsonl + shm log + per-stage logs have been silent for longer
+#      than --stuck-after, spawns `bin/rds-fix <id>` once per episode.
+#      Tracks "already fixed this episode" by checking events.jsonl for a
+#      fixer_started event newer than the most recent stage transition.
+#
+#   2. Failed (build process exited non-zero)
+#      Within --fail-after seconds of the failure timestamp, scans every
+#      build whose state.json status is "failed" and whose latest fixer
+#      attempt is older than the latest build_failed/stage_failed event.
+#      Spawns `bin/rds-fix` to recover. Capped at --max-fix-attempts per
+#      build to avoid infinite loops if the fixer can't make progress.
+#
+# Usage:
+#   bin/rds-watchdog                       # foreground; logs to stdout
+#   bin/rds-watchdog --detach              # background; pid → /dev/shm/rds-watchdog.pid
+#   bin/rds-watchdog --status              # is it running?
+#   bin/rds-watchdog --stop                # kill the detached instance
+#   bin/rds-watchdog --once                # one pass, no loop (cron-friendly)
+#
+# Flags:
+#   --stuck-after=<seconds>     default 600 (10 min). Stuck threshold for
+#                               live builds.
+#   --fail-after=<seconds>      default 30. Wait this long after build_failed
+#                               before auto-fixing (lets a watching operator
+#                               cancel first if they want to inspect).
+#   --max-fix-attempts=<n>      default 3. Cap fixer spawns per build.
+#   --interval=<seconds>        default 60. How often to poll.
+#   --max-budget-usd=<n>          default 2.0 — legacy global, passed to rds-fix.
+#   --diagnose-budget-usd=<n>     default 0.5 — per-phase cap passed to rds-fix.
+#   --apply-budget-usd=<n>        default 2.0 — per-phase cap passed to rds-fix.
+#
+# The watchdog is OFF by default. Start it with `bin/rds-watchdog --detach`
+# from the dashboard or shell when you want hands-off recovery.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck disable=SC1091
+source "$ROOT/bin/lib/common.sh"
+PIDFILE="/dev/shm/rds-watchdog.pid"
+LOGFILE="/dev/shm/rds-watchdog.log"
+
+STUCK_AFTER=600
+FAIL_AFTER=30
+MAX_FIX_ATTEMPTS=3
+INTERVAL=60
+BUDGET="${RDS_FIX_BUDGET_USD:-2.0}"
+DIAGNOSE_BUDGET="${RDS_FIX_DIAGNOSE_BUDGET_USD:-0.5}"
+APPLY_BUDGET="${RDS_FIX_APPLY_BUDGET_USD:-2.0}"
+HEARTBEAT_AFTER="${RDS_WATCHDOG_HEARTBEAT_SEC:-300}"
+INCOMPLETE_ITERATE_MAX_AGE="${RDS_WATCHDOG_INCOMPLETE_ITERATE_MAX_AGE_SEC:-604800}"
+ONCE=0
+DETACH=0
+ACTION="run"
+DEBUG_ATTEMPT_BUILD=""
+
+for arg in "$@"; do
+  case "$arg" in
+    --stuck-after=*)         STUCK_AFTER="${arg#*=}" ;;
+    --fail-after=*)          FAIL_AFTER="${arg#*=}" ;;
+    --max-fix-attempts=*)    MAX_FIX_ATTEMPTS="${arg#*=}" ;;
+    --interval=*)            INTERVAL="${arg#*=}" ;;
+    --max-budget-usd=*)      BUDGET="${arg#*=}" ;;
+    --diagnose-budget-usd=*) DIAGNOSE_BUDGET="${arg#*=}" ;;
+    --apply-budget-usd=*)    APPLY_BUDGET="${arg#*=}" ;;
+    --once)                  ONCE=1 ;;
+    --detach)                DETACH=1 ;;
+    --status)                ACTION="status" ;;
+    --stop)                  ACTION="stop" ;;
+    --debug-attempt-count=*)  ACTION="debug-attempt-count"; DEBUG_ATTEMPT_BUILD="${arg#*=}" ;;
+    -h|--help)               sed -n '2,42p' "$0"; exit 0 ;;
+    *)                       echo "unknown arg: $arg" >&2; exit 1 ;;
+  esac
+done
+
+watchdog_pids() {
+  local pid cmd ppid
+  while read -r pid; do
+    [[ -n "$pid" && "$pid" != "$$" ]] || continue
+    [[ -r "/proc/$pid/cmdline" ]] || continue
+    ppid="$(awk '/^PPid:/ { print $2 }' "/proc/$pid/status" 2>/dev/null || true)"
+    [[ "$ppid" == "1" ]] || continue
+    cmd="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)"
+    [[ -n "$cmd" ]] || continue
+    [[ "$cmd" == *"--once"* || "$cmd" == *"--status"* || "$cmd" == *"--stop"* || "$cmd" == *"--debug-attempt-count"* ]] && continue
+    [[ "$cmd" == bash\ * ]] || continue
+    if [[ "$cmd" == *"$ROOT/bin/rds-watchdog --stuck-after="* || "$cmd" == *"./bin/rds-watchdog --stuck-after="* ]]; then
+      echo "$pid"
+    fi
+  done < <(pgrep -f 'rds-watchdog' 2>/dev/null || true)
+}
+
+cmd_status() {
+  if [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+    mapfile -t pids < <(watchdog_pids)
+    if (( ${#pids[@]} > 1 )); then
+      echo "rds-watchdog: RUNNING (pid $(cat "$PIDFILE")), duplicates=${pids[*]}, log $LOGFILE"
+    else
+      echo "rds-watchdog: RUNNING (pid $(cat "$PIDFILE")), log $LOGFILE"
+    fi
+    return 0
+  fi
+  mapfile -t pids < <(watchdog_pids)
+  if (( ${#pids[@]} > 0 )); then
+    printf '%s\n' "${pids[0]}" > "$PIDFILE"
+    echo "rds-watchdog: RUNNING (adopted pid ${pids[0]}), log $LOGFILE"
+    return 0
+  fi
+  echo "rds-watchdog: not running"
+  return 1
+}
+
+cmd_stop() {
+  mapfile -t pids < <(watchdog_pids)
+  if [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+    pid="$(cat "$PIDFILE")"
+    if [[ ! " ${pids[*]} " =~ " $pid " ]]; then
+      pids=("$pid" "${pids[@]}")
+    fi
+  fi
+
+  if (( ${#pids[@]} > 0 )); then
+    for pid in "${pids[@]}"; do
+      kill -TERM "$pid" 2>/dev/null || true
+    done
+    for pid in "${pids[@]}"; do
+      for _ in 1 2 3 4 5; do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.4
+      done
+    done
+    for pid in "${pids[@]}"; do
+      kill -KILL "$pid" 2>/dev/null || true
+    done
+    rm -f "$PIDFILE"
+    echo "rds-watchdog: stopped (${pids[*]})"
+  else
+    rm -f "$PIDFILE"
+    echo "rds-watchdog: not running"
+  fi
+}
+
+case "$ACTION" in
+  status) cmd_status; exit $? ;;
+  stop)   cmd_stop;   exit 0  ;;
+esac
+
+# Newest Scaffold task heartbeat for this build.
+# A resumed Scaffold run may update tasks.json / .scaffold telemetry while the
+# terminal stream is quiet, so these files are live activity for stuck checks.
+build_scaffold_activity() {
+  local dir="$1"
+  local state="$dir/state.json"
+  [[ -f "$state" ]] || { echo 0; return; }
+  local app_dest
+  app_dest="$(jq -r '.app_dest // empty' "$state" 2>/dev/null || true)"
+  [[ -n "$app_dest" && -d "$app_dest" ]] || { echo 0; return; }
+
+  local newest=0 m p
+  for p in "$app_dest/tasks.json" "$app_dest/.scaffold/events.jsonl" "$app_dest/.scaffold/state.json" "$app_dest"/.scaffold/telemetry/*.json; do
+    [[ -e "$p" ]] || continue
+    m="$(stat -c %Y "$p" 2>/dev/null || echo 0)"
+    (( m > newest )) && newest="$m"
+  done
+  echo "$newest"
+}
+
+# Newest mtime among events, logs, and task-level Scaffold telemetry.
+# Prints epoch seconds; 0 if nothing exists.
+build_last_activity() {
+  local dir="$1" id="$2"
+  local newest=0 m
+  for p in "$dir/events.jsonl" "/dev/shm/${id}-launch-build.log" "$dir"/logs/*.log; do
+    [[ -e "$p" ]] || continue
+    m="$(stat -c %Y "$p" 2>/dev/null || echo 0)"
+    (( m > newest )) && newest="$m"
+  done
+  m="$(build_scaffold_activity "$dir")"
+  (( m > newest )) && newest="$m"
+  echo "$newest"
+}
+
+# True (0) if a fixer_started event exists in events.jsonl newer than the
+# most recent stage_started/stage_completed/build_started — i.e. we've
+# already attempted to fix this episode.
+already_fixed_this_episode() {
+  local dir="$1"
+  [[ -f "$dir/events.jsonl" ]] || return 1
+  local fixer_ts stage_ts
+  fixer_ts="$(grep -F '"event":"fixer_started"' "$dir/events.jsonl" 2>/dev/null \
+              | tail -n1 | sed -n 's/.*"ts":"\([^"]*\)".*/\1/p')"
+  stage_ts="$(grep -E '"event":"(stage_started|stage_completed|build_started)"' "$dir/events.jsonl" 2>/dev/null \
+              | tail -n1 | sed -n 's/.*"ts":"\([^"]*\)".*/\1/p')"
+  [[ -z "$fixer_ts" ]] && return 1
+  [[ -z "$stage_ts" ]] && return 0
+  # string compare works for ISO-8601 UTC timestamps.
+  [[ "$fixer_ts" > "$stage_ts" ]]
+}
+
+# Count how many actual retry attempts have ever been emitted for this build.
+# Provider diagnosis failures should not consume this cap; otherwise a transient
+# quota/auth issue can permanently block later deterministic recoveries.
+fixer_attempt_count() {
+  local dir="$1"
+  [[ -f "$dir/events.jsonl" ]] || { echo 0; return; }
+  local count
+  count="$(grep -cF '"event":"fixer_retry_started"' "$dir/events.jsonl" 2>/dev/null || true)"
+  printf '%s\n' "${count:-0}"
+}
+
+# Count fixer_retry_started/build_resumed events for the current failed episode.
+# Do not reset the count on each repeated stage_started/stage_failed pair;
+# otherwise an immediate retry failure is always reported as attempt 1/3
+# and the watchdog can loop forever.
+fixer_attempt_count_for_failure() {
+  local dir="$1"
+  [[ -f "$dir/events.jsonl" ]] || { echo 0; return; }
+  python3 - "$dir/events.jsonl" <<'PY' 2>/dev/null || echo 0
+import json
+import sys
+from pathlib import Path
+
+events_path = Path(sys.argv[1])
+latest_stage = ""
+first_fail_ts = ""
+retries_since = 0
+
+for line in events_path.read_text(encoding="utf-8", errors="replace").splitlines():
+    try:
+        event = json.loads(line)
+    except Exception:
+        continue
+    name = event.get("event") or ""
+    ts = event.get("ts") or ""
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    stage = payload.get("stage") or ""
+
+    if name in {"build_completed", "build_pending_review", "build_started"}:
+        latest_stage = ""
+        first_fail_ts = ""
+        retries_since = 0
+        continue
+
+    if name in {"build_failed", "stage_failed"}:
+        if stage and stage != latest_stage:
+            latest_stage = stage
+            first_fail_ts = ts
+            retries_since = 0
+        elif not first_fail_ts:
+            first_fail_ts = ts
+        continue
+
+    if name in {"fixer_retry_started", "build_resumed"}:
+        if first_fail_ts and ts >= first_fail_ts:
+            retries_since += 1
+
+print(retries_since)
+PY
+}
+
+if [[ "$ACTION" == "debug-attempt-count" ]]; then
+  [[ -n "$DEBUG_ATTEMPT_BUILD" ]] || { echo "missing build id" >&2; exit 2; }
+  fixer_attempt_count_for_failure "$RDS_BUILDS_DIR/$DEBUG_ATTEMPT_BUILD"
+  exit 0
+fi
+
+terminal_failure_reason() {
+  local dir="$1"
+
+  # Operator review is terminal only when it is the newest relevant pipeline
+  # event. state.review.status can be pending during normal post-deploy QA, so
+  # using it alone makes active/recoverable builds look terminal.
+  if [[ -f "$dir/events.jsonl" ]]; then
+    local latest_relevant latest_terminal
+    latest_relevant="$(grep -E '"event":"(iterate_started|iterate_failed|iterate_qa_completed|qa_iteration_completed|iterate_needs_review|build_pending_review|build_completed|stage_failed|build_failed)"' "$dir/events.jsonl" 2>/dev/null | tail -n1 || true)"
+    latest_terminal="$(printf '%s\n' "$latest_relevant" | grep -oE '"event":"(iterate_needs_review|build_pending_review)"' || true)"
+    if [[ -n "$latest_terminal" ]]; then
+      printf 'operator_review'
+      return 0
+    fi
+  fi
+
+  # Skill-impact blockers are terminal until the operator changes scope or
+  # installs/configures missing capabilities. Product-quality blockers are
+  # recoverable through rds-fix -> rds-iterate and should not be quarantined here.
+  if [[ -f "$dir/truth.json" ]]; then
+    local truth_reason
+    truth_reason="$(jq -r 'if .verdict == "blocked" and .blockerClass == "skill_impact" then .blockerClass else empty end' "$dir/truth.json" 2>/dev/null || true)"
+    if [[ -n "$truth_reason" ]]; then
+      printf '%s' "$truth_reason"
+      return 0
+    fi
+  fi
+
+  local latest_log=""
+  if [[ -d "$dir/logs" ]]; then
+    latest_log="$(ls -t "$dir"/logs/*.log 2>/dev/null | head -n1 || true)"
+  fi
+  [[ -n "$latest_log" && -f "$latest_log" ]] || return 1
+
+  if grep -qiE 'HTTP 401|Status 401|Token has expired|ZO_CLIENT_IDENTITY_TOKEN environment variable is required' "$latest_log"; then
+    printf 'zo_auth'
+    return 0
+  fi
+  return 1
+}
+
+latest_failure_ts() {
+  local dir="$1"
+  grep -E '"event":"(build_failed|stage_failed)"' "$dir/events.jsonl" 2>/dev/null \
+    | tail -n1 | sed -n 's/.*"ts":"\([^"]*\)".*/\1/p'
+}
+
+latest_iterate_started_epoch() {
+  local dir="$1" ts
+  ts="$(grep -F '"event":"iterate_started"' "$dir/events.jsonl" 2>/dev/null | tail -n1 | sed -n 's/.*"ts":"\([^"]*\)".*/\1/p')"
+  [[ -n "$ts" ]] || { echo 0; return; }
+  iso_to_epoch "$ts"
+}
+
+failure_quarantined() {
+  local dir="$1" fail_ts="$2" reason="$3"
+  local marker="$dir/.watchdog-quarantine-$reason"
+  [[ -f "$marker" ]] || return 1
+  grep -qxF "$fail_ts" "$marker" 2>/dev/null
+}
+
+quarantine_failure() {
+  local id="$1" dir="$2" fail_ts="$3" reason="$4"
+  local marker="$dir/.watchdog-quarantine-$reason"
+  printf '%s\n' "$fail_ts" > "$marker"
+  "$ROOT/bin/rds-event" watchdog_quarantined \
+    --build-id "$id" --build-dir "$dir" \
+    reason="$reason" failure_ts="$fail_ts" \
+    >/dev/null 2>&1 || true
+}
+
+watchdog_resume_attempt_count() {
+  local dir="$1"
+  [[ -f "$dir/events.jsonl" ]] || { echo 0; return; }
+  local count
+  count="$(grep -cF '"event":"watchdog_resume_started"' "$dir/events.jsonl" 2>/dev/null || true)"
+  printf '%s\n' "${count:-0}"
+}
+
+watchdog_recent_resume_lock() {
+  local dir="$1" now="$2"
+  local marker="$dir/.watchdog-resume.lock"
+  [[ -f "$marker" ]] || return 1
+  local m
+  m="$(stat -c %Y "$marker" 2>/dev/null || echo 0)"
+  [[ "$m" =~ ^[0-9]+$ ]] || return 1
+  (( now - m < STUCK_AFTER ))
+}
+
+iso_to_epoch() {
+  local ts="$1" epoch
+  epoch="$(date -d "$ts" +%s 2>/dev/null | tail -n1 || true)"
+  [[ "$epoch" =~ ^[0-9]+$ ]] || epoch=0
+  printf '%s\n' "$epoch"
+}
+
+goal_process_alive() {
+  local id="$1" pid cmd
+  while read -r pid; do
+    [[ -n "$pid" && "$pid" != "$$" ]] || continue
+    [[ -r "/proc/$pid/cmdline" ]] || continue
+    cmd="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)"
+    [[ -n "$cmd" ]] || continue
+    [[ "$cmd" == *"rds-goal $id"* || "$cmd" == *"rds-iterate $id"* || "$cmd" == *"rds-fix $id"* ]] && return 0
+  done < <(pgrep -f "rds-(goal|iterate|fix).*${id}" 2>/dev/null || true)
+  return 1
+}
+
+watchdog_goal_resume_attempt_count() {
+  local dir="$1"
+  [[ -f "$dir/events.jsonl" ]] || { echo 0; return; }
+  local count
+  count="$(grep -cF '"event":"watchdog_goal_resume_started"' "$dir/events.jsonl" 2>/dev/null || true)"
+  printf '%s\n' "${count:-0}"
+}
+
+watchdog_recent_goal_lock() {
+  local dir="$1" now="$2"
+  local marker="$dir/.watchdog-goal-resume.lock"
+  local lockdir="$dir/.watchdog-goal-resume.lock.d"
+  [[ -f "$marker" || -d "$lockdir" ]] || return 1
+  local m
+  m="$(stat -c %Y "$lockdir" 2>/dev/null || stat -c %Y "$marker" 2>/dev/null || echo 0)"
+  [[ "$m" =~ ^[0-9]+$ ]] || return 1
+  (( now - m < STUCK_AFTER ))
+}
+
+watchdog_incomplete_iterate_attempt_count() {
+  local dir="$1"
+  [[ -f "$dir/events.jsonl" ]] || { echo 0; return; }
+  local count
+  count="$(grep -cF '"event":"watchdog_incomplete_iterate_started"' "$dir/events.jsonl" 2>/dev/null || true)"
+  printf '%s\n' "${count:-0}"
+}
+
+watchdog_recent_incomplete_iterate_lock() {
+  local dir="$1" now="$2"
+  local marker="$dir/.watchdog-incomplete-iterate.lock"
+  local lockdir="$dir/.watchdog-incomplete-iterate.lock.d"
+  [[ -f "$marker" || -d "$lockdir" ]] || return 1
+  local m
+  m="$(stat -c %Y "$lockdir" 2>/dev/null || stat -c %Y "$marker" 2>/dev/null || echo 0)"
+  [[ "$m" =~ ^[0-9]+$ ]] || return 1
+  (( now - m < STUCK_AFTER ))
+}
+
+needs_stale_goal_resume() {
+  local dir="$1" id="$2" now="$3"
+  local goal="$dir/goal.json"
+  [[ -f "$goal" ]] || return 1
+  watchdog_recent_goal_lock "$dir" "$now" && return 1
+
+  local status updated_at updated_epoch delta attempts
+  status="$(jq -r '.status // empty' "$goal" 2>/dev/null || true)"
+  [[ "$status" == "running" ]] || return 1
+
+  if goal_process_alive "$id"; then
+    return 1
+  fi
+
+  updated_at="$(jq -r '.updatedAt // empty' "$goal" 2>/dev/null || true)"
+  updated_epoch="$(iso_to_epoch "$updated_at")"
+  if (( updated_epoch <= 0 )); then
+    updated_epoch="$(stat -c %Y "$goal" 2>/dev/null || echo 0)"
+  fi
+  [[ "$updated_epoch" =~ ^[0-9]+$ ]] || return 1
+  delta=$(( now - updated_epoch ))
+  (( delta >= STUCK_AFTER )) || return 1
+
+  attempts="$(watchdog_goal_resume_attempt_count "$dir")"
+  (( attempts < MAX_FIX_ATTEMPTS )) || return 1
+  printf '%s:%s\n' "$delta" "$attempts"
+}
+
+mark_goal_interrupted_for_watchdog() {
+  local dir="$1" reason="$2"
+  python3 - "$dir/goal.json" "$reason" <<'PY' 2>/dev/null || true
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+path = Path(sys.argv[1])
+reason = sys.argv[2]
+try:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(0)
+now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+payload.update({
+    "status": "interrupted",
+    "phase": "interrupted",
+    "currentAction": None,
+    "nextAction": f"Watchdog found a stale goal with no live rds-goal/rds-iterate process: {reason}. Re-running rds-goal from current evidence.",
+    "updatedAt": now,
+    "endedAt": now,
+    "watchdogInterruptedAt": now,
+})
+for node in payload.get("nodes") or []:
+    if isinstance(node, dict) and node.get("id") == "goal":
+        node["status"] = "interrupted"
+tmp = path.with_suffix(path.suffix + ".tmp")
+tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+tmp.replace(path)
+PY
+}
+
+spawn_goal_resume_for() {
+  local id="$1" dir="$2" reason="$3"
+
+  mkdir "$dir/.watchdog-goal-resume.lock.d" 2>/dev/null || return 0
+  printf '%s\n' "$(date -u +%FT%TZ) $reason" > "$dir/.watchdog-goal-resume.lock"
+  mark_goal_interrupted_for_watchdog "$dir" "$reason"
+
+  "$ROOT/bin/rds-event" goal_interrupted \
+    --build-id "$id" --build-dir "$dir" \
+    reason="watchdog_stale_goal" detail="$reason" \
+    >/dev/null 2>&1 || true
+  "$ROOT/bin/rds-event" watchdog_goal_resume_started \
+    --build-id "$id" --build-dir "$dir" \
+    reason="$reason" \
+    >/dev/null 2>&1 || true
+
+  nohup "$ROOT/bin/rds-goal" "$id" \
+    >> "$LOGFILE" 2>&1 </dev/null &
+}
+
+needs_incomplete_iterate_fix() {
+  local dir="$1" id="$2" now="$3"
+  watchdog_recent_incomplete_iterate_lock "$dir" "$now" && return 1
+  if goal_process_alive "$id"; then
+    return 1
+  fi
+
+  local started_epoch
+  started_epoch="$(latest_iterate_started_epoch "$dir")"
+  (( started_epoch > 0 )) || return 1
+  (( now - started_epoch <= INCOMPLETE_ITERATE_MAX_AGE )) || return 1
+
+  "$ROOT/bin/rds-evidence-ledger" "$id" >/dev/null 2>&1 || true
+
+  local has_blocker
+  has_blocker="$(jq -r '([.topBlockers[]?.code] | index("incomplete_iterate_session")) != null' "$dir/truth.json" 2>/dev/null || echo false)"
+  [[ "$has_blocker" == "true" ]] || return 1
+
+  local attempts
+  attempts="$(watchdog_incomplete_iterate_attempt_count "$dir")"
+  (( attempts < MAX_FIX_ATTEMPTS )) || return 1
+  printf '%s\n' "$attempts"
+}
+
+spawn_incomplete_iterate_fix_for() {
+  local id="$1" dir="$2" reason="$3"
+  mkdir "$dir/.watchdog-incomplete-iterate.lock.d" 2>/dev/null || return 0
+  printf '%s\n' "$(date -u +%FT%TZ) $reason" > "$dir/.watchdog-incomplete-iterate.lock"
+  "$ROOT/bin/rds-event" watchdog_incomplete_iterate_started \
+    --build-id "$id" --build-dir "$dir" \
+    reason="$reason" \
+    >/dev/null 2>&1 || true
+  spawn_fixer_for "$id" "$dir" "$reason"
+}
+
+# True (0) if the build is in `failed` status, the latest failure event
+# happened at least FAIL_AFTER seconds ago, and no fixer has run since
+# the failure (and we're under MAX_FIX_ATTEMPTS).
+needs_failure_fix() {
+  local dir="$1" now="$2"
+  [[ -f "$dir/events.jsonl" ]] || return 1
+
+  local state_failed
+  state_failed="$(jq -r '
+    ((.error // null) != null) or
+    ([.stages[]?.status] | any(. == "failed"))
+  ' "$dir/state.json" 2>/dev/null || echo false)"
+  [[ "$state_failed" == "true" ]] || return 1
+
+  local fail_ts
+  fail_ts="$(grep -E '"event":"(build_failed|stage_failed)"' "$dir/events.jsonl" 2>/dev/null \
+             | tail -n1 | sed -n 's/.*"ts":"\([^"]*\)".*/\1/p')"
+  [[ -n "$fail_ts" ]] || return 1
+
+  local terminal_reason
+  if terminal_reason="$(terminal_failure_reason "$dir")"; then
+    return 1
+  fi
+
+  # A deterministic truth diagnosis that says "targeted iteration required"
+  # is a completed watchdog action, even though it intentionally does not emit
+  # fixer_retry_started. Without this guard the watchdog retries the same
+  # non-retryable QA/product blocker every poll and makes the UI look active.
+  local truth_blocker latest_fixer
+  truth_blocker="$(jq -r 'if .verdict == "blocked" and (.blockerClass == "product_quality" or .blockerClass == "skill_impact") then .blockerClass else empty end' "$dir/truth.json" 2>/dev/null || true)"
+  latest_fixer="$(grep -F '"event":"fixer_completed"' "$dir/events.jsonl" 2>/dev/null | tail -n1 | sed -n 's/.*"ts":"\([^"]*\)".*/\1/p')"
+  if [[ -n "$truth_blocker" && -n "$latest_fixer" && "$latest_fixer" > "$fail_ts" ]]; then
+    return 1
+  fi
+
+  # State can be rewritten by later resumes, so events.jsonl is the source of
+  # truth for "did a failure happen that still needs recovery?" If the latest
+  # lifecycle terminal event after the failure is success/pending review, this
+  # historical failure is already recovered.
+  local terminal_after
+  terminal_after="$(awk -v fail_ts="$fail_ts" '
+    /"ts":/ {
+      ts=$0
+      sub(/^.*"ts":"([^"]*)".*$/, "\\1", ts)
+      if (ts > fail_ts && $0 ~ /"event":"(build_completed|build_pending_review)"/) print ts
+    }
+  ' "$dir/events.jsonl" 2>/dev/null | tail -n1)"
+  [[ -z "$terminal_after" ]] || return 1
+
+  # Wait FAIL_AFTER before acting so a human has a chance to intervene.
+  local fail_epoch
+  fail_epoch="$(iso_to_epoch "$fail_ts")"
+  (( fail_epoch > 0 )) || return 1
+  (( now - fail_epoch >= FAIL_AFTER )) || return 1
+
+  # Cap recovery retries PER FAILURE: count fixer_retry_started events for
+  # the latest failed stage since that failure. A new failure in a different
+  # stage starts at 0, so attempts spent on an earlier stage don't block it.
+  local attempts
+  attempts="$(fixer_attempt_count_for_failure "$dir")"
+  (( attempts < MAX_FIX_ATTEMPTS )) || return 1
+
+  # If a retry/resume ran AFTER the failure timestamp, we've already tried.
+  # A diagnosis-only fixer after failure is not enough; it did not resume the
+  # build and should not suppress a later deterministic recovery.
+  local retry_ts
+  retry_ts="$(grep -E '"event":"(fixer_retry_started|build_resumed)"' "$dir/events.jsonl" 2>/dev/null \
+              | tail -n1 | sed -n 's/.*"ts":"\([^"]*\)".*/\1/p')"
+  [[ -z "$retry_ts" ]] && return 0
+  [[ "$retry_ts" < "$fail_ts" ]]
+}
+
+needs_orphaned_running_resume() {
+  local dir="$1" id="$2" now="$3"
+  local state="$dir/state.json"
+  [[ -f "$state" ]] || return 1
+  watchdog_recent_resume_lock "$dir" "$now" && return 1
+
+  local running_stage
+  running_stage="$(jq -r '
+    (.current_stage // empty) as $current |
+    if $current != "" and (.stages[$current].status == "running") then $current
+    else ((.stages | to_entries | map(select(.value.status == "running")) | .[0].key) // "")
+    end
+  ' "$state" 2>/dev/null || true)"
+  [[ -n "$running_stage" ]] || return 1
+
+  local pidfile="$dir/run.pid" pid=""
+  if [[ -f "$pidfile" ]]; then
+    pid="$(awk -F= '/^pid=/{print $2; exit}' "$pidfile" 2>/dev/null || true)"
+    if [[ "$pid" =~ ^[0-9]+$ ]] && rds_pid_is_build_runner "$pid" "$id"; then
+      return 1
+    fi
+  fi
+
+  local last delta attempts
+  last="$(build_last_activity "$dir" "$id")"
+  [[ "$last" -gt 0 ]] || return 1
+  delta=$(( now - last ))
+  (( delta >= STUCK_AFTER )) || return 1
+
+  attempts="$(watchdog_resume_attempt_count "$dir")"
+  (( attempts < MAX_FIX_ATTEMPTS )) || return 1
+  printf '%s:%s:%s\n' "$running_stage" "$delta" "$attempts"
+}
+
+spawn_resume_for() {
+  local id="$1" dir="$2" reason="$3"
+
+  printf '%s\n' "$(date -u +%FT%TZ) $reason" > "$dir/.watchdog-resume.lock"
+
+  "$ROOT/bin/rds-event" watchdog_resume_started \
+    --build-id "$id" --build-dir "$dir" \
+    reason="$reason" \
+    >/dev/null 2>&1 || true
+
+  nohup "$ROOT/bin/rds-resume" "$id" --detach \
+    >> "$LOGFILE" 2>&1 </dev/null &
+}
+
+spawn_fixer_for() {
+  local id="$1" dir="$2" reason="$3"
+
+  "$ROOT/bin/rds-event" watchdog_triggered \
+    --build-id "$id" --build-dir "$dir" \
+    reason="$reason" budget_usd="$BUDGET" \
+    >/dev/null 2>&1 || true
+
+  if [[ "${RDS_NOTIFY_ON_WATCHDOG:-1}" -eq 1 ]]; then
+    "$ROOT/bin/rds-notify" watchdog_triggered \
+      --build-id "$id" --build-dir "$dir" \
+      --task "$reason; budget=\$$BUDGET" \
+      >/dev/null 2>&1 || true
+  fi
+
+  # rds-fix is synchronous and may take a couple of minutes; detach it so the
+  # watchdog stays responsive and one-shot probes do not kill the child on exit.
+  nohup "$ROOT/bin/rds-fix" "$id" \
+    --max-budget-usd="$BUDGET" \
+    --diagnose-budget-usd="$DIAGNOSE_BUDGET" \
+    --apply-budget-usd="$APPLY_BUDGET" \
+    >> "$LOGFILE" 2>&1 </dev/null &
+}
+
+# Scan counters maintained for the heartbeat. Reset every emission.
+SCAN_COUNT=0
+SCAN_BUILDS_TOTAL=0
+SCAN_BUILDS_ACTED=0
+SCAN_BUILDS_QUARANTINED=0
+SCAN_LAST_HEARTBEAT=0
+
+scan_once() {
+  local now; now="$(date +%s)"
+  local builds_dir="$RDS_BUILDS_DIR"
+  [[ -d "$builds_dir" ]] || return 0
+
+  SCAN_COUNT=$((SCAN_COUNT + 1))
+  local scan_builds=0 scan_acted=0 scan_quarantined=0
+  local id dir pidfile pid last delta attempts orphan stale_goal incomplete_iterate
+  for dir in "$builds_dir"/*/; do
+    [[ -d "$dir" ]] || continue
+    id="$(basename "$dir")"
+    [[ "$id" == "README.md" || "$id" == ".gitkeep" ]] && continue
+
+    scan_builds=$((scan_builds + 1))
+
+    state_status="$(jq -r '.status // empty' "$dir/state.json" 2>/dev/null || true)"
+    if [[ "$state_status" == "paused" ]]; then
+      continue
+    fi
+
+    if stale_goal="$(needs_stale_goal_resume "$dir" "$id" "$now")"; then
+      IFS=: read -r delta attempts <<<"$stale_goal"
+      echo "[$(date -u +%FT%TZ)] $id goal is stale-running with no live goal/action process after ${delta}s — re-running goal (attempt $((attempts + 1))/$MAX_FIX_ATTEMPTS)"
+      spawn_goal_resume_for "$id" "$dir" "stale goal state after ${delta}s with no live goal/action process (attempt $((attempts + 1))/$MAX_FIX_ATTEMPTS)"
+      scan_acted=$((scan_acted + 1))
+      continue
+    fi
+
+    if incomplete_iterate="$(needs_incomplete_iterate_fix "$dir" "$id" "$now")"; then
+      attempts="$incomplete_iterate"
+      echo "[$(date -u +%FT%TZ)] $id has an incomplete iteration session — verifying current app state (attempt $((attempts + 1))/$MAX_FIX_ATTEMPTS)"
+      spawn_incomplete_iterate_fix_for "$id" "$dir" "incomplete iteration session without live action process (attempt $((attempts + 1))/$MAX_FIX_ATTEMPTS)"
+      scan_acted=$((scan_acted + 1))
+      continue
+    fi
+
+    pidfile="$dir/run.pid"
+    pid=""
+    if [[ -f "$pidfile" ]]; then
+      pid="$(awk -F= '/^pid=/{print $2; exit}' "$pidfile" 2>/dev/null || true)"
+      [[ "$pid" =~ ^[0-9]+$ ]] || pid=""
+    fi
+
+    # Failure state wins over pidfile state. A stale or wedged launcher can
+    # otherwise make a failed build look merely "stuck", delaying recovery
+    # until the longer stuck threshold instead of the short fail-after window.
+    state_failed="$(jq -r '
+      ((.error // null) != null) or
+      ([.stages[]?.status] | any(. == "failed"))
+    ' "$dir/state.json" 2>/dev/null || echo false)"
+    if [[ "$state_failed" == "true" ]] && terminal_reason="$(terminal_failure_reason "$dir")" && fail_ts="$(latest_failure_ts "$dir")" && [[ -n "$fail_ts" ]]; then
+      if ! failure_quarantined "$dir" "$fail_ts" "$terminal_reason"; then
+        echo "[$(date -u +%FT%TZ)] $id failed with terminal external issue ($terminal_reason) — quarantining instead of spawning rds-fix"
+        quarantine_failure "$id" "$dir" "$fail_ts" "$terminal_reason"
+      fi
+      scan_quarantined=$((scan_quarantined + 1))
+      continue
+    fi
+
+    if needs_failure_fix "$dir" "$now"; then
+      attempts="$(fixer_attempt_count_for_failure "$dir")"
+      echo "[$(date -u +%FT%TZ)] $id failed and unfixed (prior attempts=$attempts/$MAX_FIX_ATTEMPTS for this failure) — spawning rds-fix"
+      spawn_fixer_for "$id" "$dir" "build failed (attempt $((attempts + 1))/$MAX_FIX_ATTEMPTS)"
+      scan_acted=$((scan_acted + 1))
+      continue
+    fi
+
+    if orphan="$(needs_orphaned_running_resume "$dir" "$id" "$now")"; then
+      IFS=: read -r orphan_stage delta attempts <<<"$orphan"
+      echo "[$(date -u +%FT%TZ)] $id stage '$orphan_stage' is running with no live launcher after ${delta}s — resuming (attempt $((attempts + 1))/$MAX_FIX_ATTEMPTS)"
+      spawn_resume_for "$id" "$dir" "orphaned running stage '$orphan_stage' after ${delta}s (attempt $((attempts + 1))/$MAX_FIX_ATTEMPTS)"
+      scan_acted=$((scan_acted + 1))
+      continue
+    fi
+
+    if [[ -n "$pid" ]] && rds_pid_is_build_runner "$pid" "$id"; then
+      # ---- Live build: stuck-detection path -----------------------------
+      last="$(build_last_activity "$dir" "$id")"
+      [[ "$last" -gt 0 ]] || continue
+      delta=$(( now - last ))
+      (( delta >= STUCK_AFTER )) || continue
+      if already_fixed_this_episode "$dir"; then
+        echo "[$(date -u +%FT%TZ)] $id stuck ${delta}s — fixer already ran this episode, skipping"
+        continue
+      fi
+      echo "[$(date -u +%FT%TZ)] $id stuck for ${delta}s (>= ${STUCK_AFTER}s) — spawning rds-fix"
+      spawn_fixer_for "$id" "$dir" "stuck ${delta}s"
+      scan_acted=$((scan_acted + 1))
+    elif [[ -f "$pidfile" ]]; then
+      rm -f "$pidfile"
+    fi
+  done
+
+  SCAN_BUILDS_TOTAL=$scan_builds
+  SCAN_BUILDS_ACTED=$scan_acted
+  SCAN_BUILDS_QUARANTINED=$scan_quarantined
+
+  # Heartbeat: emit a watchdog_heartbeat event at most once per HEARTBEAT_AFTER
+  # seconds so operators can confirm the watchdog is alive even when it has
+  # nothing to do (e.g., everything is quarantined awaiting operator review).
+  # Without this, a silent watchdog and a stopped watchdog look identical.
+  if (( HEARTBEAT_AFTER > 0 )) && (( now - SCAN_LAST_HEARTBEAT >= HEARTBEAT_AFTER )); then
+    "$ROOT/bin/rds-event" watchdog_heartbeat \
+      --build-id "_watchdog" --build-dir "$ROOT" \
+      scans_since_last="$SCAN_COUNT" \
+      builds_total="$SCAN_BUILDS_TOTAL" \
+      builds_acted="$SCAN_BUILDS_ACTED" \
+      builds_quarantined="$SCAN_BUILDS_QUARANTINED" \
+      stuck_after="$STUCK_AFTER" \
+      fail_after="$FAIL_AFTER" \
+      interval="$INTERVAL" \
+      >/dev/null 2>&1 || true
+    echo "[$(date -u +%FT%TZ)] heartbeat: scans=$SCAN_COUNT builds=$SCAN_BUILDS_TOTAL acted=$SCAN_BUILDS_ACTED quarantined=$SCAN_BUILDS_QUARANTINED"
+    SCAN_LAST_HEARTBEAT=$now
+    SCAN_COUNT=0
+  fi
+}
+
+if (( DETACH == 1 )); then
+  if [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+    echo "rds-watchdog: already running (pid $(cat "$PIDFILE"))"; exit 0
+  fi
+  mapfile -t pids < <(watchdog_pids)
+  if (( ${#pids[@]} > 0 )); then
+    printf '%s\n' "${pids[0]}" > "$PIDFILE"
+    echo "rds-watchdog: already running (adopted pid ${pids[0]})"; exit 0
+  fi
+  setsid nohup "$0" --stuck-after="$STUCK_AFTER" --fail-after="$FAIL_AFTER" \
+                    --max-fix-attempts="$MAX_FIX_ATTEMPTS" --interval="$INTERVAL" \
+                    --max-budget-usd="$BUDGET" \
+                    --diagnose-budget-usd="$DIAGNOSE_BUDGET" \
+                    --apply-budget-usd="$APPLY_BUDGET" \
+       </dev/null >> "$LOGFILE" 2>&1 &
+  echo "$!" > "$PIDFILE"
+  echo "rds-watchdog: started (pid $!, log $LOGFILE)"
+  exit 0
+fi
+
+# Foreground loop. Trap so the pidfile is cleaned on stop. A one-shot probe
+# must not claim the daemon pidfile or it will make the real watchdog look off.
+if (( ONCE != 1 )); then
+  trap 'rm -f "$PIDFILE"; exit 0' INT TERM
+  echo "$$" > "$PIDFILE" 2>/dev/null || true
+fi
+echo "[$(date -u +%FT%TZ)] rds-watchdog up (stuck_after=${STUCK_AFTER}s fail_after=${FAIL_AFTER}s max_attempts=${MAX_FIX_ATTEMPTS} interval=${INTERVAL}s budget=\$$BUDGET diagnose=\$$DIAGNOSE_BUDGET apply=\$$APPLY_BUDGET heartbeat=${HEARTBEAT_AFTER}s)"
+
+while :; do
+  scan_once || true
+  (( ONCE == 1 )) && break
+  sleep "$INTERVAL"
+done

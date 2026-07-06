@@ -1,0 +1,17 @@
+---
+slug: godot-mcp-pro-mount
+name: Godot MCP Pro mount
+status: curated
+category: mcp
+maturity: beta
+applies_to:
+- game-engine
+description: Godot MCP context mount.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: docs.godotengine.org
+  url: https://docs.godotengine.org/
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

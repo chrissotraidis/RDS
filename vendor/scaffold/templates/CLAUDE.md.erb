@@ -1,0 +1,81 @@
+# <%= project_name %>
+
+## Project Summary
+
+<%= spec_summary %>
+
+## Tech Stack
+
+<% primary_stack_lines.each do |line| -%>
+- <%= line %>
+<% end -%>
+<% if supporting_stack_lines.any? -%>
+- Supporting: <%= supporting_stack_lines.join(" | ") %>
+<% end -%>
+<% if domain_summaries.any? -%>
+- Domain focus: <%= domain_summaries.join(" | ") %>
+<% end -%>
+
+## Core Workflow
+
+This build runs task-by-task from `tasks.json` with lazy task details in `.scaffold/task-details/{position}.json`.
+
+1. Run `bin/task status` or `bin/task next`.
+2. Run `bin/task start {position}`.
+3. Run `bin/task prepare {position}` (optionally with Codex preflight review enabled by the harness).
+4. Run `bin/task dossier {position}` to print the consolidated per-task context (done_when, workflow gates, predecessor runbook in dependency-closure order, wiki entity excerpts + risk flags, implementation guidance, verification commands). This is the single source of truth for "what this task needs." Read it before anything else.
+5. Implement the task so `done_when` is observably true through normal user flows.
+6. Run `bin/task verify {position} --skip-runtime-deps` during iteration; the harness runs the full suite after the session exits.
+7. Commit with `Task {position}: {title}`.
+8. Run `bin/task done {position}`.
+
+Use `bin/task error {position} "reason"` only when blocked after repeated fix attempts. Use `bin/task reset {position}` before retrying an errored task.
+
+Other useful commands: `bin/task runbook-for {position}` (predecessor runbook only), `bin/task attempt-advisory {position}` (split suggestion when failed attempts exceed threshold), `bin/task split {position} "<contract-1>" "<contract-2>" ...` (decompose a task into behavior-contract children).
+
+## Iterating on the spec
+
+When `spec.md` changes after the initial build, use `bin/task sync`:
+
+1. Commit the spec edit: `git add spec.md && git commit -m "spec: ..."`.
+2. Run `bin/task sync` to produce `.scaffold/sync-proposal.md`. The classifier flags each spec hunk as new-task, modify-pending, inject-against-completed, deprecate, or refinement-noop. Medium/low-confidence entries are double-sampled with a critic pass.
+3. Open the proposal in your editor. Per change block, flip `status:` to `accept`, `reject`, or `edit`. Accepted entries become tasks; rejected entries are logged and skipped.
+4. Run `bin/task sync --apply` to mutate `tasks.json` and commit. Completed tasks are never modified — changes affecting completed work become new pending tasks via `inject-against-completed`.
+5. Use `bin/task sync --show-drift` any time to audit completed tasks whose cheap probes no longer pass (e.g., a file that was deleted).
+
+## Execution Rules
+
+- `done_when` is the primary success criterion; file existence alone is not enough.
+- Verify behavior through normal entry points and seeded flows, not only by direct URLs or isolated helpers.
+- Required global checks live in `config.yml`. Task-specific checks live in `.scaffold/task-details/{position}.json`.
+- Do not edit `runbook.md` manually; `launch-build.sh` owns runbook updates after successful verification.
+- If a task touches one stack in a multi-stack project, still run full verification for all stacks.
+- If a task adds auth, async work, seed dependencies, or user-visible actions, wire and verify them in real execution paths before marking done.
+- Reuse existing definitions before adding new types, helpers, colors, assets, or manifests entries.
+
+## Validation
+
+- Run `bin/task verify {position}` for the authoritative task + global validation pass.
+<% if verification_check_names.any? -%>
+- Global check families: <%= verification_check_names.join(", ") %>.
+<% end -%>
+- Use `bin/spec_coverage` for coverage audits when checking overall build completeness.
+
+## References
+
+- `spec.md`: product behavior and GIVEN/WHEN/THEN scenarios
+- `tasks.json`: thin task plan and task state
+- `.scaffold/task-details/{position}.json`: task-specific implementation guidance, verification, and optional preflight review
+- `config.yml`: global verification, workflow capabilities, and runtime config
+- `runbook.md`: what the app currently does after completed tasks
+- `mockup-manifest.json` (if present): canonical screen inventory — screens with roles, routes, components, interactive elements, data entities, navigation, and realistic seed data. When implementing a frontend task, prefer this as the source of truth for screen structure and seed content over reinventing them from `spec.md`.
+<% if has_wiki -%>
+- `wiki/`: product knowledge base — entity definitions, terminology, decisions, UX expectations. Read `wiki/index/wiki-index.json` to find relevant pages for your current task.
+<% end -%>
+
+<% if trimmed_sections.any? -%>
+## Notes
+
+This `CLAUDE.md` was intentionally trimmed for context efficiency. Full detail remains in the source files above.
+Trimmed sections: <%= trimmed_sections.join(", ") %>.
+<% end -%>

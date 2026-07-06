@@ -1,0 +1,44 @@
+{
+  "id": "python-ai-service",
+  "name": "Python AI service",
+  "language": "python",
+  "runtime": {
+    "python": ">=3.12"
+  },
+  "framework": {
+    "name": "fastapi",
+    "version": "0.136"
+  },
+  "database": "optional",
+  "default_port_range": [
+    4000,
+    4099
+  ],
+  "health_path": "/health",
+  "stages": [
+    "intake",
+    "spec",
+    "init",
+    "scaffold",
+    "local-run",
+    "deploy",
+    "qa"
+  ],
+  "init": "stacks/python-ai-service/init.sh",
+  "local_run": "stacks/python-ai-service/local-run.sh",
+  "doctor": "stacks/python-ai-service/doctor.sh",
+  "scaffold_recipe": "python_ai_service",
+  "service_entrypoint": "bash -c 'PYTHON_BIN=${PYTHON_BIN:-python3.12}; command -v \"$PYTHON_BIN\" >/dev/null 2>&1 || PYTHON_BIN=python3; \"$PYTHON_BIN\" -m venv .venv; . .venv/bin/activate; python -m ensurepip --upgrade >/dev/null 2>&1 || true; python -m pip install --upgrade pip >/dev/null; pip install -r requirements.txt; exec uvicorn app.main:app --host 0.0.0.0 --port %(ENV_PORT)s'",
+  "service_env": {
+    "PYTHONUNBUFFERED": "1",
+    "PYTHON_BIN": "python3.12",
+    "PYTHONPATH": ".",
+    "RDS_RUNTIME": "zo"
+  },
+  "supports_modes": [
+    "green",
+    "brown"
+  ],
+  "status": "ready",
+  "notes": "Ready V1 Phase 1a stack for FastAPI/Pydantic-style AI services. Root redirects to docs and /health returns JSON."
+}

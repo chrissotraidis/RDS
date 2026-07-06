@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8" /><title>Orders</title></head>
+  <body>
+    <main>
+      <h1>Orders</h1>
+      <label>Search <input placeholder="Search orders" /></label>
+      <button id="create">Create order</button>
+      <p id="result">No draft yet</p>
+    </main>
+    <script>
+      if (localStorage.getItem("operator-session") !== "ok") location.href = "/login/";
+      document.getElementById("create").onclick = () => document.getElementById("result").textContent = "Draft order created";
+    </script>
+  </body>
+</html>

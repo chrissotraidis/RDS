@@ -1,0 +1,5 @@
+primary_recipe: cli_tool
+persona: software_architect
+domains_any_of:
+  - generic
+  - productivity

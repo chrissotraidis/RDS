@@ -1,0 +1,21 @@
+---
+slug: vector-turbopuffer
+name: Turbopuffer vectors
+status: ready
+default: false
+applies_to:
+- nextjs-fullstack
+- python-ai-service
+description: Managed vector search alternative.
+install:
+  command: bin/rds-skill-materialize vector-turbopuffer
+verify:
+  command: bin/rds-skill-verify vector-turbopuffer
+maturity: beta
+category: vector-db
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should
+  understand during stack selection, skill resolution, implementation guidance, or
+  verification.
+source_links:
+- label: turbopuffer.com
+  url: https://turbopuffer.com/docs

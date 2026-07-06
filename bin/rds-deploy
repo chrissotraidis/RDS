@@ -1,0 +1,464 @@
+#!/usr/bin/env bash
+# bin/rds-deploy — finalizes a build for public preview.
+#
+# Usage:
+#   ./bin/rds-deploy --build-id=<id> --app-dir=<abs-path> [--target=zo|none|teardown]
+#
+# Targets:
+#   zo       (default) — leave the native app server running, register a
+#                        durable public Zo HTTP service, and write the real
+#                        *.zocomputer.io URL to preview-url.txt. Set
+#                        RDS_ZO_AUTO_REGISTER=0 to write the legacy pending
+#                        sentinel instead.
+#   none               — skip public deploy; preview URL is
+#                        http://localhost:<HOST_PORT>. Server left running.
+#   teardown           — Stop the running app server (via tmp/pids/server.pid)
+#                        and write an empty preview URL.
+#
+# fly is no longer supported — RDS runs on Zo and only deploys to Zo.
+# Docker is not available on Zo (gVisor sandbox); RDS runs Rails natively.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck disable=SC1091
+source "$ROOT/bin/lib/common.sh"
+# shellcheck disable=SC1091
+source "$ROOT/bin/lib/logging.sh"
+
+BUILD_ID="$(parse_flag --build-id "$@")"
+TARGET="$(parse_flag --target "$@" || echo "${RDS_DEFAULT_DEPLOY_TARGET:-zo}")"
+APP_DIR="$(parse_flag --app-dir "$@" || echo "")"
+
+[[ -n "$BUILD_ID" ]] || { echo "FATAL: --build-id is required" >&2; exit 1; }
+[[ -n "$APP_DIR"  ]] || { echo "FATAL: --app-dir is required" >&2; exit 1; }
+
+BUILD_DIR="$RDS_BUILDS_DIR/$BUILD_ID"
+[[ -d "$APP_DIR" ]] || { echo "FATAL: $APP_DIR not found" >&2; exit 1; }
+STACK="$(jq -r '.stack // "rails"' "$BUILD_DIR/state.json" 2>/dev/null || echo rails)"
+stack_validate "$STACK"
+
+PORT="$(grep '^HOST_PORT=' "$APP_DIR/.env" 2>/dev/null | head -n1 | cut -d= -f2 || true)"
+DEPLOY_DIR="$BUILD_DIR/deploy-snapshot"
+SERVED_DIR="$DEPLOY_DIR"
+
+if [[ -f "$BUILD_DIR/service.json" ]]; then
+  EXISTING_PORT="$(python3 - "$BUILD_DIR/service.json" "$DEPLOY_DIR" <<'PY' || true
+import json, os, sys
+path, deploy_dir = sys.argv[1:]
+try:
+    data = json.load(open(path))
+except Exception:
+    raise SystemExit(0)
+if data.get("status") == "live" and os.path.realpath(data.get("app_dir") or "") == os.path.realpath(deploy_dir):
+    port = data.get("local_port")
+    if port:
+        print(port)
+PY
+)"
+  if [[ "$EXISTING_PORT" =~ ^[0-9]+$ ]]; then
+    PORT="$EXISTING_PORT"
+  fi
+fi
+
+URL=""
+
+prepare_deploy_snapshot() {
+  [[ -n "$DEPLOY_DIR" && "$DEPLOY_DIR" == "$BUILD_DIR"/deploy-snapshot ]] || {
+    echo "FATAL: invalid deploy snapshot path: $DEPLOY_DIR" >&2
+    exit 1
+  }
+  # Atomic-swap snapshot prep: never rm -rf a directory a live service may be
+  # serving from. Instead, rsync into deploy-snapshot.new, then atomically swap
+  # via rename, then GC the old tree in the background. Renaming a directory
+  # while a process holds open file descriptors inside it is safe on Linux —
+  # the running process keeps its references until it closes them.
+  local stage_dir="$BUILD_DIR/deploy-snapshot.new"
+  local trash_dir="$BUILD_DIR/deploy-snapshot.old.$$"
+  rm -rf "$stage_dir"
+  mkdir -p "$stage_dir"
+  # Seed the staging dir with the current snapshot (if any) so rsync --delete
+  # only churns the diff. Use the same heavy-directory excludes as the app copy;
+  # otherwise large framework caches from the old snapshot can stall deploys
+  # before the atomic swap even begins.
+  if [[ -d "$DEPLOY_DIR" ]]; then
+    rsync -a \
+      --exclude 'node_modules/' \
+      --exclude '.next/' \
+      --exclude '.turbo/' \
+      --exclude '.vite/' \
+      --exclude 'tmp/pids/' \
+      --exclude 'log/*.log' \
+      "$DEPLOY_DIR"/ "$stage_dir"/ || true
+  fi
+  rsync -a --delete \
+    --exclude '.git/' \
+    --exclude 'node_modules/' \
+    --exclude '.next/' \
+    --exclude '.turbo/' \
+    --exclude '.vite/' \
+    --exclude 'tmp/pids/' \
+    --exclude 'log/*.log' \
+    "$APP_DIR"/ "$stage_dir"/
+  if [[ -d "$DEPLOY_DIR" ]]; then
+    mv "$DEPLOY_DIR" "$trash_dir"
+  fi
+  mv "$stage_dir" "$DEPLOY_DIR"
+  if [[ -d "$trash_dir" ]]; then
+    ( rm -rf "$trash_dir" >/dev/null 2>&1 & ) || true
+  fi
+  log "prepared deploy snapshot (atomic swap): $DEPLOY_DIR"
+}
+
+ensure_vite_allows_zo_hosts() {
+  local dir="${1:-$APP_DIR}"
+  local config="$dir/vite.config.ts"
+  [[ -f "$config" ]] || config="$dir/vite.config.js"
+  [[ -f "$config" ]] || return 0
+  [[ "$STACK" == "react" || "$STACK" == "web-3d" ]] || return 0
+
+  python3 - "$config" <<'PY'
+import re, sys
+path = sys.argv[1]
+text = open(path).read()
+if re.search(r"allowedHosts\s*:\s*(true|\[)", text):
+    raise SystemExit(0)
+if re.search(r"server\s*:\s*\{", text):
+    text = re.sub(r"(server\s*:\s*\{)", r"\1\n    allowedHosts: true,", text, count=1)
+elif re.search(r"defineConfig\s*\(\s*\{", text):
+    text = re.sub(r"(defineConfig\s*\(\s*\{)", r"\1\n  server: { allowedHosts: true },", text, count=1)
+else:
+    raise SystemExit(0)
+open(path, "w").write(text)
+PY
+}
+
+stop_local_preview() {
+  local pidfile="$APP_DIR/tmp/pids/server.pid"
+  if [[ ! -f "$pidfile" ]]; then return 0; fi
+  local pid
+  pid="$(cat "$pidfile" 2>/dev/null || true)"
+  if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+    log "stopping local preview pid=$pid before durable Zo service bind"
+    kill -- "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+    sleep 1
+  fi
+  rm -f "$pidfile"
+}
+
+wait_for_public_url() {
+  local url="$1"
+  local timeout="${RDS_PUBLIC_URL_TIMEOUT_SEC:-180}"
+  local interval=3
+  local elapsed=0
+  local code=""
+
+  [[ "$url" =~ ^https?:// ]] || return 0
+  log "waiting up to ${timeout}s for public URL to answer: $url"
+  while (( elapsed <= timeout )); do
+    code="$(curl -k -sS -o /dev/null -w "%{http_code}" --max-time 10 "$url" 2>/dev/null || true)"
+    if [[ "$code" =~ ^[23][0-9][0-9]$ ]]; then
+      log "public URL healthy: $url ($code)"
+      return 0
+    fi
+    sleep "$interval"
+    elapsed=$((elapsed + interval))
+  done
+
+  echo "FATAL: public URL did not become healthy within ${timeout}s: $url (last HTTP $code)" >&2
+  return 1
+}
+
+write_runtime_marker() {
+  local served_dir="${1:-$DEPLOY_DIR}"
+  [[ -d "$served_dir" && -f "$BUILD_DIR/deploy-fingerprint.json" ]] || return 0
+  python3 - "$BUILD_DIR/deploy-fingerprint.json" "$served_dir" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+fingerprint_path, served_dir = sys.argv[1:]
+payload = json.loads(Path(fingerprint_path).read_text(encoding="utf-8"))
+marker = {
+    "schema": "rds.runtime-marker.v1",
+    "buildId": payload.get("buildId"),
+    "hash": payload.get("hash"),
+    "generatedAt": payload.get("generatedAt"),
+}
+for base in [Path(served_dir), Path(served_dir) / "public"]:
+    marker_dir = base / ".well-known"
+    marker_dir.mkdir(parents=True, exist_ok=True)
+    (marker_dir / "rds-deploy-fingerprint.json").write_text(json.dumps(marker, indent=2) + "\n", encoding="utf-8")
+public_dir = Path(served_dir) / "public"
+public_dir.mkdir(parents=True, exist_ok=True)
+(public_dir / "rds-deploy-fingerprint.json").write_text(json.dumps(marker, indent=2) + "\n", encoding="utf-8")
+PY
+}
+
+verify_runtime_marker() {
+  local url="$1"
+  [[ "$url" =~ ^https?:// ]] || return 0
+  [[ -f "$BUILD_DIR/deploy-fingerprint.json" ]] || return 0
+  local out="$BUILD_DIR/service-runtime.json"
+  python3 - "$BUILD_DIR/deploy-fingerprint.json" "$url" "$out" <<'PY'
+import json
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+fingerprint_path, url, out_path = sys.argv[1:]
+fingerprint = json.loads(Path(fingerprint_path).read_text(encoding="utf-8"))
+marker_urls = [
+    url.rstrip("/") + "/rds-deploy-fingerprint.json",
+    url.rstrip("/") + "/.well-known/rds-deploy-fingerprint.json",
+]
+payload = {
+    "schema": "rds.service-runtime.v1",
+    "buildId": fingerprint.get("buildId"),
+    "url": url,
+    "markerUrl": marker_urls[0],
+    "expectedHash": fingerprint.get("hash"),
+    "checkedAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    "status": "fail",
+    "httpStatus": None,
+    "servedHash": None,
+    "error": None,
+}
+deadline = time.time() + 120
+while time.time() <= deadline and payload["status"] != "pass":
+    for marker_url in marker_urls:
+        payload["markerUrl"] = marker_url
+        try:
+            req = urllib.request.Request(marker_url, headers={"Accept": "application/json", "User-Agent": "rds-deploy/0.1"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                payload["httpStatus"] = resp.getcode()
+                body = resp.read(256_000).decode("utf-8", errors="ignore")
+            marker = json.loads(body)
+            payload["servedHash"] = marker.get("hash")
+            if marker.get("buildId") == fingerprint.get("buildId") and marker.get("hash") == fingerprint.get("hash"):
+                payload["status"] = "pass"
+                payload["error"] = None
+                break
+            payload["error"] = "runtime marker did not match deploy fingerprint"
+        except urllib.error.HTTPError as exc:
+            payload["httpStatus"] = exc.code
+            payload["error"] = f"HTTP {exc.code}"
+        except Exception as exc:
+            payload["error"] = str(exc)
+    if payload["status"] != "pass":
+        time.sleep(5)
+
+Path(out_path).write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+if payload["status"] != "pass":
+    print(f"FATAL: runtime marker verification failed: {payload['error']}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+
+write_deploy_fingerprint() {
+  local served_dir="${1:-$DEPLOY_DIR}"
+  [[ -d "$served_dir" ]] || return 0
+  python3 - "$BUILD_ID" "$TARGET" "$URL" "$APP_DIR" "$served_dir" "$BUILD_DIR/deploy-fingerprint.json" <<'PY'
+import hashlib
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+build_id, target, url, source_app_dir, served_dir, out_path = sys.argv[1:]
+served = Path(served_dir).resolve()
+skip_dirs = {".git", "node_modules", ".turbo", ".vite", "tmp", "log"}
+marker_paths = {
+    ".well-known/rds-deploy-fingerprint.json",
+    "public/.well-known/rds-deploy-fingerprint.json",
+}
+entries = []
+for path in sorted(served.rglob("*")):
+    if not path.is_file():
+        continue
+    rel = path.relative_to(served).as_posix()
+    if any(part in skip_dirs for part in rel.split("/")):
+        continue
+    if rel in marker_paths:
+        continue
+    try:
+        data = path.read_bytes()
+    except Exception:
+        continue
+    entries.append({
+        "path": rel,
+        "size": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+    })
+
+digest = hashlib.sha256()
+for entry in entries:
+    digest.update(entry["path"].encode())
+    digest.update(b"\0")
+    digest.update(str(entry["size"]).encode())
+    digest.update(b"\0")
+    digest.update(entry["sha256"].encode())
+    digest.update(b"\n")
+
+payload = {
+    "schema": "rds.deploy-fingerprint.v1",
+    "buildId": build_id,
+    "target": target,
+    "url": url,
+    "sourceAppDir": source_app_dir,
+    "servedDir": str(served),
+    "generatedAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    "fileCount": len(entries),
+    "hash": digest.hexdigest(),
+    "runtimeMarkerPath": "/.well-known/rds-deploy-fingerprint.json",
+    "files": entries[:2000],
+}
+Path(out_path).write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+PY
+}
+
+reuse_existing_zo_service_if_possible() {
+  local info="$BUILD_DIR/service.json"
+  local service_app_dir="${1:-$DEPLOY_DIR}"
+  [[ -f "$info" ]] || return 1
+  python3 - "$info" "$service_app_dir" "$PORT" <<'PY'
+import json, os, sys
+path, app_dir, port = sys.argv[1:]
+try:
+    data = json.load(open(path))
+except Exception:
+    raise SystemExit(1)
+if data.get("status") != "live":
+    raise SystemExit(1)
+if os.path.realpath(data.get("app_dir") or "") != os.path.realpath(app_dir):
+    raise SystemExit(1)
+if str(data.get("local_port") or "") != str(port):
+    raise SystemExit(1)
+url = data.get("url") or ""
+if not url.startswith("http"):
+    raise SystemExit(1)
+print(url)
+PY
+}
+
+reuse_existing_live_app_service_if_possible() {
+  local info="$BUILD_DIR/service.json"
+  [[ -f "$info" ]] || return 1
+  python3 - "$info" "$APP_DIR" "$PORT" <<'PY'
+import json, os, sys
+path, app_dir, port = sys.argv[1:]
+try:
+    data = json.load(open(path))
+except Exception:
+    raise SystemExit(1)
+if data.get("status") != "live":
+    raise SystemExit(1)
+if os.path.realpath(data.get("app_dir") or "") != os.path.realpath(app_dir):
+    raise SystemExit(1)
+if str(data.get("local_port") or "") != str(port):
+    raise SystemExit(1)
+url = data.get("url") or ""
+if not url.startswith("http"):
+    raise SystemExit(1)
+print(url)
+PY
+}
+
+expected_zo_url() {
+  local zo_owner="${RDS_ZO_OWNER:-${ZO_OWNER:-}}"
+  zo_owner="$(printf '%s' "$zo_owner" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//; s/-+/-/g')"
+  [[ -n "$zo_owner" ]] || { echo "FATAL: set RDS_ZO_OWNER or ZO_OWNER before Zo deploy" >&2; return 1; }
+  python3 - "$BUILD_ID" "$zo_owner" <<'PY'
+import hashlib
+import re
+import sys
+
+build_id, zo_owner = sys.argv[1:]
+slug = re.sub(r"[^a-z0-9-]+", "-", build_id.lower()).strip("-")
+slug = re.sub(r"-+", "-", slug)
+suffix = hashlib.sha1(build_id.encode()).hexdigest()[:6]
+label = f"rds-{slug[:21]}-{suffix}"
+label = re.sub(r"[^a-z0-9-]+", "-", label.lower()).strip("-")
+label = re.sub(r"-+", "-", label)[:32] or "rds-build"
+print(f"https://{label}-{zo_owner}.zocomputer.io")
+PY
+}
+
+case "$TARGET" in
+  zo)
+    [[ -n "$PORT" ]] || { echo "FATAL: no HOST_PORT in $APP_DIR/.env" >&2; exit 1; }
+    prepare_deploy_snapshot
+    ensure_vite_allows_zo_hosts "$DEPLOY_DIR"
+    if [[ "${RDS_ZO_AUTO_REGISTER:-1}" == "1" ]]; then
+      if [[ -z "${ZO_CLIENT_IDENTITY_TOKEN:-}" ]] && URL="$(reuse_existing_zo_service_if_possible "$DEPLOY_DIR")"; then
+        SERVED_DIR="$DEPLOY_DIR"
+        log "zo target — reused existing live service without Zo identity token: $URL"
+      else
+        stop_local_preview
+        register_cmd="$ROOT/bin/rds-zo-register"
+        [[ -x "$register_cmd" ]] || { echo "FATAL: $register_cmd missing or not executable" >&2; exit 1; }
+        URL="$(expected_zo_url)"
+        write_deploy_fingerprint "$DEPLOY_DIR"
+        write_runtime_marker "$DEPLOY_DIR"
+        register_timeout="${RDS_ZO_REGISTER_TOTAL_TIMEOUT_SEC:-420}"
+        if URL="$(timeout "$register_timeout" "$register_cmd" --build-id="$BUILD_ID" --app-dir="$DEPLOY_DIR" --port="$PORT" --stack="$STACK")"; then
+          SERVED_DIR="$DEPLOY_DIR"
+          log "zo target — registered/updated public service: $URL"
+        elif URL="$(reuse_existing_zo_service_if_possible "$DEPLOY_DIR")"; then
+          SERVED_DIR="$DEPLOY_DIR"
+          log "zo target — registration exceeded/faulted; reused existing matching service: $URL"
+        else
+          echo "FATAL: Zo registration failed or exceeded ${register_timeout}s, and no matching live service exists for $DEPLOY_DIR" >&2
+          exit 1
+        fi
+      fi
+    else
+      URL="pending-zo-registration://port=$PORT;build_id=$BUILD_ID;app_dir=$DEPLOY_DIR;source_app_dir=$APP_DIR"
+      log "zo target — auto-register disabled; sentinel written for port $PORT"
+    fi
+    wait_for_public_url "$URL"
+    ;;
+
+  none)
+    log "none target — skipping public deploy; preview = localhost"
+    if [[ -n "$PORT" ]]; then
+      URL="http://localhost:$PORT"
+      SERVED_DIR="$APP_DIR"
+    else
+      URL=""
+      SERVED_DIR="$APP_DIR"
+    fi
+    ;;
+
+  teardown)
+    log "teardown — stopping native app server in $APP_DIR"
+    pidfile="$APP_DIR/tmp/pids/server.pid"
+    if [[ -f "$pidfile" ]]; then
+      pid="$(cat "$pidfile" 2>/dev/null || true)"
+      if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" || true
+      fi
+      rm -f "$pidfile"
+    fi
+    URL=""
+    rm -f "$BUILD_DIR/deploy-fingerprint.json"
+    ;;
+
+  *)
+    echo "FATAL: unknown --target=$TARGET (expected zo|none|teardown)" >&2
+    exit 1
+    ;;
+esac
+
+printf '%s\n' "$URL" > "$BUILD_DIR/preview-url.txt"
+if [[ -n "$URL" ]]; then
+  if [[ ! -f "$BUILD_DIR/deploy-fingerprint.json" ]]; then
+    write_deploy_fingerprint "$SERVED_DIR"
+    write_runtime_marker "$SERVED_DIR"
+  fi
+  verify_runtime_marker "$URL"
+fi
+echo "Preview: $URL"

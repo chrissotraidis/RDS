@@ -1,0 +1,26 @@
+#!/usr/bin/env ruby
+# Materialize an RDS skill guide inside the generated app.
+
+require "fileutils"
+
+slug = ARGV.fetch(0)
+root = File.expand_path("..", __dir__)
+app_dest = ENV.fetch("RDS_APP_DEST")
+build_dir = ENV.fetch("RDS_BUILD_DIR")
+
+skill_dir = File.join(root, "skills", "built-in", slug)
+guide = File.join(skill_dir, "AGENTS.md")
+manifest = File.join(skill_dir, "rds-skill.yaml")
+
+abort "missing skill guide: #{guide}" unless File.exist?(guide)
+abort "missing skill manifest: #{manifest}" unless File.exist?(manifest)
+
+target_dir = File.join(app_dest, ".rds", "skills")
+FileUtils.mkdir_p(target_dir)
+
+FileUtils.cp(guide, File.join(target_dir, "#{slug}.md"))
+FileUtils.cp(manifest, File.join(target_dir, "#{slug}.yaml"))
+
+FileUtils.mkdir_p(File.join(build_dir, "skills"))
+File.write(File.join(build_dir, "skills", "#{slug}.ready"), "ready\n")
+puts "materialized #{slug} guide into #{target_dir}"

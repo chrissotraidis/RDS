@@ -1,0 +1,21 @@
+{
+  "status": "pass",
+  "routeVisits": [
+    {
+      "url": "http://127.0.0.1:47101/dashboard",
+      "finalUrl": "http://127.0.0.1:47101/dashboard",
+      "status": 200,
+      "redirectedToLogin": false
+    }
+  ],
+  "actionGraph": [
+    {
+      "persona": "operator",
+      "route": "/dashboard",
+      "interactions": [
+        { "persona": "operator", "route": "/dashboard", "label": "Approve episode", "tag": "button", "href": null, "outcome": "changed" }
+      ]
+    }
+  ]
+}
+

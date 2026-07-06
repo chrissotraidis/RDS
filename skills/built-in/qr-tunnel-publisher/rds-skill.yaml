@@ -1,0 +1,18 @@
+---
+slug: qr-tunnel-publisher
+name: QR tunnel publisher
+status: ready
+default: false
+applies_to:
+- mobile-native
+description: Expo tunnel QR and deep-link publication contract.
+install:
+  command: bin/rds-skill-materialize qr-tunnel-publisher
+verify:
+  command: bin/rds-skill-verify qr-tunnel-publisher
+maturity: beta
+category: preview
+rationale: Mobile-native previews need a clear owner-facing handoff path. This skill requires QR/deep-link preview metadata or an explicit fallback when tunnel/device preview is unavailable.
+source_links:
+- label: docs.expo.dev
+  url: https://docs.expo.dev/more/expo-cli/

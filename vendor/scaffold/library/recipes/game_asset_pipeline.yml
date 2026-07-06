@@ -1,0 +1,88 @@
+name: Game Asset Pipeline
+type: game_asset_pipeline
+keywords:
+  - asset pipeline
+  - blender
+  - bpy
+  - gltf
+  - usd
+  - usdz
+  - model-viewer
+  - lod
+description: >
+  Python/uv batch pipeline for processing 3D assets, validating a target spec,
+  generating artifacts, and serving a model-viewer/download preview. Blender
+  hooks are optional until the runtime is installed.
+
+framework:
+  primary: Python asset pipeline
+  target_runtime: Blender/bpy
+  language: Python
+  package_manager: uv
+  deployment: Zo static preview
+
+workflow:
+  capabilities:
+    batch_processing: true
+    asset_validation: true
+    preview_page: true
+    downloadable_artifacts: true
+    native_tests: true
+    database: false
+
+finalization:
+  commands:
+    - uv sync
+    - uv run pytest -q
+    - uv run python scripts/process_asset.py --input assets/in/sample_asset.json --spec spec/target_spec.yaml
+    - uv run python scripts/build_preview.py
+  checks:
+    - name: Pipeline tests
+      command: uv run pytest -q
+      type: test
+      required: true
+    - name: Preview page
+      command: uv run python scripts/build_preview.py
+      type: artifact
+      required: true
+
+verification:
+  setup_commands:
+    - uv sync
+  boot_command: HOST_PORT=3000 uv run python scripts/serve_preview.py
+  health_checks:
+    - url: "http://localhost:3000/health.json"
+      expected_status: 200
+    - url: "http://localhost:3000/"
+      expected_status: 200
+  test_command: uv run pytest -q
+
+sections:
+  - name: Runtime Contract
+    phase: pipeline
+    labels: ["setup", "assets"]
+    description: Keep the pipeline deterministic and reproducible.
+    guidance:
+      - Preserve spec/target_spec.yaml as the asset target contract.
+      - Preserve assets/in, assets/out, assets/cache, and web/.
+      - Keep Blender-specific code optional and isolated behind availability checks.
+      - Do not ingest rights-encumbered commercial game assets without explicit user confirmation.
+
+  - name: Asset Processing
+    phase: pipeline
+    labels: ["pipeline", "validation"]
+    description: Implement transforms and validators from the PRD.
+    guidance:
+      - Write scripts that can be run non-interactively.
+      - Emit machine-readable summaries for every processed asset.
+      - Validate triangle budgets, formats, texture constraints, scale, and up-axis.
+      - Keep large generated artifacts out of git unless explicitly requested.
+
+  - name: Quality
+    phase: pipeline
+    labels: ["qa"]
+    description: Verify tests, artifacts, and preview page.
+    guidance:
+      - uv run pytest -q must pass.
+      - The preview must expose /health.json and /.
+      - Processed outputs must land in assets/out with a summary file.

@@ -1,0 +1,19 @@
+#!/usr/bin/env ruby
+# Verify an RDS built-in skill is internally complete and, when installed, materialized.
+
+slug = ARGV.fetch(0)
+root = File.expand_path("..", __dir__)
+skill_dir = File.join(root, "skills", "built-in", slug)
+manifest = File.join(skill_dir, "rds-skill.yaml")
+guide = File.join(skill_dir, "AGENTS.md")
+
+abort "missing #{manifest}" unless File.exist?(manifest)
+abort "missing #{guide}" unless File.exist?(guide)
+
+if ENV["RDS_APP_DEST"]
+  app_dest = ENV.fetch("RDS_APP_DEST")
+  abort "missing installed guide for #{slug}" unless File.exist?(File.join(app_dest, ".rds", "skills", "#{slug}.md"))
+  abort "missing installed manifest for #{slug}" unless File.exist?(File.join(app_dest, ".rds", "skills", "#{slug}.yaml"))
+end
+
+puts "#{slug} verify ok"

@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# Exercise the autonomous readiness gate against synthetic passing/failing builds.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+TMP_ROOT="${TMPDIR:-/tmp}/rds-readiness-fixture-$$"
+PASS_ID="ready-pass"
+FAIL_ID="ready-fail"
+SKIPPED_DESIGN_ID="ready-skipped-design"
+
+mkdir -p "$TMP_ROOT/builds/$PASS_ID/playwright/iter-001" "$TMP_ROOT/builds/$FAIL_ID/playwright/iter-001" "$TMP_ROOT/builds/$SKIPPED_DESIGN_ID/playwright/iter-001"
+
+write_json() {
+  local path="$1"
+  shift
+  mkdir -p "$(dirname "$path")"
+  printf '%s\n' "$*" > "$path"
+}
+
+state_json='{
+  "status": "done",
+  "app_type": "website",
+  "preview_url": "https://example.test",
+  "review": {"status": "not_required"},
+  "stages": {
+    "intake": {"status": "done"},
+    "spec": {"status": "done"},
+    "taste": {"status": "done"},
+    "skill-resolve": {"status": "done"},
+    "rails-init": {"status": "done"},
+    "skill-install": {"status": "done"},
+    "scaffold": {"status": "done"},
+    "local-run": {"status": "done"},
+    "deploy": {"status": "done"},
+    "qa": {"status": "done"},
+    "taste-review": {"status": "done"}
+  }
+}'
+
+for id in "$PASS_ID" "$FAIL_ID" "$SKIPPED_DESIGN_ID"; do
+  write_json "$TMP_ROOT/builds/$id/state.json" "$state_json"
+  write_json "$TMP_ROOT/builds/$id/preview-url.txt" "https://example.test"
+  write_json "$TMP_ROOT/builds/$id/playwright/iter-001/summary.json" '{"converged": true, "gapsFound": 0}'
+  write_json "$TMP_ROOT/builds/$id/playwright/iter-001/spec-verdict.json" '{"overall": "pass"}'
+  write_json "$TMP_ROOT/builds/$id/playwright/iter-001/visual-verdict.json" '{"status": "pass", "blockerCount": 0}'
+  write_json "$TMP_ROOT/builds/$id/playwright/iter-001/scenario-verdict.json" '{"status": "pass", "blockingFailures": 0}'
+  write_json "$TMP_ROOT/builds/$id/playwright/iter-001/website-verdict.json" '{"status": "pass", "score": 100, "threshold": 100}'
+  write_json "$TMP_ROOT/builds/$id/playwright/iter-001/truthfulness-verdict.json" '{"status": "pass", "score": 100, "threshold": 100}'
+  write_json "$TMP_ROOT/builds/$id/playwright/iter-001/persona-verdict.json" '{"status": "pass", "score": 100, "threshold": 100}'
+  write_json "$TMP_ROOT/builds/$id/playwright/iter-001/prd-coverage-verdict.json" '{"status": "pass", "score": 100, "threshold": 100}'
+  write_json "$TMP_ROOT/builds/$id/playwright/iter-001/design-review.json" '{"status": "pass", "score": 95}'
+  write_json "$TMP_ROOT/builds/$id/taste-review.json" '{"status": "pass", "score": 90}'
+  write_json "$TMP_ROOT/builds/$id/quality-ledger.json" '{"blocking": []}'
+done
+
+write_json "$TMP_ROOT/builds/$FAIL_ID/playwright/iter-001/scenario-verdict.json" '{"status": "fail", "blockingFailures": 1}'
+write_json "$TMP_ROOT/builds/$SKIPPED_DESIGN_ID/playwright/iter-001/design-review.json" '{"status": "skipped", "score": null, "summary": "reviewer returned unparsable output", "reviewerError": {"kind": "unparsable_output", "evidence": "Done."}}'
+rm -f "$TMP_ROOT/builds/$SKIPPED_DESIGN_ID/quality-ledger.json"
+
+"$ROOT/bin/rds-readiness" "$PASS_ID" --root "$TMP_ROOT" >/tmp/rds-readiness-pass.out
+"$ROOT/bin/rds-quality-ledger" "$SKIPPED_DESIGN_ID" --root "$TMP_ROOT" >/tmp/rds-readiness-skipped-design-ledger.out
+if "$ROOT/bin/rds-readiness" "$SKIPPED_DESIGN_ID" --root "$TMP_ROOT" >/tmp/rds-readiness-skipped-design.out 2>&1; then
+  echo "FATAL: skipped design review passed readiness" >&2
+  exit 1
+fi
+"$ROOT/bin/rds-evidence-ledger" "$SKIPPED_DESIGN_ID" --root "$TMP_ROOT" >/tmp/rds-readiness-skipped-design-evidence.out
+if ! jq -e '(.blocking // []) | index("design")' "$TMP_ROOT/builds/$SKIPPED_DESIGN_ID/quality-ledger.json" >/dev/null; then
+  echo "FATAL: skipped design review did not block the quality ledger" >&2
+  exit 1
+fi
+if ! jq -e '.issues[]? | select(.code == "design_review_blocking" or .code == "quality_ledger_blocking")' "$TMP_ROOT/builds/$SKIPPED_DESIGN_ID/readiness.json" >/dev/null; then
+  echo "FATAL: skipped design review did not block readiness" >&2
+  exit 1
+fi
+if ! jq -e '.blockers[]? | select(.code == "quality_ledger_blocking")' "$TMP_ROOT/builds/$SKIPPED_DESIGN_ID/evidence-ledger.json" >/dev/null; then
+  echo "FATAL: skipped design review did not block evidence ledger" >&2
+  exit 1
+fi
+if "$ROOT/bin/rds-readiness" "$FAIL_ID" --root "$TMP_ROOT" >/tmp/rds-readiness-fail.out 2>&1; then
+  echo "FATAL: failing readiness fixture passed unexpectedly" >&2
+  exit 1
+fi
+if ! jq -e '.issues[] | select(.code == "scenario_verdict_blocking" and (.recovery | length > 0))' "$TMP_ROOT/builds/$FAIL_ID/readiness.json" >/dev/null; then
+  echo "FATAL: failing readiness fixture did not include recovery guidance" >&2
+  exit 1
+fi
+
+echo "Readiness fixtures passed."
+echo "Artifacts: $TMP_ROOT"

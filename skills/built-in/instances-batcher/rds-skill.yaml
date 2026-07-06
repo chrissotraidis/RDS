@@ -1,0 +1,20 @@
+---
+slug: instances-batcher
+name: Instances batcher
+status: ready
+default: false
+applies_to:
+- web-3d
+description: Instanced rendering performance helper.
+install:
+  command: bin/rds-skill-materialize instances-batcher
+verify:
+  command: bin/rds-skill-verify instances-batcher
+maturity: beta
+category: performance
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should
+  understand during stack selection, skill resolution, implementation guidance, or
+  verification.
+source_links:
+- label: drei.docs.pmnd.rs
+  url: https://drei.docs.pmnd.rs/performances/instances

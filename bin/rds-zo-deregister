@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# bin/rds-zo-deregister — delete a durable Zo HTTP user service for an RDS build.
+set -euo pipefail
+
+SERVICE_ID=""
+BUILD_ID=""
+
+for arg in "$@"; do
+  case "$arg" in
+    --service-id=*) SERVICE_ID="${arg#*=}" ;;
+    --build-id=*) BUILD_ID="${arg#*=}" ;;
+    *)
+      echo "FATAL: unknown argument: $arg" >&2
+      exit 2
+      ;;
+  esac
+done
+
+[[ -n "$SERVICE_ID" ]] || { echo "FATAL: --service-id is required" >&2; exit 1; }
+
+schema='{"type":"object","properties":{"ok":{"type":"boolean"},"service_id":{"type":"string"},"status":{"type":"string"},"error":{"type":"string"}},"required":["ok","service_id","status"],"additionalProperties":false}'
+
+read -r -d '' prompt <<PROMPT || true
+Delete the Zo user service with service_id ${SERVICE_ID}. Use the Zo delete_user_service tool directly.
+
+Requirements:
+- Do not delete files.
+- Do not delete any other service.
+- If the service is already absent, treat that as success with status "already_absent".
+- After deletion, list Zo user services and verify that ${SERVICE_ID} is absent.
+- Return ok=false if the service still exists after the delete attempt.
+
+Context:
+- RDS build_id: ${BUILD_ID:-unknown}
+
+Return JSON only:
+{
+  "ok": true_or_false,
+  "service_id": "${SERVICE_ID}",
+  "status": "deleted | already_absent | still_present | error",
+  "error": "short error if ok is false"
+}
+PROMPT
+
+tmp="$(mktemp)"
+if ! timeout "${RDS_ZO_DEREGISTER_TIMEOUT_SEC:-180}" zo "$prompt" --output-format "$schema" >"$tmp" 2>"$tmp.err"; then
+  echo "FATAL: Zo service deletion command failed" >&2
+  cat "$tmp.err" >&2 || true
+  rm -f "$tmp" "$tmp.err"
+  exit 1
+fi
+
+python3 - "$tmp" <<'PY'
+import json, sys
+raw = json.load(open(sys.argv[1]))
+payload = raw.get("output", raw)
+print(json.dumps(payload, separators=(",", ":")))
+if not payload.get("ok"):
+    raise SystemExit(1)
+PY
+
+rm -f "$tmp" "$tmp.err"

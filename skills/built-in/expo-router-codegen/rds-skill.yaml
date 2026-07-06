@@ -1,0 +1,18 @@
+---
+slug: expo-router-codegen
+name: Expo Router codegen
+status: ready
+default: false
+applies_to:
+- mobile-native
+description: Typed route scaffolding conventions for Expo Router.
+install:
+  command: bin/rds-skill-materialize expo-router-codegen
+verify:
+  command: bin/rds-skill-verify expo-router-codegen
+maturity: beta
+category: mobile
+rationale: Expo builds need route structure that matches mobile navigation expectations, not a web page pasted into a phone shell. This skill keeps screens, tabs, stacks, params, and deep-link paths explicit.
+source_links:
+- label: docs.expo.dev
+  url: https://docs.expo.dev/router/introduction/

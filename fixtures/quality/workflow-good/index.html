@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Workflow Good Fixture</title>
+  <style>
+    body { margin: 0; font-family: Inter, system-ui, sans-serif; background: #f4f6f8; color: #17202a; }
+    main { max-width: 980px; margin: 0 auto; padding: 32px 20px; }
+    .toolbar { display: flex; gap: 12px; flex-wrap: wrap; margin: 20px 0; }
+    button, a { min-height: 42px; border: 1px solid #b8c2cc; border-radius: 6px; padding: 0 14px; background: white; color: #17202a; font-weight: 700; }
+    .primary { background: #174f43; color: white; border-color: #174f43; }
+    .status { margin: 18px 0; padding: 12px 14px; background: #e8f4ef; border: 1px solid #b9d8cc; border-radius: 6px; }
+    table { width: 100%; border-collapse: collapse; background: white; }
+    td, th { padding: 12px; border-bottom: 1px solid #dfe5ea; text-align: left; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Operations dashboard</h1>
+    <p>Review, approve, reject, filter, export, and update status for incoming requests. Activity history and status changes stay visible after each action.</p>
+    <div class="toolbar">
+      <button class="primary" id="approve">Approve selected</button>
+      <button id="reject">Reject selected</button>
+      <button id="export">Export report</button>
+      <button id="filter">Filter pending</button>
+    </div>
+    <div class="status" id="status">Status: Pending. Activity history ready.</div>
+    <table><thead><tr><th>Status</th><th>Request</th><th>Owner</th></tr></thead><tbody><tr><td id="row-status">Pending</td><td>Fixture review</td><td>Ops</td></tr></tbody></table>
+  </main>
+  <script>
+    const status = document.getElementById("status");
+    const rowStatus = document.getElementById("row-status");
+    document.getElementById("approve").addEventListener("click", () => {
+      rowStatus.textContent = "Approved";
+      status.textContent = "Status: Approved. Activity history recorded.";
+    });
+    document.getElementById("reject").addEventListener("click", () => {
+      rowStatus.textContent = "Rejected";
+      status.textContent = "Status: Rejected. Activity history recorded.";
+    });
+    document.getElementById("export").addEventListener("click", () => {
+      status.textContent = "Export ready. Activity history recorded.";
+    });
+    document.getElementById("filter").addEventListener("click", () => {
+      status.textContent = "Filter applied: pending requests visible.";
+    });
+  </script>
+</body>
+</html>

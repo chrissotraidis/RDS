@@ -1,0 +1,17 @@
+---
+slug: github-mcp
+name: GitHub MCP
+status: curated
+category: mcp
+maturity: stable
+applies_to:
+- universal
+description: GitHub MCP context for repository work.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: github.com
+  url: https://github.com/github/github-mcp-server
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

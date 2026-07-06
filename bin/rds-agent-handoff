@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+RDS_ROOT="$ROOT"
+source "$ROOT/bin/lib/common.sh"
+source "$ROOT/bin/lib/agents.sh"
+
+ID="${1:-}"
+TO="$(agent_normalize_provider "$(parse_flag --to "$@" || echo codex)")"
+TASK="$(parse_flag --task "$@" || echo "")"
+[[ -n "$ID" ]] || { echo "usage: bin/rds-agent-handoff <session-id> --to=codex|claude-code --task='...'" >&2; exit 2; }
+[[ -n "$TASK" ]] || { echo "FATAL: --task is required" >&2; exit 2; }
+JSON_PATH="$(agent_find_session_json "$ID")" || { echo "No agent session named $ID" >&2; exit 1; }
+BUILD_ID="$(agent_json_get "$JSON_PATH" '.build_id')"
+REPO="$(agent_json_get "$JSON_PATH" '.repo_root')"
+WORKTREE="$(agent_json_get "$JSON_PATH" '.worktree_path')"
+BRANCH="$(agent_json_get "$JSON_PATH" '.branch')"
+TMUX_SESSION="$(agent_json_get "$JSON_PATH" '.tmux_session')"
+SESSION_DIR="$(dirname "$JSON_PATH")"
+PACKET="$SESSION_DIR/$ID.handoff.md"
+{
+  echo "# Handoff from $ID"
+  echo
+  echo "## Original task"
+  echo
+  agent_json_get "$JSON_PATH" '.task'
+  echo
+  echo "## New task"
+  echo
+  echo "$TASK"
+  echo
+  echo "## Current status"
+  echo
+  git -C "$WORKTREE" status --short || true
+  echo
+  echo "## Diff stat"
+  echo
+  git -C "$WORKTREE" diff --stat || true
+  echo
+  echo "## Recent logs"
+  echo
+  tail -n 120 "$SESSION_DIR/$ID.log" 2>/dev/null || true
+} >"$PACKET"
+
+args=(--provider="$TO" --mode=interactive --repo="$REPO" --task="$TASK" --base-branch="$BRANCH" --handoff-from="$ID" --started-by=handoff)
+[[ -n "$BUILD_ID" ]] && args+=(--build-id="$BUILD_ID")
+if ! agent_tmux_exists "$TMUX_SESSION"; then
+  args+=(--worktree="$WORKTREE" --branch="$BRANCH")
+fi
+out="$("$ROOT/bin/rds-agent-start" "${args[@]}")"
+NEXT_ID="$(printf '%s\n' "$out" | awk -F= '/^session_id=/{print $2; exit}')"
+if [[ -n "$NEXT_ID" ]]; then
+  NEXT_JSON="$(agent_find_session_json "$NEXT_ID")"
+  agent_update_json "$JSON_PATH" --arg next "$NEXT_ID" --arg now "$(agent_now)" '.handoff_to = $next | .updated_at = $now'
+  cp "$PACKET" "$(agent_json_get "$NEXT_JSON" '.worktree_path')/.agent-session/handoff.md" 2>/dev/null || true
+fi
+printf '%s\n' "$out"
+

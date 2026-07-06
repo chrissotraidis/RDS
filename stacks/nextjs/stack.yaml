@@ -1,0 +1,46 @@
+---
+slug: nextjs-fullstack
+runtime_id: nextjs
+name: Next.js full-stack web app
+description: Next.js App Router stack for modern server-rendered React apps with typed
+  actions, auth, and database-backed UI.
+category: modern-web
+v1_status: ship
+priority: 2
+language:
+  primary: typescript
+framework:
+  name: next
+  version: '16'
+scaffold:
+  command: stacks/nextjs/init.sh
+commands:
+  install: bun install
+  run: bunx next build && bunx next start --hostname 0.0.0.0 --port ${HOST_PORT}
+  test: bun run build
+  doctor: stacks/nextjs/doctor.sh
+ports:
+  range:
+  - 4000
+  - 4099
+health_path: "/api/health"
+deploy:
+  preview_on_zo: durable-zo-http-service
+  default_external: zo-standalone
+mockup_analog:
+  primary: single-html-mockup
+public_preview_model:
+  type: live-html
+compatible_skills:
+  primary:
+  - shadcn-add
+  universal:
+  - rds-context7-mount
+  - rds-secrets-broker
+  - rds-mockup-fidelity
+  - rds-eval-harness
+  - playwright-mcp
+agent_notes:
+  primary: claude-code
+aliases:
+- nextjs

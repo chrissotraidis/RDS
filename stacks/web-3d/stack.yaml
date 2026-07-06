@@ -1,0 +1,53 @@
+---
+slug: web-3d
+runtime_id: web-3d
+name: 3D web experience
+description: Browser-rendered 3D scenes, product configurators, 3D portfolios, and
+  small WebGL experiences using Vite, React, Three.js, and React Three Fiber.
+category: client-gpu-web
+v1_status: ship
+priority: 6
+language:
+  primary: typescript
+framework:
+  name: react-three-fiber
+  version: '9'
+scaffold:
+  command: stacks/web-3d/init.sh
+commands:
+  install: bun install
+  run: bunx --bun vite --host 0.0.0.0 --port ${HOST_PORT} --strictPort
+  test: bun run build
+  doctor: stacks/web-3d/doctor.sh
+ports:
+  range:
+  - 4000
+  - 4099
+health_path: "/"
+deploy:
+  preview_on_zo: durable-zo-http-service
+  default_external: cloudflare-pages
+mockup_analog:
+  primary: reference-image-plus-scene-spec
+public_preview_model:
+  type: static-bundle
+compatible_skills:
+  primary:
+  - r3f-drei-helpers
+  - playwright-canvas-snapshot
+  universal:
+  - rds-context7-mount
+  - rds-mockup-fidelity
+  - rds-secrets-broker
+  - rds-eval-harness
+  - playwright-mcp
+agent_notes:
+  primary: claude-code
+  codex_role: Shader, math, and tight component repair loops.
+failure_modes:
+- id: canvas-blank
+  summary: The app builds but renders a blank WebGL canvas.
+  mitigation: Run browser screenshot and canvas pixel checks before declaring QA complete.
+- id: asset-bloat
+  summary: Unoptimized GLTF or texture assets make initial load too large.
+  mitigation: Use scripts/optimize-assets.mjs and enforce asset budgets in review.

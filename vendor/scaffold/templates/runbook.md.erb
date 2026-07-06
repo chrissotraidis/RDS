@@ -1,0 +1,40 @@
+# <%= project_name %> — Development Runbook
+
+This document is progressively updated as each task completes. It captures the
+exact steps to run and test the application at every stage of development.
+
+## Prerequisites
+
+<% if primary_recipe["framework"] -%>
+<% primary_recipe["framework"].each do |key, value| -%>
+- **<%= key.capitalize %>:** <%= value %>
+<% end -%>
+<% end -%>
+
+## Quick Start
+
+```bash
+<% (primary_recipe.dig("verification", "setup_commands") || ["# See CLAUDE.md for setup instructions"]).each do |cmd| -%>
+<%= cmd %>
+<% end -%>
+```
+
+<% if primary_recipe.dig("verification", "boot_command") -%>
+## Starting the Application
+
+```bash
+<%= primary_recipe.dig("verification", "boot_command") %>
+```
+<% end -%>
+
+<% if primary_recipe.dig("verification", "health_checks")&.any? -%>
+## Health Checks
+
+<% primary_recipe.dig("verification", "health_checks").each do |hc| -%>
+- `<%= hc["url"] %>` — expected status <%= hc["expected_status"] || 200 %>
+<% end -%>
+<% end -%>
+
+## Task Progress
+
+<!-- Task runbook entries are appended below as tasks complete -->

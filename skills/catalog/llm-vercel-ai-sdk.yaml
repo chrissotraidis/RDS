@@ -1,0 +1,18 @@
+---
+slug: llm-vercel-ai-sdk
+name: Vercel AI SDK
+status: curated
+category: llm
+maturity: stable
+applies_to:
+- nextjs-fullstack
+- mobile-native
+description: TypeScript LLM inference through Vercel AI SDK.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: ai-sdk.dev
+  url: https://ai-sdk.dev/docs
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

@@ -1,0 +1,20 @@
+---
+slug: playwright-mcp
+name: Playwright MCP
+status: ready
+default: true
+applies_to:
+- universal
+description: Adds the RDS browser verification contract for real preview interaction.
+install:
+  command: bin/rds-skill-materialize playwright-mcp
+verify:
+  command: bin/rds-skill-verify playwright-mcp
+maturity: operational
+category: testing
+rationale: RDS needs a browser-level verifier for claims about UI behavior. This skill requires opening the generated preview, clicking through core flows, checking console output, and saving evidence.
+source_links:
+- label: Microsoft Playwright MCP
+  url: https://github.com/microsoft/playwright-mcp
+- label: Playwright
+  url: https://playwright.dev/

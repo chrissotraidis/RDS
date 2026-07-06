@@ -1,0 +1,18 @@
+---
+slug: hotwire-stimulus-generator
+name: Hotwire Stimulus generator
+status: ready
+default: false
+applies_to:
+- rails-web
+description: Rails Hotwire and Stimulus generator conventions.
+install:
+  command: bin/rds-skill-materialize hotwire-stimulus-generator
+verify:
+  command: bin/rds-skill-verify hotwire-stimulus-generator
+maturity: stable
+category: frontend
+rationale: Rails builds should use Hotwire and small Stimulus controllers for progressive interaction instead of introducing a parallel React-style frontend. This skill keeps Rails UI work server-rendered, inspectable, and testable.
+source_links:
+- label: stimulus.hotwired.dev
+  url: https://stimulus.hotwired.dev/

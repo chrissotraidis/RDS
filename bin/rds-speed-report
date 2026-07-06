@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+"""Write builds/<id>/timing.json from RDS events/log artifacts."""
+
+from __future__ import annotations
+
+import json
+import re
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def parse_ts(value: str) -> datetime | None:
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def read_json(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return {}
+
+
+def main() -> int:
+    if len(sys.argv) != 2:
+        print("usage: bin/rds-speed-report <build-id>", file=sys.stderr)
+        return 2
+
+    build_id = sys.argv[1]
+    build_dir = ROOT / "builds" / build_id
+    if not build_dir.is_dir():
+        print(f"no such build: {build_dir}", file=sys.stderr)
+        return 1
+
+    events_path = build_dir / "events.jsonl"
+    events: list[dict] = []
+    if events_path.exists():
+        for line in events_path.read_text(errors="replace").splitlines():
+            try:
+                events.append(json.loads(line))
+            except Exception:
+                pass
+
+    stage_starts: dict[str, str] = {}
+    stages: list[dict] = []
+    for event in events:
+        name = event.get("event")
+        payload = event.get("payload") or {}
+        stage = payload.get("stage")
+        ts = event.get("ts")
+        if not stage or not ts:
+            continue
+        if name == "stage_started":
+            stage_starts[stage] = ts
+        elif name in {"stage_completed", "stage_failed"} and stage in stage_starts:
+            start_dt = parse_ts(stage_starts[stage])
+            end_dt = parse_ts(ts)
+            duration = None
+            if start_dt and end_dt:
+                duration = round((end_dt - start_dt).total_seconds(), 3)
+            stages.append({
+                "stage": stage,
+                "status": "failed" if name == "stage_failed" else "done",
+                "started_at": stage_starts[stage],
+                "ended_at": ts,
+                "duration_seconds": duration,
+                "exit_code": payload.get("exit_code"),
+            })
+
+    scaffold_log = build_dir / "logs" / "scaffold.log"
+    token_reports: list[int] = []
+    codex_sessions = 0
+    if scaffold_log.exists():
+        text = scaffold_log.read_text(errors="replace")
+        codex_sessions = len(re.findall(r"OpenAI Codex v", text))
+        token_reports = [int(m.replace(",", "")) for m in re.findall(r"tokens used\n([0-9,]+)", text)]
+
+    tasks_total = None
+    task_file_candidates = [
+        build_dir / "scaffold-out" / "tasks.json",
+        Path(read_json(build_dir / "state.json").get("app_dest", "")) / "tasks.json",
+    ]
+    for path in task_file_candidates:
+        if not path.exists():
+            continue
+        data = read_json(path)
+        tasks = data.get("tasks") if isinstance(data, dict) else None
+        if isinstance(tasks, list):
+            tasks_total = len(tasks)
+            break
+
+    cost = read_json(build_dir / "cost.json") or read_json(build_dir / "state.json").get("cost", {})
+    total_seconds = sum(s["duration_seconds"] or 0 for s in stages)
+    slowest = sorted(
+        [s for s in stages if isinstance(s.get("duration_seconds"), (int, float))],
+        key=lambda s: s["duration_seconds"],
+        reverse=True,
+    )[:5]
+
+    report = {
+        "build_id": build_id,
+        "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "total_stage_seconds": round(total_seconds, 3),
+        "stages": stages,
+        "slowest_stages": slowest,
+        "scaffold": {
+            "tasks_total": tasks_total,
+            "codex_session_headers": codex_sessions,
+            "token_report_count": len(token_reports),
+            "reported_token_sum": sum(token_reports),
+            "max_reported_tokens": max(token_reports) if token_reports else None,
+            "top_reported_tokens": sorted(token_reports, reverse=True)[:10],
+        },
+        "cost": cost,
+    }
+
+    out = build_dir / "timing.json"
+    out.write_text(json.dumps(report, indent=2) + "\n")
+    print(out)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,20 @@
+---
+slug: rds-context7-mount
+name: Context7 documentation mount
+status: ready
+default: true
+applies_to:
+- universal
+description: Pins current framework documentation requirements into the build manifest so agents know which docs to mount.
+install:
+  mode: metadata
+verify:
+  command: skills/built-in/rds-context7-mount/scripts/verify.sh
+maturity: operational
+category: ai-context
+rationale: Default RDS skill because framework version drift is one of the highest-risk causes of bad generated code. It records the documentation context expected for the selected stack.
+source_links:
+- label: context7.com
+  url: https://context7.com/
+- label: github.com/upstash/context7
+  url: https://github.com/upstash/context7

@@ -1,0 +1,17 @@
+---
+slug: rsc-boundary-linter
+name: RSC boundary linter
+status: curated
+category: testing
+maturity: beta
+applies_to:
+- nextjs-fullstack
+description: Server/client component boundary checks for Next.js.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: react.dev
+  url: https://react.dev/reference/rsc/server-components
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

@@ -1,0 +1,22 @@
+---
+slug: vector-pgvector
+name: pgvector
+status: ready
+default: false
+applies_to:
+- rails-web
+- nextjs-fullstack
+- python-ai-service
+description: Adds the Postgres vector search and embedding storage contract.
+install:
+  command: bin/rds-skill-materialize vector-pgvector
+verify:
+  command: bin/rds-skill-verify vector-pgvector
+maturity: operational
+category: vector-db
+rationale: RAG and semantic search features need explicit embedding dimensions, indexing, and refresh behavior. This skill keeps vector storage grounded in Postgres when that is the stack fit.
+source_links:
+- label: pgvector
+  url: https://github.com/pgvector/pgvector
+- label: PostgreSQL Docs
+  url: https://www.postgresql.org/docs/

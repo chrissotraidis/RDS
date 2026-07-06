@@ -1,0 +1,17 @@
+---
+slug: drizzle-introspect-skill
+name: Drizzle introspect
+status: curated
+category: database
+maturity: stable
+applies_to:
+- nextjs-fullstack
+description: Drizzle schema introspection and migration conventions.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: orm.drizzle.team
+  url: https://orm.drizzle.team/docs/kit-overview
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# bin/rds-dashboard — start (or check) the RDS Hub dashboard.
+#
+# Usage:
+#   bin/rds-dashboard                  # foreground; logs to stdout
+#   bin/rds-dashboard --detach         # background; pid → /dev/shm/rds-dashboard.pid
+#   bin/rds-dashboard --status         # is it running?
+#   bin/rds-dashboard --stop           # kill the detached instance
+#   bin/rds-dashboard --install        # bun install in dashboard/
+#
+# Env:
+#   PORT                  default 4000
+#   RDS_DASHBOARD_TOKEN   required for write endpoints (POST /new, /b/:id/cmd, /b/:id/fix)
+#   RDS_ROOT              default = this repo's root
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+DASH="$ROOT/dashboard"
+PIDFILE="/dev/shm/rds-dashboard.pid"
+LOGFILE="/dev/shm/rds-dashboard.log"
+BUN="${BUN_BIN:-/root/.bun/bin/bun}"
+[[ -x "$BUN" ]] || BUN="$(command -v bun || true)"
+PORT="${PORT:-4000}"
+
+usage() {
+  sed -n '2,12p' "$0"
+}
+
+require_bun() {
+  if [[ -z "${BUN:-}" || ! -x "$BUN" ]]; then
+    echo "FATAL: bun not found. Install Bun (https://bun.sh) or set BUN_BIN." >&2
+    exit 1
+  fi
+}
+
+cmd_status() {
+  if [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+    echo "rds-dashboard: RUNNING (pid $(cat "$PIDFILE")), log $LOGFILE"
+    return 0
+  fi
+  if curl -fsS --max-time 3 "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1; then
+    listener="$(ss -ltnp "sport = :$PORT" 2>/dev/null | awk -F'pid=' 'NR>1 && $2 {split($2,a,","); print a[1]; exit}')"
+    if [[ -n "$listener" ]]; then
+      echo "rds-dashboard: RUNNING (port $PORT, pid $listener, managed service or external supervisor)"
+    else
+      echo "rds-dashboard: RUNNING (port $PORT, managed service or external supervisor)"
+    fi
+    return 0
+  fi
+  echo "rds-dashboard: not running"
+  return 1
+}
+
+cmd_stop() {
+  if [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+    pid="$(cat "$PIDFILE")"
+    kill -TERM "$pid" 2>/dev/null || true
+    for _ in 1 2 3 4 5; do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.4
+    done
+    kill -KILL "$pid" 2>/dev/null || true
+    rm -f "$PIDFILE"
+    echo "rds-dashboard: stopped (pid $pid)"
+  else
+    rm -f "$PIDFILE"
+    echo "rds-dashboard: not running"
+  fi
+}
+
+cmd_install() {
+  require_bun
+  cd "$DASH"
+  "$BUN" install
+}
+
+cmd_run() {
+  require_bun
+  if [[ ! -d "$DASH/node_modules" ]]; then
+    echo "[rds-dashboard] node_modules missing — running bun install..."
+    (cd "$DASH" && "$BUN" install)
+  fi
+  export RDS_ROOT="${RDS_ROOT:-$ROOT}"
+  cd "$DASH"
+  if [[ "${1:-}" == "--detach" ]]; then
+    if [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+      echo "rds-dashboard: already running (pid $(cat "$PIDFILE"))" >&2
+      exit 1
+    fi
+    if curl -fsS --max-time 3 "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1; then
+      listener="$(ss -ltnp "sport = :$PORT" 2>/dev/null | awk -F'pid=' 'NR>1 && $2 {split($2,a,","); print a[1]; exit}')"
+      if [[ -n "$listener" ]]; then
+        echo "rds-dashboard: already running on port $PORT (pid $listener)" >&2
+      else
+        echo "rds-dashboard: already running on port $PORT" >&2
+      fi
+      exit 0
+    fi
+    : > "$LOGFILE"
+    setsid nohup "$BUN" run src/server.ts </dev/null >>"$LOGFILE" 2>&1 &
+    echo $! > "$PIDFILE"
+    sleep 0.6
+    if ! kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+      echo "rds-dashboard: failed to start — see $LOGFILE" >&2
+      tail -20 "$LOGFILE" >&2 || true
+      rm -f "$PIDFILE"
+      exit 1
+    fi
+    echo "rds-dashboard: started (pid $(cat "$PIDFILE"), port ${PORT:-4000}, log $LOGFILE)"
+    [[ -n "${RDS_DASHBOARD_TOKEN:-}" ]] || echo "  WARN: RDS_DASHBOARD_TOKEN unset — write endpoints will return 503"
+  else
+    exec "$BUN" run src/server.ts
+  fi
+}
+
+case "${1:-}" in
+  ""|--detach) cmd_run "${1:-}" ;;
+  --status)    cmd_status ;;
+  --stop)      cmd_stop ;;
+  --install)   cmd_install ;;
+  -h|--help)   usage ;;
+  *)           usage; exit 1 ;;
+esac

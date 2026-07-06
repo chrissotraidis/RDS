@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+RDS_ROOT="$ROOT"
+source "$ROOT/bin/lib/common.sh"
+source "$ROOT/bin/lib/agents.sh"
+ID="${1:-}"
+CONFIRM="$(parse_flag --confirm "$@" || echo "")"
+[[ -n "$ID" ]] || { echo "usage: bin/rds-agent-discard <session-id> --confirm=DISCARD" >&2; exit 2; }
+[[ "$CONFIRM" == "DISCARD" ]] || { echo "FATAL: discard requires --confirm=DISCARD" >&2; exit 2; }
+JSON_PATH="$(agent_find_session_json "$ID")" || { echo "No agent session named $ID" >&2; exit 1; }
+"$ROOT/bin/rds-agent-stop" "$ID" >/dev/null 2>&1 || true
+WORKTREE="$(agent_json_get "$JSON_PATH" '.worktree_path')"
+git -C "$(agent_json_get "$JSON_PATH" '.repo_root')" worktree remove --force "$WORKTREE" 2>/dev/null || rm -rf "$WORKTREE"
+agent_update_json "$JSON_PATH" --arg now "$(agent_now)" '.status = "discarded" | .updated_at = $now'
+echo "discarded $ID"
+

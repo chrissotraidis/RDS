@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""Classify build complexity and emit a proportional execution plan."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+from pathlib import Path
+from typing import Any
+
+LEVELS = {
+    "tiny": {"max_tasks": 3, "task_timeout_sec": 420, "claude_max_turns": 70, "claude_budget_usd": 1.00, "qa_max_pages": 6, "qa_depth": 1, "target_minutes": "5-15"},
+    "simple": {"max_tasks": 5, "task_timeout_sec": 600, "claude_max_turns": 120, "claude_budget_usd": 2.00, "qa_max_pages": 12, "qa_depth": 2, "target_minutes": "15-30"},
+    "standard": {"max_tasks": 10, "task_timeout_sec": 900, "claude_max_turns": 160, "claude_budget_usd": 3.00, "qa_max_pages": 25, "qa_depth": 2, "target_minutes": "30-90"},
+    "complex": {"max_tasks": 16, "task_timeout_sec": 1200, "claude_max_turns": 220, "claude_budget_usd": 5.00, "qa_max_pages": 40, "qa_depth": 3, "target_minutes": "90+"},
+}
+
+STACK_CAPS = {
+    "react": {"tiny": 3, "simple": 5, "standard": 8, "complex": 10},
+    "rails": {"tiny": 5, "simple": 8, "standard": 12, "complex": 16},
+}
+
+TINY_GAME_WORDS = {"pong", "snake", "tetris", "breakout", "asteroids", "flappy", "2048", "tic tac toe", "minesweeper", "missile command", "space invaders"}
+SIMPLE_APP_WORDS = {"todo", "to-do", "calculator", "timer", "stopwatch", "counter", "kanban", "notes", "flashcards", "pomodoro", "landing page"}
+COMPLEX_WORDS = {"multi-tenant", "billing", "subscription", "stripe", "oauth", "sso", "roles", "permissions", "admin", "database", "postgres", "api", "webhook", "background job", "queue", "analytics", "dashboard", "crm", "auth", "login", "signup", "email", "notion", "slack", "calendar", "integration", "upload", "payments", "teams"}
+
+
+def count_matches(text: str, words: set[str]) -> list[str]:
+    return sorted(word for word in words if re.search(rf"\b{re.escape(word)}\b", text))
+
+
+def infer_level(text: str, stack: str, app_type: str = "auto") -> tuple[str, list[str], list[str], list[str]]:
+    lower = text.lower()
+    reasons: list[str] = []
+    questions: list[str] = []
+    risks: list[str] = []
+    tiny_hits = count_matches(lower, TINY_GAME_WORDS)
+    simple_hits = count_matches(lower, SIMPLE_APP_WORDS)
+    complex_hits = count_matches(lower, COMPLEX_WORDS)
+    if app_type == "game":
+        complex_hits = [hit for hit in complex_hits if hit not in {"api", "analytics", "dashboard"}]
+    word_count = len(re.findall(r"[a-z0-9]+", lower))
+    heading_count = len(re.findall(r"^#{1,3}\s+", text, flags=re.MULTILINE))
+    checkbox_count = len(re.findall(r"^\s*[-*]\s+\[[ xX]\]", text, flags=re.MULTILINE))
+
+    if app_type != "auto":
+        reasons.append(f"explicit app_type={app_type}")
+    if tiny_hits:
+        reasons.append(f"recognized small game pattern: {', '.join(tiny_hits[:3])}")
+    if simple_hits:
+        reasons.append(f"recognized small app pattern: {', '.join(simple_hits[:3])}")
+    if complex_hits:
+        reasons.append(f"complexity signals: {', '.join(complex_hits[:5])}")
+    reasons.append(f"{'short' if word_count < 450 else 'large' if word_count > 2500 else 'medium'} spec ({word_count} words)")
+    if heading_count > 12 or checkbox_count > 20:
+        reasons.append("many sections or checklist requirements")
+
+    if complex_hits and (tiny_hits or simple_hits):
+        questions.append("Spec mixes small app/game and complex app signals; confirm whether advanced auth/data/integration requirements are in scope.")
+
+    score = 0
+    score += 3 if tiny_hits else 0
+    score += 2 if simple_hits else 0
+    score -= min(8, len(complex_hits) * 2)
+    score += 1 if word_count < 800 else 0
+    score -= 2 if word_count > 1800 else 0
+    score -= 2 if heading_count > 12 else 0
+    score -= 2 if checkbox_count > 20 else 0
+    if app_type == "game" and stack == "react" and not complex_hits:
+        score += 3
+    if app_type in {"website", "prototype", "hack"} and stack == "react" and not complex_hits:
+        score += 2
+    if app_type in {"dashboard", "internal-tool"}:
+        score -= 1
+    if stack == "react" and (tiny_hits or simple_hits) and not complex_hits:
+        score += 2
+
+    if score >= 5:
+        level = "tiny"
+    elif score >= 2:
+        level = "simple"
+    elif score >= -3:
+        level = "standard"
+    else:
+        level = "complex"
+
+    if app_type == "game" and word_count > 2500 and level in {"tiny", "simple"}:
+        level = "standard"
+        reasons.append("large game spec promoted to standard budget floor")
+
+    if "react native" in lower or "expo" in lower:
+        risks.append("React Native/Expo language detected; React + Vite can only produce a browser/web version today.")
+    if stack == "react" and any(w in lower for w in ["database", "postgres", "auth", "login", "server"]):
+        risks.append("React stack selected with backend-like requirements; verify the stack choice before running a long build.")
+
+    return level, reasons, questions, risks
+
+
+def build_plan(spec_path: Path, stack: str, provider: str, app_type: str) -> dict[str, Any]:
+    text = spec_path.read_text(encoding="utf-8", errors="replace")
+    level, reasons, questions, risks = infer_level(text, stack, app_type)
+    base = dict(LEVELS[level])
+    if level in STACK_CAPS.get(stack, {}):
+        base["max_tasks"] = min(int(base["max_tasks"]), int(STACK_CAPS[stack][level]))
+    timeout_label = "codex_task_timeout_sec" if provider == "codex" else "claude_task_timeout_sec"
+    return {
+        "schema_version": 1,
+        "profile": level,
+        "profile_name": {"tiny": "Tiny", "simple": "Simple", "standard": "Standard", "complex": "Complex"}[level],
+        "stack": stack,
+        "provider": provider,
+        "app_type": app_type,
+        "spec_path": str(spec_path),
+        "max_tasks": base["max_tasks"],
+        "task_timeout_sec": base["task_timeout_sec"],
+        timeout_label: base["task_timeout_sec"],
+        "claude_max_turns": base["claude_max_turns"],
+        "claude_budget_usd": base["claude_budget_usd"],
+        "qa_max_pages": base["qa_max_pages"],
+        "qa_depth": base["qa_depth"],
+        "target_minutes": base["target_minutes"],
+        "reasons": reasons,
+        "operator_questions": questions,
+        "risks": risks,
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--spec", required=True)
+    parser.add_argument("--stack", required=True)
+    parser.add_argument("--provider", default="claude", choices=["claude", "codex"])
+    parser.add_argument("--app-type", default="auto", choices=["auto", "game", "website", "web-app", "dashboard", "internal-tool", "prototype", "hack"])
+    parser.add_argument("--out")
+    args = parser.parse_args()
+    spec_path = Path(args.spec).resolve()
+    if not spec_path.exists():
+        raise SystemExit(f"FATAL: spec not found: {spec_path}")
+    payload = json.dumps(build_plan(spec_path, args.stack, args.provider, args.app_type), indent=2) + "\n"
+    if args.out:
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(payload, encoding="utf-8")
+    print(payload, end="")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

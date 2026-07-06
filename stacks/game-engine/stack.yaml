@@ -1,0 +1,58 @@
+---
+slug: game-engine
+runtime_id: game-engine
+name: Game engine project
+description: Playable browser game stack with deterministic HTML5 canvas preview,
+  gameplay spec, scene reference, tests, and static export. Godot-native export is
+  documented as the follow-on runtime when Godot is available.
+category: game
+v1_status: ship
+priority: 7
+language:
+  primary: typescript
+framework:
+  name: html5-canvas-game
+  version: '1'
+scaffold:
+  command: stacks/game-engine/init.sh
+commands:
+  install: bun install
+  run: bun server.ts
+  test: bun test
+  doctor: stacks/game-engine/doctor.sh
+ports:
+  range:
+  - 4000
+  - 4099
+health_path: "/health.json"
+deploy:
+  preview_on_zo: durable-zo-http-service
+  default_external: itch-html5
+mockup_analog:
+  primary: gameplay-spec
+public_preview_model:
+  type: live-html
+compatible_skills:
+  primary:
+  - browser-game-product-quality
+  - testing-vitest-playwright
+  - playwright-canvas-snapshot
+  universal:
+  - rds-context7-mount
+  - rds-mockup-fidelity
+  - rds-secrets-broker
+  - rds-eval-harness
+  - playwright-mcp
+agent_notes:
+  primary: claude-code
+  codex_role: Tight game-loop, collision, and test repair loops.
+failure_modes:
+- id: missing-godot-runtime
+  summary: Godot 4.6 is the long-term target but is not installed on the current Zo
+    image.
+  mitigation: Do not resolve Godot skills by default for browser-game builds. Ship
+    the HTML5 canvas preview stack with browser-game quality skills now; move to
+    Godot export only when the binary and templates are provisioned.
+- id: unplayable-preview
+  summary: A game build can compile but lack input, reset, scoring, or failure states.
+  mitigation: Preserve tests and the GAMEPLAY_SPEC acceptance checklist.

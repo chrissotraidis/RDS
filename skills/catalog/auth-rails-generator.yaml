@@ -1,0 +1,17 @@
+---
+slug: auth-rails-generator
+name: Rails authentication generator
+status: curated
+category: auth
+maturity: stable
+applies_to:
+- rails-web
+description: Rails authentication scaffold using the framework generator path.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: guides.rubyonrails.org
+  url: https://guides.rubyonrails.org/security.html
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

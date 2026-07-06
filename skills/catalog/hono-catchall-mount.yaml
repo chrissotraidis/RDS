@@ -1,0 +1,17 @@
+---
+slug: hono-catchall-mount
+name: Hono catch-all mount
+status: curated
+category: api
+maturity: stable
+applies_to:
+- astro-thin-web
+description: Hono API mount for Astro hybrid sites.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: hono.dev
+  url: https://hono.dev/docs/
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

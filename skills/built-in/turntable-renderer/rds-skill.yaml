@@ -1,0 +1,20 @@
+---
+slug: turntable-renderer
+name: Turntable renderer
+status: ready
+default: false
+applies_to:
+- game-asset-pipeline
+description: Generated asset turntable preview renders.
+install:
+  command: bin/rds-skill-materialize turntable-renderer
+verify:
+  command: bin/rds-skill-verify turntable-renderer
+maturity: beta
+category: asset-pipeline
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should
+  understand during stack selection, skill resolution, implementation guidance, or
+  verification.
+source_links:
+- label: docs.blender.org
+  url: https://docs.blender.org/api/current/

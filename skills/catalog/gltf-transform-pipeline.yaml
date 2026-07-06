@@ -1,0 +1,17 @@
+---
+slug: gltf-transform-pipeline
+name: glTF transform pipeline
+status: curated
+category: asset-pipeline
+maturity: stable
+applies_to:
+- web-3d
+description: glTF optimization and compression pipeline.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: gltf-transform.dev
+  url: https://gltf-transform.dev/
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

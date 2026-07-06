@@ -1,0 +1,44 @@
+{
+  "id": "react",
+  "name": "React + Vite",
+  "language": "typescript",
+  "runtime": {
+    "bun": ">=1.1.0",
+    "node": ">=20"
+  },
+  "framework": {
+    "name": "react",
+    "version": "19"
+  },
+  "database": "none",
+  "default_port_range": [
+    4000,
+    4099
+  ],
+  "health_path": "/",
+  "stages": [
+    "intake",
+    "spec",
+    "init",
+    "scaffold",
+    "local-run",
+    "deploy",
+    "qa"
+  ],
+  "init": "stacks/react/init.sh",
+  "local_run": "stacks/react/local-run.sh",
+  "doctor": "stacks/react/doctor.sh",
+  "scaffold_recipe": "react_web",
+  "scaffold_max_tasks": 10,
+  "service_entrypoint": "bash -c 'bun install --frozen-lockfile || bun install; exec bunx --bun vite --host 0.0.0.0 --port %(ENV_PORT)s --strictPort'",
+  "service_env": {
+    "NODE_ENV": "development",
+    "VITE_RDS_RUNTIME": "zo"
+  },
+  "supports_modes": [
+    "green",
+    "brown"
+  ],
+  "status": "defer",
+  "notes": "Deferred V1 stack. Retained for legacy V0 React builds and explicit Vite-only requests; nextjs-fullstack is the modern-web default."
+}

@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# bin/rds-reject <build-id> --reason=<text> [--by=<name>] — operator rejection (TD-033).
+#
+# Marks state.json.review = rejected and emits a `build_rejected` event.
+# Reason is required so the audit trail is meaningful.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck disable=SC1091
+source "$ROOT/bin/lib/common.sh"
+# shellcheck disable=SC1091
+source "$ROOT/bin/lib/state.sh"
+
+BUILD_ID="${1:-}"
+if [[ -z "$BUILD_ID" || "$BUILD_ID" == --* ]]; then
+  echo "Usage: bin/rds-reject <build-id> --reason=<text> [--by=<name>]" >&2
+  exit 1
+fi
+shift || true
+
+BY="$(parse_flag --by "$@" || echo "${RDS_OPERATOR:-operator}")"
+REASON="$(parse_flag --reason "$@" || echo "")"
+if [[ -z "$REASON" ]]; then
+  echo "FATAL: --reason=<text> is required when rejecting." >&2
+  exit 1
+fi
+
+BUILD_DIR="$RDS_BUILDS_DIR/$BUILD_ID"
+[[ -f "$BUILD_DIR/state.json" ]] || { echo "FATAL: no state.json for $BUILD_ID" >&2; exit 1; }
+
+state_set_review "$BUILD_DIR" rejected "$BY" "$REASON"
+"$ROOT/bin/rds-event" build_rejected \
+  --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+  decided_by="$BY" reason="$REASON" \
+  >/dev/null 2>&1 || true
+
+if [[ "${RDS_NOTIFY_ON_REVIEW:-1}" -eq 1 ]]; then
+  "$ROOT/bin/rds-notify" build_rejected \
+    --build-id "$BUILD_ID" \
+    --build-dir "$BUILD_DIR" \
+    >/dev/null 2>&1 || true
+fi
+
+echo "[rds-reject] $BUILD_ID rejected by $BY: $REASON"
+exit 0

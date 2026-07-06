@@ -1,0 +1,17 @@
+---
+slug: react-native-reanimated-helpers
+name: React Native Reanimated helpers
+status: curated
+category: mobile
+maturity: stable
+applies_to:
+- mobile-native
+description: Reanimated animation helper conventions.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: docs.swmansion.com
+  url: https://docs.swmansion.com/react-native-reanimated/
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

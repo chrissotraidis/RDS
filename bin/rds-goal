@@ -1,0 +1,757 @@
+#!/usr/bin/env python3
+"""Run a bounded evidence-driven RDS goal loop for one build."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import traceback
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+TERMINAL_VERDICTS = {"pending_review", "approved"}
+PRODUCT_BLOCKER_CLASSES = {"product_quality", "skill_impact", "design", "taste"}
+EVIDENCE_BLOCKER_CLASSES = {"missing_or_stale_evidence", "deploy_truth", "runtime", "stage_state"}
+SOURCE_CONTEXT_FILES = [
+    ("original PRD/source", "prd_source"),
+    ("generated implementation spec", "spec.md"),
+    ("research brief", "research.md"),
+    ("taste brief", "taste-brief.md"),
+    ("QA scenario contract", "qa-scenarios.md"),
+    ("product-owner questions", "po-questions.md"),
+]
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def read_text(path: Path, limit: int = 1_000_000) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="ignore")[:limit]
+    except Exception:
+        return ""
+
+
+def read_json(path: Path) -> Any:
+    try:
+        return json.loads(read_text(path))
+    except Exception:
+        return None
+
+
+def write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def run_cmd(root: Path, args: list[str], log: Path, env: dict[str, str], dry_run: bool = False, stdin: str | None = None) -> int:
+    log.parent.mkdir(parents=True, exist_ok=True)
+    if dry_run:
+        log.write_text("[rds-goal] dry-run: " + " ".join(args) + "\n", encoding="utf-8")
+        return 0
+    with log.open("w", encoding="utf-8") as fh:
+        fh.write(f"[rds-goal] {now_iso()} cwd={root}\n")
+        fh.write("[rds-goal] command=" + " ".join(args) + "\n\n")
+        fh.flush()
+        timeout = float(env.get("RDS_GOAL_ACTION_TIMEOUT_SEC", "3600"))
+        try:
+            proc = subprocess.run(args, cwd=root, input=stdin, text=True, stdout=fh, stderr=subprocess.STDOUT, env=env, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            fh.write(f"\n[rds-goal] action timed out after {timeout:.0f}s\n")
+            fh.flush()
+            return 124
+    return int(proc.returncode)
+
+
+def event(root: Path, build_id: str, name: str, **fields: Any) -> None:
+    cmd = root / "bin" / "rds-event"
+    build_dir = root / "builds" / build_id
+    if not cmd.exists():
+        return
+    args = [str(cmd), name, "--build-id", build_id, "--build-dir", str(build_dir)]
+    for key, value in fields.items():
+        if value is None:
+            continue
+        args.append(f"{key}={value}")
+    subprocess.run(args, cwd=root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def refresh_evidence(root: Path, build_id: str, goal_dir: Path, env: dict[str, str], dry_run: bool = False) -> None:
+    for name in ("rds-quality-ledger", "rds-readiness", "rds-evidence-ledger"):
+        cmd = root / "bin" / name
+        if cmd.exists():
+            run_cmd(root, [str(cmd), build_id], goal_dir / f"{name}.log", env, dry_run=dry_run)
+
+
+def compact_blockers(ledger: dict[str, Any], limit: int = 8) -> list[dict[str, Any]]:
+    blockers = ledger.get("blockers") if isinstance(ledger.get("blockers"), list) else []
+    out: list[dict[str, Any]] = []
+    for item in blockers[:limit]:
+        if not isinstance(item, dict):
+            continue
+        out.append({
+            "code": item.get("code"),
+            "stage": item.get("stage"),
+            "severity": item.get("severity"),
+            "detail": item.get("detail") or item.get("message") or item.get("evidence"),
+            "recovery": item.get("recovery"),
+            "path": item.get("path"),
+        })
+    return out
+
+
+def blocker_signature(ledger: dict[str, Any]) -> str:
+    summary = ledger.get("summary") if isinstance(ledger.get("summary"), dict) else {}
+    blockers = compact_blockers(ledger, limit=8)
+    parts = [str(summary.get("blockerClass") or "unknown")]
+    for blocker in blockers:
+        parts.append("|".join(str(blocker.get(key) or "") for key in ("code", "stage", "path", "recovery")))
+    return " :: ".join(parts)
+
+
+def latest_iteration_artifacts(build_dir: Path) -> dict[str, str]:
+    summaries = sorted(build_dir.glob("iterate-*.summary.json"))
+    jobs = sorted(build_dir.glob("iterate-*.repair-jobs.json"))
+    convergence = sorted(build_dir.glob("iterate-*.repair-convergence.json"))
+    return {
+        "summary": f"builds/{build_dir.name}/{summaries[-1].name}" if summaries else "",
+        "repairJobs": f"builds/{build_dir.name}/{jobs[-1].name}" if jobs else "",
+        "convergence": f"builds/{build_dir.name}/{convergence[-1].name}" if convergence else "",
+    }
+
+
+def sync_goal_nodes(payload: dict[str, Any]) -> None:
+    status = str(payload.get("status") or "unknown")
+    phase = str(payload.get("phase") or "")
+    nodes = payload.get("nodes")
+    if not isinstance(nodes, list):
+        return
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        node_id = node.get("id")
+        if node_id == "goal":
+            node["status"] = status
+        elif node_id == "operator" and status in {"passed", "needs_review"}:
+            node["status"] = "ready"
+        elif node_id == "agent-review" and phase == "cycle_cap" and not payload.get("agentReviewCount"):
+            node["status"] = "skipped"
+
+
+def resolve_source_path(build_dir: Path, state: dict[str, Any], key_or_file: str) -> Path | None:
+    if key_or_file == "prd_source":
+        raw = str(state.get("prd_source") or state.get("trigger") or "")
+        if raw.startswith("/"):
+            path = Path(raw)
+        elif raw and not re.match(r"^[a-z]+://", raw):
+            path = build_dir.parent.parent / raw
+        else:
+            return None
+    else:
+        path = build_dir / key_or_file
+    try:
+        return path.resolve() if path.exists() and path.is_file() else None
+    except Exception:
+        return None
+
+
+def latest_qa_path(build_dir: Path, filename: str) -> Path | None:
+    root = build_dir / "playwright"
+    if not root.exists():
+        return None
+    iters = sorted(path for path in root.glob("iter-*") if path.is_dir())
+    for path in reversed(iters):
+        candidate = path / filename
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def source_context_markdown(build_dir: Path, state: dict[str, Any]) -> str:
+    sections: list[str] = []
+    seen: set[Path] = set()
+    for label, key_or_file in SOURCE_CONTEXT_FILES:
+        path = resolve_source_path(build_dir, state, key_or_file)
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        text = read_text(path, limit=18_000).strip()
+        if not text:
+            continue
+        sections.append(f"## {label}\n\nPath: `{path}`\n\n{text}")
+    for label, path in [
+        ("latest PRD coverage verdict", latest_qa_path(build_dir, "prd-coverage-verdict.json")),
+        ("latest persona verdict", latest_qa_path(build_dir, "persona-verdict.json")),
+        ("latest workflow verdict", latest_qa_path(build_dir, "workflow-verdict.json")),
+        ("latest truthfulness verdict", latest_qa_path(build_dir, "truthfulness-verdict.json")),
+        ("latest scenario verdict", latest_qa_path(build_dir, "scenario-verdict.json")),
+        ("latest repair convergence", sorted(build_dir.glob("iterate-*.repair-convergence.json"))[-1] if sorted(build_dir.glob("iterate-*.repair-convergence.json")) else None),
+    ]:
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        text = read_text(path, limit=16_000).strip()
+        if text:
+            sections.append(f"## {label}\n\nPath: `{path}`\n\n```json\n{text}\n```")
+    return "\n\n---\n\n".join(sections)
+
+
+def iteration_prompt(objective: str, ledger: dict[str, Any], build_dir: Path, state: dict[str, Any], repeated: bool, repeat_count: int) -> str:
+    summary = ledger.get("summary") if isinstance(ledger.get("summary"), dict) else {}
+    blockers = compact_blockers(ledger, limit=12)
+    source_context = source_context_markdown(build_dir, state)
+    return "\n".join([
+        f"RDS goal objective: {objective}",
+        "",
+        "Work only inside the generated app. Do not edit RDS itself.",
+        "Keep building until the app is genuinely review-ready. Re-read the PRD/spec/context below before editing.",
+        "Prioritize truthfulness, PRD route/action coverage, persona workflows, workflow behavior, design/taste, and skill efficacy before cosmetic polish.",
+        "If a blocker survived a previous attempt, do not repeat the same superficial edit. Implement the missing route/action/state/workflow or disclosure that the PRD and evidence actually require.",
+        "After changes, leave the app in a state that RDS QA can verify.",
+        "",
+        f"Repeated blocker signature: {'yes' if repeated else 'no'}",
+        f"Repeat count for current blocker signature: {repeat_count}",
+        "",
+        "Current RDS truth:",
+        json.dumps({
+            "verdict": ledger.get("verdict"),
+            "blockerClass": summary.get("blockerClass"),
+            "nextAction": summary.get("nextAction"),
+            "blockers": blockers,
+        }, indent=2),
+        "",
+        "First-party PRD/spec/evidence context:",
+        source_context or "No source context files were available; rely on current evidence artifacts.",
+    ])
+
+
+def normalize_provider(value: str) -> str:
+    """Normalize an operator/provider string to the state form: 'claude' or 'codex' (or '' if unset)."""
+    token = (value or "").strip().lower()
+    if token in {"claude", "claude-code", "claude_code"}:
+        return "claude"
+    if token == "codex":
+        return "codex"
+    return ""
+
+
+def agent_provider_name(state_provider: str) -> str:
+    """Map a state provider ('claude'/'codex') to the rds-agent-start provider flag."""
+    return "claude-code" if state_provider == "claude" else "codex"
+
+
+def apply_engine_override(state: dict[str, Any], state_path: Path, provider: str, model: str) -> dict[str, str]:
+    """Persist an operator-chosen provider/model onto state.inference and return env overrides for child runs.
+
+    The repair tools (rds-iterate/rds-fix) and rds-infer read state.inference first, so pinning here makes
+    every downstream action use the chosen engine. We also return env so escalation workers honor the model.
+    """
+    pinned = normalize_provider(provider)
+    model = (model or "").strip()
+    if not pinned and not model:
+        return {}
+    inference = state.get("inference") if isinstance(state.get("inference"), dict) else {}
+    target = pinned or normalize_provider(str(inference.get("provider") or "")) or "claude"
+    if pinned:
+        inference["provider"] = target
+    if model:
+        inference["claude_model" if target == "claude" else "codex_model"] = model
+    state["inference"] = inference
+    # Persist so a resumed/continued goal keeps the chosen engine.
+    try:
+        existing = read_json(state_path)
+        if isinstance(existing, dict):
+            existing["inference"] = inference
+            write_json(state_path, existing)
+    except Exception:
+        pass
+    env_overrides: dict[str, str] = {}
+    if pinned:
+        env_overrides["RDS_INFERENCE_PROVIDER"] = target
+    chosen_model = inference.get("claude_model") if target == "claude" else inference.get("codex_model")
+    if isinstance(chosen_model, str) and chosen_model:
+        env_overrides["RDS_CLAUDE_MODEL" if target == "claude" else "RDS_CODEX_MODEL"] = chosen_model
+    return env_overrides
+
+
+def alternate_provider(state: dict[str, Any]) -> str:
+    provider = (((state.get("inference") or {}).get("provider")) or "").lower()
+    if provider == "codex":
+        return "claude-code"
+    return "codex"
+
+
+def active_state_provider(state: dict[str, Any]) -> str:
+    """Current inference provider in state form ('claude'/'codex'), defaulting to 'claude'."""
+    return normalize_provider(str((state.get("inference") or {}).get("provider") or "")) or "claude"
+
+
+def other_provider(provider: str) -> str:
+    """The opposite state-form provider."""
+    return "codex" if normalize_provider(provider) == "claude" else "claude"
+
+
+def provider_cli_available(provider: str) -> bool:
+    """Whether the CLI for a state-form provider ('claude'/'codex') is on PATH."""
+    cli = "claude" if normalize_provider(provider) == "claude" else "codex"
+    return shutil.which(cli) is not None
+
+
+def detect_usage_limit(text: str) -> bool:
+    """Mirror rds-fix's deterministic_provider_limit_recovery signature.
+
+    A provider usage/quota exhaustion is reported as a "usage limit" message paired with a
+    "try again at" window or a "purchase more credits" upsell. Matching both halves keeps this
+    from firing on unrelated text that merely mentions a limit.
+    """
+    low = (text or "").lower()
+    if "usage limit" not in low:
+        return False
+    return ("try again at" in low) or ("purchase more credits" in low)
+
+
+def cycle_provider_log_text(build_dir: Path, cycle_log: Path) -> str:
+    """Collect the text a usage-limit may surface in for one goal cycle.
+
+    rds-fix writes its provider output inline, but rds-iterate redirects the provider apply to
+    builds/<id>/iterate-<ts>.apply.log and only leaves a FATAL pointer in the cycle log, so the
+    quota message lives in that artifact rather than the cycle log itself. Scan both.
+    """
+    parts = [read_text(cycle_log, limit=200_000)]
+    candidates: list[Path] = []
+    candidates += list(build_dir.glob("iterate-*.apply.log"))
+    candidates += list(build_dir.glob("fixer-apply-*.log"))
+    candidates += list(build_dir.glob("fixer-*.md"))
+    fresh = [p for p in candidates if p.exists() and p.stat().st_mtime >= (cycle_log.stat().st_mtime - 5 if cycle_log.exists() else 0)]
+    for path in sorted(fresh, key=lambda p: p.stat().st_mtime)[-3:]:
+        parts.append(read_text(path, limit=200_000))
+    return "\n".join(parts)
+
+
+def parse_session_id(text: str) -> str:
+    match = re.search(r"^session_id=(\S+)", text, flags=re.MULTILINE)
+    return match.group(1) if match else ""
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Run a bounded RDS goal loop for one build.")
+    parser.add_argument("build_id")
+    parser.add_argument("--root", default=str(Path(__file__).resolve().parents[1]))
+    parser.add_argument("--objective", default="Make this build review-ready.")
+    parser.add_argument("--max-cycles", type=int, default=int(os.environ.get("RDS_GOAL_MAX_CYCLES", "12")))
+    parser.add_argument("--max-agent-reviews", type=int, default=int(os.environ.get("RDS_GOAL_MAX_AGENT_REVIEWS", "2")))
+    parser.add_argument("--max-minutes", type=float, default=float(os.environ.get("RDS_GOAL_MAX_MINUTES", "240")))
+    parser.add_argument("--no-agent-review", action="store_true")
+    parser.add_argument("--provider", default="", help="Pin the inference provider for this goal (claude or codex). Persists to state.inference.")
+    parser.add_argument("--model", default="", help="Pin the provider model for this goal (e.g. claude-opus-4-7). Persists to the provider's model field in state.inference.")
+    parser.add_argument("--fresh", action="store_true", help="Start a new goal directory instead of resuming build goal.json.")
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+
+    root = Path(args.root).resolve()
+    build_dir = root / "builds" / args.build_id
+    state_path = build_dir / "state.json"
+    if not state_path.exists():
+        print(f"FATAL: build not found: {args.build_id}", file=sys.stderr)
+        return 2
+
+    goal_file = build_dir / "goal.json"
+    previous = read_json(goal_file)
+    resume_existing = isinstance(previous, dict) and not args.fresh and previous.get("status") not in {"passed", "approved"}
+    if resume_existing and isinstance(previous.get("goalDir"), str):
+        goal_dir = root / str(previous["goalDir"])
+    else:
+        goal_dir = build_dir / "goals" / datetime.now(timezone.utc).strftime("goal-%Y%m%d-%H%M%S")
+    goal_dir.mkdir(parents=True, exist_ok=True)
+    env = {**os.environ, "RDS_NOTIFY_DISABLED": "1", "RDS_ZO_REUSE_EXISTING": "1"}
+
+    state = read_json(state_path)
+    if not isinstance(state, dict):
+        print("FATAL: invalid state.json", file=sys.stderr)
+        return 2
+
+    engine_env = apply_engine_override(state, state_path, args.provider, args.model)
+    env.update(engine_env)
+    pinned_provider = normalize_provider(args.provider)
+    pinned_model = (args.model or "").strip()
+
+    payload: dict[str, Any] = previous if resume_existing else {
+        "schema": "rds.goal.v1",
+        "buildId": args.build_id,
+        "objective": args.objective,
+        "status": "running",
+        "phase": "starting",
+        "startedAt": now_iso(),
+        "updatedAt": now_iso(),
+        "maxCycles": args.max_cycles,
+        "maxAgentReviews": 0 if args.no_agent_review else args.max_agent_reviews,
+        "maxMinutes": args.max_minutes,
+        "cycle": 0,
+        "agentReviewCount": 0,
+        "goalDir": f"builds/{args.build_id}/goals/{goal_dir.name}",
+        "currentAction": None,
+        "nextAction": "Refresh evidence and choose the first bounded action.",
+        "nodes": [
+            {"id": "goal", "label": "Goal", "status": "running"},
+            {"id": "evidence", "label": "Evidence", "status": "pending"},
+            {"id": "repair", "label": "Repair loop", "status": "pending"},
+            {"id": "agent-review", "label": "Claude/Codex worker review", "status": "pending"},
+            {"id": "operator", "label": "Operator review", "status": "pending"},
+        ],
+        "edges": [
+            {"from": "goal", "to": "evidence"},
+            {"from": "evidence", "to": "repair"},
+            {"from": "repair", "to": "evidence"},
+            {"from": "repair", "to": "agent-review"},
+            {"from": "evidence", "to": "operator"},
+        ],
+        "actions": [],
+        "blockerSignatures": [],
+        "turns": [],
+    }
+    payload["status"] = "running"
+    payload["phase"] = "resuming" if resume_existing else "starting"
+    previous_objective = str(payload.get("objective") or "")
+    next_objective = args.objective or previous_objective or "Make this build review-ready."
+    if resume_existing and previous_objective and next_objective != previous_objective:
+        history = payload.get("objectiveHistory") if isinstance(payload.get("objectiveHistory"), list) else []
+        history.append({"at": now_iso(), "from": previous_objective, "to": next_objective})
+        payload["objectiveHistory"] = history[-20:]
+    payload["objective"] = next_objective
+    payload["maxCycles"] = max(int(payload.get("maxCycles") or 0), args.max_cycles)
+    payload["maxAgentReviews"] = max(int(payload.get("maxAgentReviews") or 0), 0 if args.no_agent_review else args.max_agent_reviews)
+    payload["maxMinutes"] = max(float(payload.get("maxMinutes") or 0), args.max_minutes)
+    payload["goalDir"] = f"builds/{args.build_id}/goals/{goal_dir.name}"
+    payload.setdefault("actions", [])
+    payload.setdefault("turns", [])
+    payload.setdefault("blockerSignatures", [])
+    if resume_existing:
+        payload["resumeCount"] = int(payload.get("resumeCount") or 0) + 1
+        payload["resumedAt"] = now_iso()
+    else:
+        payload.setdefault("resumeCount", 0)
+    if pinned_provider or pinned_model:
+        active_provider = pinned_provider or normalize_provider(str((state.get("inference") or {}).get("provider") or "")) or "claude"
+        active_model = pinned_model or str((state.get("inference") or {}).get("claude_model" if active_provider == "claude" else "codex_model") or "")
+        payload["engine"] = {
+            "provider": active_provider,
+            "model": active_model,
+            "pinned": True,
+            "pinnedAt": now_iso(),
+        }
+    payload["updatedAt"] = now_iso()
+    write_json(goal_file, payload)
+    event(root, args.build_id, "goal_started" if not resume_existing else "goal_resumed", objective=payload["objective"], goal=payload["goalDir"])
+
+    final_rc = 0
+    provider_limit_fallback_enabled = os.environ.get("RDS_GOAL_PROVIDER_LIMIT_FALLBACK", "1") == "1"
+    exhausted_providers: set[str] = {normalize_provider(p) for p in (payload.get("exhaustedProviders") or []) if normalize_provider(p)}
+    provider_switched_due_to_limit = False
+    try:
+        started = time.time()
+        start_cycle = int(payload.get("cycle") or 0)
+        max_cycles = int(payload["maxCycles"])
+        for cycle in range(start_cycle, max_cycles):
+            elapsed_minutes = (time.time() - started) / 60
+            if elapsed_minutes > float(payload["maxMinutes"]):
+                payload.update({
+                    "status": "needs_review",
+                    "phase": "budget_stop",
+                    "nextAction": "Goal time budget expired. Continue the goal when more runtime budget is available.",
+                })
+                final_rc = 1
+                break
+
+            turn_no = len(payload.get("turns") or []) + 1
+            turn_file = goal_dir / f"turn-{turn_no:03d}.json"
+            payload["cycle"] = cycle
+            payload["phase"] = "evidence"
+            payload["currentAction"] = "Refreshing readiness, quality, and evidence ledgers."
+            payload["updatedAt"] = now_iso()
+            payload["nodes"][1]["status"] = "running"
+            write_json(goal_file, payload)
+            refresh_evidence(root, args.build_id, goal_dir, env, dry_run=args.dry_run)
+
+            ledger = read_json(build_dir / "evidence-ledger.json")
+            truth = read_json(build_dir / "truth.json")
+            if not isinstance(ledger, dict):
+                ledger = {"verdict": "blocked", "summary": {"blockerClass": "missing_or_stale_evidence", "nextAction": "Regenerate evidence-ledger.json."}, "blockers": []}
+            summary = ledger.get("summary") if isinstance(ledger.get("summary"), dict) else {}
+            verdict = str(ledger.get("verdict") or (truth or {}).get("verdict") or "blocked")
+            blocker_class = str(summary.get("blockerClass") or "unknown")
+            signature = blocker_signature(ledger)
+            signatures = payload.get("blockerSignatures") if isinstance(payload.get("blockerSignatures"), list) else []
+            repeat_count = sum(1 for item in signatures if item == signature)
+            repeated = repeat_count > 0
+            payload["verdict"] = verdict
+            payload["blockerClass"] = blocker_class
+            payload["blockers"] = compact_blockers(ledger)
+            payload["lastBlockerSignature"] = signature
+            payload["repeatCount"] = repeat_count
+            payload["nodes"][1]["status"] = "passed" if verdict in TERMINAL_VERDICTS else "blocked"
+            payload["nextAction"] = str(summary.get("nextAction") or "Choose the next goal action.")
+            write_json(goal_file, payload)
+
+            turn_payload: dict[str, Any] = {
+                "schema": "rds.goal.turn.v1",
+                "goal": payload["goalDir"],
+                "buildId": args.build_id,
+                "turn": turn_no,
+                "cycle": cycle + 1,
+                "startedAt": now_iso(),
+                "objective": payload["objective"],
+                "before": {
+                    "verdict": verdict,
+                    "blockerClass": blocker_class,
+                    "blockerSignature": signature,
+                    "repeatCount": repeat_count,
+                    "blockers": compact_blockers(ledger),
+                    "evidenceLedger": f"builds/{args.build_id}/evidence-ledger.json",
+                    "truth": f"builds/{args.build_id}/truth.json",
+                },
+                "action": None,
+                "after": None,
+                "artifacts": {},
+                "status": "running",
+            }
+            write_json(turn_file, turn_payload)
+
+            if verdict in TERMINAL_VERDICTS:
+                payload.update({
+                    "status": "passed",
+                    "phase": "operator_review",
+                    "currentAction": None,
+                    "nextAction": "Open the preview and approve or reject from the dashboard.",
+                })
+                payload["nodes"][4]["status"] = "ready"
+                final_rc = 0
+                turn_payload["status"] = "passed"
+                turn_payload["finishedAt"] = now_iso()
+                turn_payload["after"] = {"verdict": verdict, "evidenceLedger": f"builds/{args.build_id}/evidence-ledger.json"}
+                write_json(turn_file, turn_payload)
+                break
+
+            action_type = "fix" if blocker_class in EVIDENCE_BLOCKER_CLASSES else "iterate"
+            if blocker_class in PRODUCT_BLOCKER_CLASSES or action_type == "iterate":
+                prompt_file = goal_dir / f"cycle-{cycle + 1}.iterate.prompt.md"
+                prompt_file.write_text(iteration_prompt(str(payload["objective"]), ledger, build_dir, state, repeated, repeat_count), encoding="utf-8")
+                log = goal_dir / f"cycle-{cycle + 1}.iterate.log"
+                cmd = [str(root / "bin" / "rds-iterate"), args.build_id, "--yes"]
+                stdin = prompt_file.read_text(encoding="utf-8")
+                action_type = "iterate"
+            else:
+                log = goal_dir / f"cycle-{cycle + 1}.fix.log"
+                cmd = [str(root / "bin" / "rds-fix"), args.build_id]
+                stdin = None
+
+            payload["phase"] = action_type
+            payload["currentAction"] = f"Cycle {cycle + 1}: running rds-{action_type} from evidence blocker class {blocker_class}."
+            payload["nodes"][2]["status"] = "running"
+            payload["updatedAt"] = now_iso()
+            write_json(goal_file, payload)
+            turn_payload["action"] = {
+                "kind": action_type,
+                "command": " ".join(cmd),
+                "prompt": f"builds/{args.build_id}/goals/{goal_dir.name}/{prompt_file.name}" if action_type == "iterate" else None,
+                "log": f"builds/{args.build_id}/goals/{goal_dir.name}/{log.name}",
+            }
+            write_json(turn_file, turn_payload)
+            event(root, args.build_id, "goal_action_started", cycle=cycle + 1, action=action_type, blocker_class=blocker_class)
+            rc = run_cmd(root, cmd, log, env, dry_run=args.dry_run, stdin=stdin)
+            artifacts = latest_iteration_artifacts(build_dir)
+            signatures.append(signature)
+            payload["blockerSignatures"] = signatures[-50:]
+            payload["actions"].append({
+                "cycle": cycle + 1,
+                "type": action_type,
+                "status": "passed" if rc == 0 else "failed",
+                "exitCode": rc,
+                "blockerClass": blocker_class,
+                "log": f"builds/{args.build_id}/goals/{goal_dir.name}/{log.name}",
+                **{k: v for k, v in artifacts.items() if v},
+            })
+            payload["nodes"][2]["status"] = "passed" if rc == 0 else "blocked"
+            payload["updatedAt"] = now_iso()
+            write_json(goal_file, payload)
+            event(root, args.build_id, "goal_action_completed", cycle=cycle + 1, action=action_type, exit_code=rc)
+
+            # Quota-aware fallback: if the active provider hit its usage limit during this cycle,
+            # smoothly switch to the other provider for the rest of the goal instead of burning the
+            # remaining cycle budget on the same blocker. Mirrors rds-fix's detection signature.
+            if rc != 0 and provider_limit_fallback_enabled:
+                active = active_state_provider(state)
+                if active not in exhausted_providers and detect_usage_limit(cycle_provider_log_text(build_dir, log)):
+                    exhausted_providers.add(active)
+                    alternate = other_provider(active)
+                    if alternate not in exhausted_providers and provider_cli_available(alternate):
+                        engine_env = apply_engine_override(state, state_path, alternate, "")
+                        env.update(engine_env)
+                        active_model = str((state.get("inference") or {}).get("claude_model" if alternate == "claude" else "codex_model") or "")
+                        payload["engine"] = {"provider": alternate, "model": active_model, "switchedFrom": active, "reason": "usage_limit", "switchedAt": now_iso()}
+                        payload["exhaustedProviders"] = sorted(exhausted_providers)
+                        payload["actions"].append({
+                            "cycle": cycle + 1,
+                            "type": "provider_switch",
+                            "status": "passed",
+                            "from": active,
+                            "to": alternate,
+                            "reason": "usage_limit",
+                            "log": f"builds/{args.build_id}/goals/{goal_dir.name}/{log.name}",
+                        })
+                        payload["phase"] = "provider_switch"
+                        payload["nextAction"] = f"{active} hit its usage limit; switched to {alternate} and continuing the goal."
+                        provider_switched_due_to_limit = True
+                        write_json(goal_file, payload)
+                        event(root, args.build_id, "goal_provider_switched", **{"from": active, "to": alternate, "reason": "usage_limit", "cycle": cycle + 1})
+                    else:
+                        payload["exhaustedProviders"] = sorted(exhausted_providers)
+                        reason = "both providers hit usage limits" if alternate in exhausted_providers else f"no fallback available ({alternate} CLI not found)"
+                        payload.update({
+                            "status": "needs_review",
+                            "phase": "provider_usage_limit",
+                            "currentAction": None,
+                            "nextAction": f"Goal paused: {reason}. Continue the goal after the quota window resets, or pick an available engine.",
+                        })
+                        event(root, args.build_id, "goal_provider_limit_stop", **{"provider": active, "reason": reason, "cycle": cycle + 1})
+                        write_json(goal_file, payload)
+                        final_rc = 1
+                        break
+
+            refresh_evidence(root, args.build_id, goal_dir, env, dry_run=args.dry_run)
+            after_ledger = read_json(build_dir / "evidence-ledger.json")
+            after_verdict = after_ledger.get("verdict") if isinstance(after_ledger, dict) else None
+            turn_payload["after"] = {
+                "verdict": after_verdict,
+                "blockerSignature": blocker_signature(after_ledger) if isinstance(after_ledger, dict) else None,
+                "evidenceLedger": f"builds/{args.build_id}/evidence-ledger.json",
+                "truth": f"builds/{args.build_id}/truth.json",
+            }
+            turn_payload["artifacts"] = {k: v for k, v in artifacts.items() if v}
+            turn_payload["status"] = "passed" if rc == 0 else "failed"
+            turn_payload["finishedAt"] = now_iso()
+            write_json(turn_file, turn_payload)
+            payload["turns"].append(f"builds/{args.build_id}/goals/{goal_dir.name}/{turn_file.name}")
+            payload["turns"] = payload["turns"][-100:]
+            write_json(goal_file, payload)
+            if rc != 0 and action_type == "fix":
+                payload["phase"] = "fix_failed_continue"
+                payload["nextAction"] = "Fixer failed; continuing with evidence-driven iteration on the next cycle."
+                write_json(goal_file, payload)
+
+        if payload.get("status") == "running":
+            if not args.no_agent_review and int(payload["agentReviewCount"]) < int(payload["maxAgentReviews"]):
+                app_dest = str(state.get("app_dest") or "")
+                if app_dest and Path(app_dest).exists():
+                    # Pick the escalation provider:
+                    # 1. If a usage-limit fallback already switched providers mid-goal, escalate on the
+                    #    current (non-exhausted) provider — never bounce back to the exhausted one.
+                    # 2. Else if the operator pinned a provider, honor that pin.
+                    # 3. Else cross-check with the alternate provider.
+                    if provider_switched_due_to_limit:
+                        provider = agent_provider_name(active_state_provider(state))
+                    elif pinned_provider:
+                        provider = agent_provider_name(pinned_provider)
+                    else:
+                        provider = alternate_provider(state)
+                    context = source_context_markdown(build_dir, state)
+                    task = (
+                        f"RDS goal escalation for build {args.build_id}: {payload['objective']}\n\n"
+                        "The bounded repair loop exhausted its current cycle budget. Re-read the PRD/spec/evidence below, patch the generated app in this isolated worktree if appropriate, "
+                        "run relevant checks, and leave a concise summary. Do not push.\n\n"
+                        f"{context[:24000]}"
+                    )
+                    log = goal_dir / f"agent-review-{payload['agentReviewCount'] + 1}.log"
+                    cmd = [
+                        str(root / "bin" / "rds-agent-start"),
+                        f"--build-id={args.build_id}",
+                        f"--provider={provider}",
+                        "--mode=print",
+                        f"--repo={app_dest}",
+                        f"--task={task}",
+                        "--started-by=rds-goal",
+                    ]
+                    payload["phase"] = "agent_review"
+                    payload["currentAction"] = f"Launching isolated {provider} review worker after repair loop cycle budget."
+                    payload["nodes"][3]["status"] = "running"
+                    write_json(goal_file, payload)
+                    rc = run_cmd(root, cmd, log, env, dry_run=args.dry_run)
+                    session_id = parse_session_id(read_text(log))
+                    payload["agentReviewCount"] = int(payload["agentReviewCount"]) + 1
+                    payload["actions"].append({
+                        "cycle": int(payload.get("cycle") or 0),
+                        "type": "agent_review",
+                        "provider": provider,
+                        "status": "passed" if rc == 0 else "failed",
+                        "exitCode": rc,
+                        "log": f"builds/{args.build_id}/goals/{goal_dir.name}/{log.name}",
+                        "sessionId": session_id or None,
+                    })
+                    payload["nodes"][3]["status"] = "ready" if rc == 0 else "failed"
+            payload.update({
+                "status": "needs_review",
+                "phase": "cycle_budget_reached",
+                "currentAction": None,
+                "nextAction": "Goal cycle budget reached. Run Continue goal to keep building with the accumulated PRD/evidence context.",
+            })
+            final_rc = 1
+
+        payload["updatedAt"] = now_iso()
+        payload["endedAt"] = now_iso()
+        sync_goal_nodes(payload)
+        write_json(goal_file, payload)
+        write_json(goal_dir / "goal.json", payload)
+        event(root, args.build_id, "goal_completed", status=payload.get("status"), phase=payload.get("phase"), goal=payload["goalDir"])
+        print(json.dumps({
+            "ok": payload.get("status") == "passed",
+            "status": payload.get("status"),
+            "phase": payload.get("phase"),
+            "goal": f"builds/{args.build_id}/goal.json",
+            "goalDir": payload["goalDir"],
+            "nextAction": payload.get("nextAction"),
+        }, indent=2))
+        return final_rc
+    except KeyboardInterrupt:
+        payload.update({
+            "status": "paused",
+            "phase": "interrupted",
+            "currentAction": None,
+            "nextAction": "Goal run interrupted. Re-run rds-goal to continue from current evidence.",
+            "updatedAt": now_iso(),
+            "endedAt": now_iso(),
+        })
+        write_json(goal_file, payload)
+        event(root, args.build_id, "goal_interrupted", goal=payload["goalDir"])
+        return 130
+    except Exception as exc:
+        error_log = goal_dir / "goal-error.log"
+        error_log.write_text(traceback.format_exc(), encoding="utf-8")
+        payload.update({
+            "status": "interrupted",
+            "phase": "error",
+            "currentAction": None,
+            "nextAction": f"Goal run stopped with an internal error: {exc}. Re-run rds-goal to continue from current evidence.",
+            "updatedAt": now_iso(),
+            "endedAt": now_iso(),
+            "error": str(exc),
+            "errorLog": f"builds/{args.build_id}/goals/{goal_dir.name}/{error_log.name}",
+        })
+        sync_goal_nodes(payload)
+        write_json(goal_file, payload)
+        write_json(goal_dir / "goal.json", payload)
+        event(root, args.build_id, "goal_interrupted", goal=payload["goalDir"], reason="internal_error")
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

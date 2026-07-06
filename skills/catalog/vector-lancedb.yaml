@@ -1,0 +1,17 @@
+---
+slug: vector-lancedb
+name: LanceDB vectors
+status: curated
+category: vector-db
+maturity: stable
+applies_to:
+- python-ai-service
+description: Embedded vector store for Python AI services.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: lancedb.github.io
+  url: https://lancedb.github.io/lancedb/
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

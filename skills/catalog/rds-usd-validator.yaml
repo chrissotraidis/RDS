@@ -1,0 +1,18 @@
+---
+slug: rds-usd-validator
+name: RDS USD validator
+status: curated
+scope: asset-pipeline
+description: Validate USD/glTF asset outputs for game and 3D pipelines.
+install:
+  phase: resolve-only
+verify:
+  command:
+maturity: curated-reference
+category: verification
+source_links:
+- label: openusd.org
+  url: https://openusd.org/release/toolset.html
+- label: github.khronos.org
+  url: https://github.khronos.org/glTF-Validator/
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

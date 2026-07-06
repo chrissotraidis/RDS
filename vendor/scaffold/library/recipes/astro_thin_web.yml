@@ -1,0 +1,88 @@
+name: Astro Thin Web
+type: astro_thin_web
+keywords:
+  - astro
+  - content
+  - marketing
+  - docs
+  - mdx
+  - portfolio
+  - static site
+description: >
+  Astro site for content-led websites, marketing pages, docs, portfolios,
+  and thin interactive web experiences. Prefer static HTML and islands
+  only where interactivity is necessary.
+
+framework:
+  primary: Astro
+  language: TypeScript
+  runtime: Bun
+  deployment: Zo HTTP service
+
+workflow:
+  capabilities:
+    browser_ui: true
+    static_pages: true
+    content_collections: true
+    accessibility: true
+    native_tests: false
+    database: false
+
+finalization:
+  commands:
+    - bun install
+    - bun run build
+  checks:
+    - name: Astro build
+      command: bun run build
+      type: compilation
+      required: true
+
+verification:
+  setup_commands:
+    - bun install
+  boot_command: bunx astro dev --host 0.0.0.0 --port 3000
+  health_checks:
+    - url: "http://localhost:3000/health.json"
+      expected_status: 200
+    - url: "http://localhost:3000/"
+      expected_status: 200
+  test_command: bun run build
+
+sections:
+  - name: Local Development
+    phase: pipeline
+    labels: ["setup"]
+    description: Keep the generated project a bootable Astro app.
+    guidance:
+      - Preserve package scripts: dev, build, preview, test.
+      - Preserve /health.json because RDS uses it as the stack health check.
+      - Do not replace this project with Next.js, Vite SPA, Rails, or a separate backend.
+      - Use Astro pages and layouts first.
+
+  - name: Content Structure
+    phase: pipeline
+    labels: ["content", "frontend"]
+    description: Build pages, layouts, navigation, content collections, and SEO.
+    guidance:
+      - Use semantic HTML and route files under src/pages.
+      - For blogs/docs, use content collections or a clear markdown structure.
+      - Keep metadata, OG tags, sitemap assumptions, and page titles explicit.
+
+  - name: Interactive Islands
+    phase: pipeline
+    labels: ["frontend", "interaction"]
+    description: Add browser-side interactivity only where needed.
+    guidance:
+      - Avoid turning the whole site into a SPA.
+      - Keep islands small and independent.
+      - Prefer static HTML for marketing/docs/content sections.
+
+  - name: Quality
+    phase: pipeline
+    labels: ["qa", "accessibility"]
+    description: Verify build output and browser behavior.
+    guidance:
+      - bun run build must pass.
+      - /health.json must return 200.
+      - Check mobile and desktop layouts for text overlap.

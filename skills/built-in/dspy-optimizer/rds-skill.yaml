@@ -1,0 +1,20 @@
+---
+slug: dspy-optimizer
+name: DSPy optimizer
+status: ready
+default: false
+applies_to:
+- python-ai-service
+description: Optional DSPy optimization loop for prompt and agent tuning.
+install:
+  command: bin/rds-skill-materialize dspy-optimizer
+verify:
+  command: bin/rds-skill-verify dspy-optimizer
+maturity: experimental
+category: llm
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should
+  understand during stack selection, skill resolution, implementation guidance, or
+  verification.
+source_links:
+- label: dspy.ai
+  url: https://dspy.ai/

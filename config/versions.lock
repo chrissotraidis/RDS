@@ -1,0 +1,21 @@
+# Pinned commit hashes of vendored components.
+# Update with: git subtree pull --prefix=vendor/<name> <remote> main --squash
+# If a component was copied from local (offline bootstrap), the commit is
+# recorded as `copied-from-local` with the date of the copy.
+
+scaffold_commit=copied-from-local
+scaffold_copied_at=2026-04-25
+scaffold_remote=rds-owned-vendored-copy
+
+wiki_commit=copied-from-local
+wiki_copied_at=2026-04-25
+wiki_remote=vendored-in-rds
+
+rails_starter_commit=generated-from-rails-new
+rails_starter_copied_at=2026-06-29
+rails_starter_remote=stock-rails-8.1.2-plus-rds-zo-setup
+
+arnold_commit=unpinned
+arnold_remote=external-tool-configured-by-ARNOLD_REMOTE
+
+rds_version=0.1.0

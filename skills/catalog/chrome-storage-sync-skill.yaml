@@ -1,0 +1,17 @@
+---
+slug: chrome-storage-sync-skill
+name: Chrome storage sync
+status: curated
+category: storage
+maturity: stable
+applies_to:
+- browser-extension
+description: Browser extension storage sync conventions.
+install:
+  mode: metadata
+verify:
+  command:
+source_links:
+- label: developer.chrome.com
+  url: https://developer.chrome.com/docs/extensions/reference/api/storage
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should understand during stack selection, skill resolution, implementation guidance, or verification.

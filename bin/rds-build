@@ -1,0 +1,1006 @@
+#!/usr/bin/env bash
+# bin/rds-build — the user-facing entry point.
+#
+# Green-field:
+#   ./bin/rds-build <research-trigger> --app-dest=<abs-path> \
+#                   [--build-id=<id>] [--deploy-target=zo|none]
+#
+# Brown-field:
+#   ./bin/rds-build --repo=<git-url> --prd=<prd-source> --app-dest=<abs-path> \
+#                   [--branch=<name>] [--build-id=<id>] [--deploy-target=zo|none]
+#
+# Mode is auto-detected from the presence of --repo. See AGENT.md §7 for
+# how Claude Code picks which to invoke.
+#
+# --app-dest is REQUIRED in both modes. RDS no longer builds into
+# builds/<id>/app — apps always live in an external folder (the cloned
+# client repo, or a project folder you control). builds/<id>/ keeps only
+# state.json + logs. The --app-dest path must be outside RDS_ROOT.
+#
+# Deploy targets: zo (default, public *.zocomputer.io URL), none, teardown.
+# fly is no longer supported — RDS runs on Zo and only deploys to Zo.
+set -euo pipefail
+
+# Zo runs as root inside a gVisor sandbox. Claude CLI refuses
+# --dangerously-skip-permissions as root unless IS_SANDBOX=1.
+export IS_SANDBOX=1
+
+# Make Ruby 4.0.1 available to all child stages (rails-init, scaffold, local-run).
+if [[ -x /opt/rubies/ruby-4.0.1/bin/ruby ]]; then
+  export PATH="/opt/rubies/ruby-4.0.1/bin:$PATH"
+fi
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck disable=SC1091
+source "$ROOT/bin/lib/common.sh"
+# shellcheck disable=SC1091
+source "$ROOT/bin/lib/logging.sh"
+# shellcheck disable=SC1091
+source "$ROOT/bin/lib/state.sh"
+if [[ -f "$ROOT/config/model.env" ]]; then
+  # shellcheck disable=SC1091
+  set -a
+  source "$ROOT/config/model.env"
+  set +a
+fi
+
+usage() {
+  cat <<'EOF'
+Usage:
+  bin/rds-build <research-trigger> --app-dest=<abs-path>
+                [--stack=<id>] [--provider=claude|codex]
+                [--claude-model=<id>] [--codex-model=<id>]
+                [--skills=default|none|slug,slug]
+                [--app-type=auto|game|website|web-app|dashboard|internal-tool|prototype|hack]
+                [--build-id=<id>] [--deploy-target=zo|none]
+
+  bin/rds-build --repo=<git-url> --prd=<prd-source> --app-dest=<abs-path>
+                [--stack=<id>] [--provider=claude|codex]
+                [--claude-model=<id>] [--codex-model=<id>]
+                [--skills=default|none|slug,slug]
+                [--app-type=auto|game|website|web-app|dashboard|internal-tool|prototype|hack]
+                [--branch=<name>]
+                [--build-id=<id>] [--deploy-target=zo|none]
+
+Modes are auto-detected: --repo triggers brown-field, otherwise green-field.
+--app-dest is required and must be an absolute path outside RDS_ROOT.
+--stack defaults to "rails". See stacks/README.md for registered stacks.
+--skills defaults to stack-compatible RDS built-ins. Use --skills=none to disable.
+--provider selects the task execution engine for this build.
+--app-type makes the product category a durable QA/taste contract.
+EOF
+}
+
+# --- Parse flags ------------------------------------------------------------
+REPO_URL="$(parse_flag --repo        "$@" || echo "")"
+PRD_SOURCE="$(parse_flag --prd       "$@" || echo "")"
+BRANCH="$(parse_flag --branch        "$@" || echo "")"
+DEPLOY_TARGET="$(parse_flag --deploy-target "$@" || echo "${RDS_DEFAULT_DEPLOY_TARGET:-zo}")"
+EXPLICIT_ID="$(parse_flag --build-id "$@" || echo "")"
+APP_DEST="$(parse_flag --app-dest    "$@" || echo "")"
+STACK_FLAG="$(parse_flag --stack "$@" || echo "")"
+BUILD_PROVIDER="$(parse_flag --provider "$@" || echo "${RDS_INFERENCE_PROVIDER:-claude}")"
+BUILD_CLAUDE_MODEL="$(parse_flag --claude-model "$@" || echo "${RDS_CLAUDE_MODEL:-claude-opus-4-6}")"
+BUILD_CODEX_MODEL="$(parse_flag --codex-model "$@" || echo "${RDS_CODEX_MODEL:-}")"
+APP_TYPE="$(normalize_app_type "$(parse_flag --app-type "$@" || echo auto)")"
+SKILLS_REQUESTED="$(parse_flag --skills "$@" || echo default)"
+
+# --resume re-runs an existing build, skipping stages already marked done|skipped
+# and re-running the failed (or running-when-killed) stage. Requires --build-id
+# of an existing build directory. state.json is preserved, not re-initialized.
+RESUME=0
+for arg in "$@"; do
+  [[ "$arg" == "--resume" ]] && RESUME=1
+done
+
+# --- Validate inference provider -------------------------------------------
+case "$BUILD_PROVIDER" in
+  claude|codex) ;;
+  *)
+    echo "FATAL: unknown --provider='$BUILD_PROVIDER' (expected claude|codex)" >&2
+    exit 1
+    ;;
+esac
+export RDS_INFERENCE_PROVIDER="$BUILD_PROVIDER"
+export RDS_CLAUDE_MODEL="$BUILD_CLAUDE_MODEL"
+export RDS_CODEX_MODEL="$BUILD_CODEX_MODEL"
+
+# --- Validate --app-dest -----------------------------------------------------
+if [[ -z "$APP_DEST" ]]; then
+  echo "FATAL: --app-dest=<abs-path> is required. RDS builds into the project folder, never into builds/<id>/app." >&2
+  usage; exit 1
+fi
+if [[ "${APP_DEST:0:1}" != "/" ]]; then
+  echo "FATAL: --app-dest must be an absolute path (got '$APP_DEST')" >&2; exit 1
+fi
+case "$APP_DEST/" in
+  "$ROOT"/*)
+    echo "FATAL: --app-dest ('$APP_DEST') is inside RDS_ROOT ('$ROOT'). Apps must live outside RDS." >&2
+    exit 1
+    ;;
+esac
+
+ensure_app_git_boundary() {
+  local app="$1"
+  [[ -d "$app" ]] || return 0
+
+  local top=""
+  top="$(git -C "$app" rev-parse --show-toplevel 2>/dev/null || true)"
+  local workspace_root="${RDS_WORKSPACE_ROOT:-/home/workspace}"
+  if [[ -z "$top" || "$top" == "$workspace_root" ]]; then
+    log "  git: isolating app_dest from parent worktree"
+    git -C "$app" init -q
+  elif [[ "$top" != "$app" ]]; then
+    log "  git: preserving parent project worktree at $top"
+    return 0
+  fi
+
+  git -C "$app" config user.email rds@local >/dev/null 2>&1 || true
+  git -C "$app" config user.name "RDS" >/dev/null 2>&1 || true
+
+  if ! git -C "$app" rev-parse --verify HEAD >/dev/null 2>&1; then
+    git -C "$app" add -A
+    if ! git -C "$app" diff --cached --quiet; then
+      git -C "$app" commit -q -m "RDS scaffold baseline" || true
+    fi
+  fi
+}
+
+# --- Validate --deploy-target -----------------------------------------------
+case "$DEPLOY_TARGET" in
+  zo|none|teardown) ;;
+  fly)
+    echo "FATAL: --deploy-target=fly is not supported. RDS runs on Zo and only deploys to Zo." >&2
+    exit 1
+    ;;
+  *)
+    echo "FATAL: unknown --deploy-target='$DEPLOY_TARGET' (expected zo|none|teardown)" >&2
+    exit 1
+    ;;
+esac
+
+# Find the first positional arg for green-field trigger.
+TRIGGER="$(first_positional_arg "$@" || echo "")"
+
+# --- Mode detection ---------------------------------------------------------
+if [[ -n "$REPO_URL" ]]; then
+  MODE=brown
+  if [[ -z "$PRD_SOURCE" ]]; then
+    echo "ERROR: --repo requires --prd" >&2; usage; exit 1
+  fi
+  if [[ -n "$TRIGGER" ]]; then
+    echo "ERROR: got positional trigger in brown-field mode — use --prd" >&2; exit 1
+  fi
+  REPO_URL="$(normalize_repo_url "$REPO_URL")"
+  # Slug is the repo name.
+  SLUG="$(basename "${REPO_URL%.git}")"
+  SLUG="$(derive_slug "$SLUG")"
+  DISPLAY_NAME="$(derive_source_title "${PRD_SOURCE:-$SLUG}")"
+else
+  MODE=green
+  if [[ -z "$TRIGGER" ]]; then
+    echo "ERROR: green-field requires a research trigger (Notion URL or .md path)" >&2
+    usage; exit 1
+  fi
+  SLUG="$(derive_slug "$TRIGGER")"
+  DISPLAY_NAME="$(derive_source_title "$TRIGGER")"
+fi
+
+BUILD_ID="${EXPLICIT_ID:-$SLUG-$(date -u +%Y%m%d-%H%M%S)}"
+BUILD_DIR="$RDS_BUILDS_DIR/$BUILD_ID"
+
+# --- Analyze source before stack/app-type selection --------------------------
+ANALYSIS_PATH="$BUILD_DIR/analysis.json"
+analysis_source="${PRD_SOURCE:-$TRIGGER}"
+analysis_stack=""
+analysis_app_type=""
+if [[ -n "$analysis_source" && -x "$ROOT/bin/rds-analyze-source" ]]; then
+  mkdir -p "$BUILD_DIR"
+  if "$ROOT/bin/rds-analyze-source" "$analysis_source" --app-type "$APP_TYPE" --out "$ANALYSIS_PATH" >/dev/null 2>&1; then
+    analysis_stack="$(jq -r '.stack // empty' "$ANALYSIS_PATH" 2>/dev/null || true)"
+    analysis_app_type="$(jq -r '.appType // empty' "$ANALYSIS_PATH" 2>/dev/null || true)"
+  fi
+fi
+
+# --- Resolve --stack --------------------------------------------------------
+if [[ -n "$STACK_FLAG" ]]; then
+  STACK_REQUESTED="$STACK_FLAG"
+elif [[ -n "$analysis_stack" ]]; then
+  STACK_REQUESTED="$analysis_stack"
+else
+  detection_source="${PRD_SOURCE:-$TRIGGER}"
+  STACK_REQUESTED="$(stack_detect_from_source "$detection_source" 2>/dev/null || echo "${RDS_DEFAULT_STACK:-nextjs-fullstack}")"
+fi
+STACK="$(stack_resolve_id "$STACK_REQUESTED")"
+STACK_CANONICAL="$(stack_canonical_id "$STACK")"
+
+# --- Validate --stack -------------------------------------------------------
+stack_validate "$STACK_REQUESTED"
+stack_status="$(stack_field "$STACK" '.status // "ready"')"
+if [[ "$stack_status" == "stub" || "$stack_status" == "disabled" || "$stack_status" == "defer" ]]; then
+  echo "FATAL: stack '$STACK_REQUESTED' (canonical '$STACK_CANONICAL', runtime '$STACK') is registered but not end-to-end enabled yet." >&2
+  exit 1
+fi
+
+if [[ "$APP_TYPE" == "auto" && -n "$analysis_app_type" && "$analysis_app_type" != "auto" ]]; then
+  APP_TYPE="$(normalize_app_type "$analysis_app_type")"
+fi
+
+if (( RESUME == 1 )); then
+  if [[ -z "$EXPLICIT_ID" ]]; then
+    echo "FATAL: --resume requires --build-id=<existing>" >&2; exit 1
+  fi
+  if [[ ! -f "$BUILD_DIR/state.json" ]]; then
+    echo "FATAL: --resume target has no state.json: $BUILD_DIR" >&2; exit 1
+  fi
+  mkdir -p "$BUILD_DIR/logs"
+  # Reset any failed/running stage to pending so the skip-done logic below
+  # actually runs it. Stages marked done|skipped stay as-is.
+  jq '.stages |= with_entries(
+        if (.value.status == "failed" or .value.status == "running")
+        then .value = {status: "pending"} else . end
+      ) | .error = null | .status = null | .paused_at = null | .paused_from_stage = null | .current_stage = null
+     ' "$BUILD_DIR/state.json" > "$BUILD_DIR/state.json.tmp"
+  mv "$BUILD_DIR/state.json.tmp" "$BUILD_DIR/state.json"
+  if [[ "$APP_TYPE" == "auto" ]]; then
+    APP_TYPE="$(jq -r '.app_type // "auto"' "$BUILD_DIR/state.json" 2>/dev/null || echo auto)"
+    APP_TYPE="$(normalize_app_type "$APP_TYPE")"
+  else
+    state_set_app_type "$BUILD_DIR" "$APP_TYPE"
+  fi
+  if jq -e '
+      (.error // null) == null and
+      (.current_stage // null) == null and
+      ([.stages[]?.status] | all(. == "done" or . == "skipped")) and
+      ((.review.status // "not_required") != "not_required")
+    ' "$BUILD_DIR/state.json" >/dev/null 2>&1; then
+    "$ROOT/bin/rds-event" build_resume_noop \
+      --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+      reason="already complete and awaiting/holding review" \
+      >/dev/null 2>&1 || true
+    rm -f "$BUILD_DIR/run.pid" "$BUILD_DIR/run.pid.tmp" 2>/dev/null || true
+    log "RDS build $BUILD_ID already complete; resume is a no-op."
+    exit 0
+  fi
+else
+  mkdir -p "$BUILD_DIR/logs"
+  state_init "$BUILD_DIR" "$MODE" "$REPO_URL" "$PRD_SOURCE" "$TRIGGER" "$APP_DEST" "$STACK" "$BUILD_PROVIDER" "$BUILD_CLAUDE_MODEL" "$BUILD_CODEX_MODEL" "$APP_TYPE" "$DISPLAY_NAME"
+  write_build_manifest "$BUILD_DIR/build.yaml" "$BUILD_ID" "$MODE" "$STACK_REQUESTED" "$STACK" "$STACK_CANONICAL" "$TRIGGER" "$REPO_URL" "$PRD_SOURCE" "$APP_DEST" "$BUILD_PROVIDER" "$APP_TYPE"
+fi
+
+if (( RESUME == 1 )); then
+  log "RDS build $BUILD_ID — RESUMING (skipping stages already done)"
+else
+  log "RDS build $BUILD_ID — mode=$MODE stack=$STACK_CANONICAL runtime_stack=$STACK deploy=$DEPLOY_TARGET provider=$BUILD_PROVIDER"
+fi
+log "  app-dest=$APP_DEST"
+log "  app-type=$APP_TYPE"
+log "  skills=$SKILLS_REQUESTED"
+[[ "$BUILD_PROVIDER" == "claude" ]] && log "  builder=Claude Code model=$BUILD_CLAUDE_MODEL"
+[[ "$BUILD_PROVIDER" == "codex" ]] && log "  builder=Codex model=${BUILD_CODEX_MODEL:-<codex default>}"
+[[ "$MODE" == "brown" ]] && log "  repo=$REPO_URL prd=$PRD_SOURCE branch=${BRANCH:-<default>}"
+[[ "$MODE" == "green" ]] && log "  trigger=$TRIGGER"
+
+refresh_skill_scorecard() {
+  [[ -x "$ROOT/bin/rds-skill-scorecard" ]] || return 0
+  [[ -f "$BUILD_DIR/skills/resolved.json" ]] || return 0
+  [[ -d "$APP_DEST" ]] || return 0
+  "$ROOT/bin/rds-skill-scorecard" \
+    --build-dir "$BUILD_DIR" \
+    --app-dest "$APP_DEST" \
+    >/dev/null 2>&1 || true
+}
+
+# Fail-fast trap so state reflects the stage that broke.
+_current_stage=""
+
+clear_run_pid() {
+  rm -f "$BUILD_DIR/run.pid" "$BUILD_DIR/run.pid.tmp" 2>/dev/null || true
+}
+
+# Helper: emit a build event to events.jsonl (TD-014). Best-effort; never fails
+# the caller. Available throughout the rest of this script.
+emit_event() {
+  local event_name="$1"; shift
+  "$ROOT/bin/rds-event" "$event_name" \
+    --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+    "$@" \
+    >/dev/null 2>&1 || true
+}
+
+emit_event_json() {
+  local event_name="$1"; shift
+  local payload_json="$1"; shift || true
+  "$ROOT/bin/rds-event" "$event_name" \
+    --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+    --json "$payload_json" \
+    >/dev/null 2>&1 || true
+}
+
+on_err() {
+  local rc=$?
+  clear_run_pid
+  if [[ -n "$_current_stage" ]]; then
+    state_set_stage "$BUILD_DIR" "$_current_stage" failed
+    state_set_error "$BUILD_DIR" "stage $_current_stage failed with exit $rc"
+    failure_payload="$(jq -nc \
+      --arg stage "$_current_stage" \
+      --arg exit_code "$rc" \
+      --arg log_path "$BUILD_DIR/logs/$_current_stage.log" \
+      --arg log_tail "$(tail -n 80 "$BUILD_DIR/logs/$_current_stage.log" 2>/dev/null || true)" \
+      '{stage:$stage, exit_code:$exit_code, log_path:$log_path, log_tail:$log_tail}')"
+    emit_event_json "stage_failed" "$failure_payload"
+  fi
+  emit_event "build_failed" stage="${_current_stage:-unknown}" exit_code="$rc"
+  "$ROOT/bin/rds-speed-report" "$BUILD_ID" >/dev/null 2>&1 || true
+  log_err "build $BUILD_ID aborted at stage '${_current_stage:-unknown}' (exit $rc)"
+  exit "$rc"
+}
+trap on_err ERR
+
+run_stage() {
+  # Mark the previous stage finished (if any) before recording the new one.
+  if [[ -n "$_current_stage" ]]; then
+    emit_event "stage_completed" stage="$_current_stage"
+  fi
+  _current_stage="$1"
+  emit_event "stage_started" stage="$_current_stage" log_path="$BUILD_DIR/logs/$_current_stage.log"
+}
+
+# On --resume, skip stages already marked done|skipped. Failed/running stages
+# were reset to pending above, so they pass this check and re-execute.
+should_run_stage() {
+  local name="$1"
+  if (( RESUME != 1 )); then return 0; fi
+  local status
+  status="$(jq -r ".stages.\"$name\".status // \"unknown\"" "$BUILD_DIR/state.json" 2>/dev/null || echo unknown)"
+  if [[ "$name" == "deploy" && "$status" == "done" ]]; then
+    local preview_file="$BUILD_DIR/preview-url.txt"
+    local state_preview
+    state_preview="$(jq -r '.preview_url // empty' "$BUILD_DIR/state.json" 2>/dev/null || true)"
+    if [[ ! -s "$preview_file" && -z "$state_preview" ]]; then
+      return 0
+    fi
+  fi
+  case "$status" in
+    done|skipped) return 1 ;;
+    *)            return 0 ;;
+  esac
+}
+
+# Initial lifecycle event so the dashboard sees the build immediately.
+if (( RESUME == 1 )); then
+  emit_event "build_resumed" stack="$STACK" deploy_target="$DEPLOY_TARGET" app_dest="$APP_DEST" provider="$BUILD_PROVIDER" app_type="$APP_TYPE"
+else
+  emit_event "build_started" mode="$MODE" stack="$STACK" slug="$SLUG" deploy_target="$DEPLOY_TARGET" app_dest="$APP_DEST" provider="$BUILD_PROVIDER" app_type="$APP_TYPE"
+fi
+
+# -------------------- Stage 1: intake --------------------
+if should_run_stage intake; then
+  run_stage intake
+  log "stage 1: intake ($MODE)"
+  state_set_stage "$BUILD_DIR" intake running
+
+  if [[ "$MODE" == "green" ]]; then
+    "$ROOT/bin/rds-intake" --mode=green --trigger="$TRIGGER" \
+      --out="$BUILD_DIR/research.md" \
+      2>&1 | tee -a "$BUILD_DIR/logs/intake.log"
+  else
+    "$ROOT/bin/rds-clone-repo" --repo="$REPO_URL" \
+      ${BRANCH:+--branch="$BRANCH"} \
+      --dest="$APP_DEST" \
+      2>&1 | tee -a "$BUILD_DIR/logs/intake.log"
+    "$ROOT/bin/rds-intake" --mode=brown --prd-source="$PRD_SOURCE" \
+      --out="$BUILD_DIR/spec.md" \
+      2>&1 | tee -a "$BUILD_DIR/logs/intake.log"
+  fi
+  state_set_stage "$BUILD_DIR" intake done
+else
+  log "stage 1: intake (resume — skipped, already done)"
+fi
+
+# -------------------- Stage 2: spec --------------------
+if should_run_stage spec; then
+  run_stage spec
+  if [[ "$MODE" == "green" ]]; then
+    log "stage 2: spec (Wiki)"
+    state_set_stage "$BUILD_DIR" spec running
+    "$ROOT/bin/rds-spec" "$BUILD_DIR/research.md" "$BUILD_DIR/spec.md" \
+      2>&1 | tee -a "$BUILD_DIR/logs/spec.log"
+    if [[ -f "$BUILD_DIR/po-questions.md" ]]; then
+      state_set_po_questions "$BUILD_DIR" "builds/$BUILD_ID/po-questions.md"
+    fi
+    state_set_stage "$BUILD_DIR" spec done
+  else
+    log "stage 2: spec (skipped — brown-field uses provided PRD)"
+    state_set_stage "$BUILD_DIR" spec skipped
+  fi
+else
+  log "stage 2: spec (resume — skipped, already done)"
+fi
+
+# -------------------- Stage 3: taste brief --------------------
+if should_run_stage taste; then
+  run_stage taste
+  if [[ "${RDS_TASTE_ENABLED:-1}" == "1" ]]; then
+    log "stage 3: taste brief"
+    state_set_stage "$BUILD_DIR" taste running
+    "$ROOT/bin/rds-taste" "$BUILD_ID" \
+      2>&1 | tee -a "$BUILD_DIR/logs/taste.log"
+    if [[ "$APP_TYPE" == "auto" && -f "$BUILD_DIR/taste-brief.json" ]]; then
+      inferred_type="$(jq -r '.app_type // .kind // "auto"' "$BUILD_DIR/taste-brief.json" 2>/dev/null || echo auto)"
+      inferred_type="$(normalize_app_type "$inferred_type" 2>/dev/null || echo auto)"
+      if [[ "$inferred_type" != "auto" ]]; then
+        APP_TYPE="$inferred_type"
+        state_set_app_type "$BUILD_DIR" "$APP_TYPE"
+        log "  app-type inferred=$APP_TYPE"
+        emit_event "app_type_selected" app_type="$APP_TYPE" source="taste"
+      fi
+    fi
+    if [[ -f "$BUILD_DIR/spec.md" && ! -f "$BUILD_DIR/qa-scenarios.json" ]]; then
+      log "  QA scenario contract"
+      "$ROOT/bin/rds-qa-scenarios" "$BUILD_ID" \
+        2>&1 | tee -a "$BUILD_DIR/logs/taste.log" >/dev/null
+      emit_event_json "qa_scenarios_selected" "$(cat "$BUILD_DIR/qa-scenarios.json")"
+    fi
+    if [[ "${RDS_SCENARIO_GATE_ENABLED:-1}" == "1" ]]; then
+      "$ROOT/bin/rds-scenario-gate" "$BUILD_ID" \
+        2>&1 | tee -a "$BUILD_DIR/logs/taste.log"
+    fi
+    if [[ "${RDS_TASTE_GATE_ENABLED:-1}" == "1" ]]; then
+      "$ROOT/bin/rds-taste-gate" "$BUILD_ID" \
+        2>&1 | tee -a "$BUILD_DIR/logs/taste.log"
+    fi
+    state_set_stage "$BUILD_DIR" taste done
+  else
+    log "stage 3: taste brief (skipped — RDS_TASTE_ENABLED=0)"
+    state_set_stage "$BUILD_DIR" taste skipped
+  fi
+else
+  log "stage 3: taste brief (resume — skipped, already done)"
+fi
+
+# -------------------- Stage 3b: skill resolve --------------------
+if should_run_stage skill-resolve; then
+  run_stage skill-resolve
+  log "stage 3b: skill resolve"
+  state_set_stage "$BUILD_DIR" skill-resolve running
+  "$ROOT/bin/rds-skill-index" >/dev/null
+  resolved_skills="$("$ROOT/bin/rds-skill-resolve" \
+    --stack "$STACK_CANONICAL" \
+    --requested "$SKILLS_REQUESTED" \
+    --build-dir "$BUILD_DIR" \
+    2>&1 | tee -a "$BUILD_DIR/logs/skill-resolve.log")"
+  log "  resolved skills=${resolved_skills:-<none>}"
+  emit_event "skills_resolved" skills="${resolved_skills:-}"
+  state_set_stage "$BUILD_DIR" skill-resolve done
+else
+  log "stage 3b: skill resolve (resume — skipped, already done)"
+fi
+
+# -------------------- Stage 4: stack-init (legacy stage name: rails-init) --------------------
+BUILD_PLAN_PATH="$BUILD_DIR/build-plan.json"
+if [[ -f "$BUILD_PLAN_PATH" ]]; then
+  state_set_build_plan "$BUILD_DIR" "$BUILD_PLAN_PATH" || true
+elif [[ -f "$BUILD_DIR/spec.md" ]]; then
+  log "preflight: build complexity plan"
+  "$ROOT/bin/rds-build-plan" \
+    --spec "$BUILD_DIR/spec.md" \
+    --stack "$STACK" \
+    --provider "$BUILD_PROVIDER" \
+    --app-type "$APP_TYPE" \
+    --out "$BUILD_PLAN_PATH" \
+    2>&1 | tee -a "$BUILD_DIR/logs/plan.log" >/dev/null
+  state_set_build_plan "$BUILD_DIR" "$BUILD_PLAN_PATH"
+  plan_profile="$(jq -r '.profile_name' "$BUILD_PLAN_PATH")"
+  plan_tasks="$(jq -r '.max_tasks' "$BUILD_PLAN_PATH")"
+  plan_target="$(jq -r '.target_minutes' "$BUILD_PLAN_PATH")"
+  log "  plan=$plan_profile max_tasks=$plan_tasks target=${plan_target}m"
+  emit_event_json "build_plan_selected" "$(cat "$BUILD_PLAN_PATH")"
+fi
+
+if [[ -f "$BUILD_DIR/spec.md" && ! -f "$BUILD_DIR/qa-scenarios.json" ]]; then
+  log "preflight: QA scenario contract"
+  "$ROOT/bin/rds-qa-scenarios" "$BUILD_ID" \
+    2>&1 | tee -a "$BUILD_DIR/logs/plan.log" >/dev/null
+  emit_event_json "qa_scenarios_selected" "$(cat "$BUILD_DIR/qa-scenarios.json")"
+fi
+
+if should_run_stage rails-init; then
+  run_stage rails-init
+  if [[ "$MODE" == "green" ]]; then
+    log "stage 4: init (stack=$STACK)"
+    state_set_stage "$BUILD_DIR" rails-init running
+    APP_NAME="$(derive_app_name "$BUILD_DIR/spec.md" "$BUILD_ID")"
+    log "  app_name=$APP_NAME"
+    # Resolve the stack's init hook from manifest. For rails, this defaults
+    # to bin/rds-rails-init. For other stacks it points at stacks/<id>/init.sh.
+    init_hook_rel="$(stack_field "$STACK" '.init // "bin/rds-rails-init"')"
+    init_hook="$ROOT/$init_hook_rel"
+    if [[ ! -x "$init_hook" ]]; then
+      echo "FATAL: stack '$STACK' init hook not executable: $init_hook" >&2
+      exit 1
+    fi
+    "$init_hook" "$APP_NAME" "$APP_DEST" \
+      2>&1 | tee -a "$BUILD_DIR/logs/rails-init.log"
+    state_set_stage "$BUILD_DIR" rails-init done
+  else
+    log "stage 4: init (skipped — using cloned client repo)"
+    state_set_stage "$BUILD_DIR" rails-init skipped
+  fi
+else
+  log "stage 4: init (resume — skipped, already done)"
+fi
+
+# -------------------- Stage 4b: skill install --------------------
+if should_run_stage skill-install; then
+  run_stage skill-install
+  log "stage 4b: skill install (before scaffold planning)"
+  state_set_stage "$BUILD_DIR" skill-install running
+  "$ROOT/bin/rds-skill-install" \
+    --build-dir "$BUILD_DIR" \
+    --app-dest "$APP_DEST" \
+    --stack "$STACK_CANONICAL" \
+    2>&1 | tee -a "$BUILD_DIR/logs/skill-install.log"
+  state_set_stage "$BUILD_DIR" skill-install done
+else
+  log "stage 4b: skill install (resume — skipped, already done)"
+fi
+
+# -------------------- Stage 5: scaffold --------------------
+if should_run_stage scaffold; then
+  run_stage scaffold
+  log "stage 5: scaffold"
+  state_set_stage "$BUILD_DIR" scaffold running
+  if [[ "$RESUME" -eq 1 && -x "$APP_DEST/launch-build.sh" && -f "$APP_DEST/tasks.json" ]]; then
+    log "  resume: reusing existing scaffold app in $APP_DEST"
+  else
+    (
+      cd "$ROOT/vendor/scaffold"
+      scaffold_args=("$BUILD_DIR/spec.md" --wiki "$BUILD_DIR/wiki" --output "$BUILD_DIR/scaffold-out")
+      scaffold_recipe="$(stack_field "$STACK" '.scaffold_recipe // empty')"
+      if [[ -n "$scaffold_recipe" && "$scaffold_recipe" != "null" ]]; then
+        scaffold_args+=(--recipe "$scaffold_recipe")
+      fi
+      scaffold_max_tasks=""
+      if [[ -f "$BUILD_PLAN_PATH" ]]; then
+        scaffold_max_tasks="$(jq -r '.max_tasks // empty' "$BUILD_PLAN_PATH")"
+      fi
+      if [[ -z "$scaffold_max_tasks" || "$scaffold_max_tasks" == "null" ]]; then
+        scaffold_max_tasks="$(stack_field "$STACK" '.scaffold_max_tasks // empty')"
+      fi
+      if [[ -n "$scaffold_max_tasks" && "$scaffold_max_tasks" != "null" ]]; then
+        scaffold_args+=(--max-tasks "$scaffold_max_tasks")
+      fi
+      ./scaffold.sh "${scaffold_args[@]}"
+    ) 2>&1 | tee -a "$BUILD_DIR/logs/scaffold.log"
+
+    # Scaffold produces a complete project tree (Rails app + .claude/ + launch-build.sh
+    # + tasks.json + .scaffold/) inside $BUILD_DIR/scaffold-out. Mirror it into
+    # $APP_DEST so all task work happens in the project repo, then run launch-build.sh
+    # from there. rsync preserves the pre-existing .git/ and PRD .md in $APP_DEST.
+    (
+      cd "$BUILD_DIR/scaffold-out"
+      rsync -a --exclude='.git/' ./ "$APP_DEST/"
+    ) 2>&1 | tee -a "$BUILD_DIR/logs/scaffold.log"
+  fi
+
+  # Locate Ruby 4.0.1 for launch-build (it shells out to bundle/rails).
+  if [[ -x /opt/rubies/ruby-4.0.1/bin/ruby ]]; then
+    export PATH="/opt/rubies/ruby-4.0.1/bin:$PATH"
+  fi
+
+  # Pre-scaffold: inject skill-using starter files (shadcn pages, drizzle client,
+  # better-auth route, etc.) AFTER the stack defaults exist but BEFORE the
+  # builder runs, so the builder modifies skill-using code instead of choosing
+  # whether to use the skill. Idempotent — skips files the builder has touched.
+  "$ROOT/bin/rds-prescaffold" \
+    --build-dir "$BUILD_DIR" \
+    --app-dest "$APP_DEST" \
+    2>&1 | tee -a "$BUILD_DIR/logs/prescaffold.log" || \
+    log "  prescaffold: non-fatal failure, continuing"
+
+  ensure_app_git_boundary "$APP_DEST"
+
+  (
+    cd "$APP_DEST"
+    if [[ -f "$BUILD_PLAN_PATH" ]]; then
+      export RDS_CODEX_TASK_TIMEOUT_SEC
+      export RDS_CODEX_INFER_TIMEOUT_SEC
+      export RDS_SCAFFOLD_MAX_TURNS
+      export RDS_SCAFFOLD_MAX_BUDGET
+      RDS_CODEX_TASK_TIMEOUT_SEC="$(jq -r '.task_timeout_sec // empty' "$BUILD_PLAN_PATH")"
+      RDS_CODEX_INFER_TIMEOUT_SEC="$RDS_CODEX_TASK_TIMEOUT_SEC"
+      RDS_SCAFFOLD_MAX_TURNS="$(jq -r '.claude_max_turns // empty' "$BUILD_PLAN_PATH")"
+      RDS_SCAFFOLD_MAX_BUDGET="$(jq -r '.claude_budget_usd // empty' "$BUILD_PLAN_PATH")"
+    fi
+    # IS_SANDBOX=1 lets `claude --dangerously-skip-permissions` run as root
+    # under Zo's gVisor sandbox. --headless --batch loops every task with
+    # `claude -p` so the build is fully non-interactive (--max-budget-usd
+    # only works alongside -p).
+    launch_args=(--headless --batch)
+    if [[ -n "${RDS_SCAFFOLD_MAX_TURNS:-}" && "$RDS_SCAFFOLD_MAX_TURNS" != "null" ]]; then
+      launch_args+=(--max-turns "$RDS_SCAFFOLD_MAX_TURNS")
+    fi
+    if [[ -n "${RDS_SCAFFOLD_MAX_BUDGET:-}" && "$RDS_SCAFFOLD_MAX_BUDGET" != "null" ]]; then
+      launch_args+=(--max-budget "$RDS_SCAFFOLD_MAX_BUDGET")
+    fi
+    IS_SANDBOX=1 ./launch-build.sh "${launch_args[@]}"
+    python3 - <<'PY'
+import json, sys
+from pathlib import Path
+
+path = Path("tasks.json")
+if not path.exists():
+    raise SystemExit("FATAL: scaffold did not produce tasks.json")
+data = json.loads(path.read_text())
+tasks = data.get("tasks") if isinstance(data, dict) else data
+if not isinstance(tasks, list) or not tasks:
+    raise SystemExit("FATAL: scaffold tasks.json has no tasks")
+unfinished = [
+    t for t in tasks
+    if str(t.get("status", "")).lower() not in {"done", "skipped"}
+]
+if unfinished:
+    details = "; ".join(
+        f"{t.get('position', '?')}: {t.get('title', 'untitled')} [{t.get('status', 'unknown')}]"
+        for t in unfinished[:8]
+    )
+    more = f"; +{len(unfinished) - 8} more" if len(unfinished) > 8 else ""
+    raise SystemExit(f"FATAL: scaffold incomplete; refusing local-run/deploy until all tasks are done: {details}{more}")
+PY
+  ) 2>&1 | tee -a "$BUILD_DIR/logs/scaffold.log"
+  state_set_stage "$BUILD_DIR" scaffold done
+  refresh_skill_scorecard
+else
+  log "stage 5: scaffold (resume — skipped, already done)"
+  # Re-export Ruby PATH so subsequent stages can find it after a resume.
+  if [[ -x /opt/rubies/ruby-4.0.1/bin/ruby ]]; then
+    export PATH="/opt/rubies/ruby-4.0.1/bin:$PATH"
+  fi
+  refresh_skill_scorecard
+fi
+
+# -------------------- Stage 6: local-run (native, no Docker) --------------------
+if should_run_stage local-run; then
+  run_stage local-run
+  local_run_hook_rel="$(stack_field "$STACK" '.local_run // empty')"
+  if [[ "$local_run_hook_rel" == "null" ]]; then local_run_hook_rel=""; fi
+  log "stage 6: local-run (stack=$STACK)"
+  state_set_stage "$BUILD_DIR" local-run running
+  if [[ -n "$local_run_hook_rel" ]]; then
+    local_run_hook="$ROOT/$local_run_hook_rel"
+    if [[ ! -x "$local_run_hook" ]]; then
+      echo "FATAL: stack '$STACK' local_run hook not executable: $local_run_hook" >&2
+      exit 1
+    fi
+    "$local_run_hook" "$APP_DEST" "$BUILD_DIR" \
+      2>&1 | tee -a "$BUILD_DIR/logs/local-run.log"
+  else
+    (
+    cd "$APP_DEST"
+
+    # Ensure .env exists with a HOST_PORT.
+    if [[ ! -f .env ]]; then
+      if [[ -f .env.example ]]; then
+        cp .env.example .env
+      else
+        : > .env
+      fi
+    fi
+    if ! grep -q '^HOST_PORT=' .env 2>/dev/null; then
+      printf 'HOST_PORT=%s\n' \
+        "$(next_free_port "${RDS_LOCAL_PORT_RANGE_START:-4000}" "${RDS_LOCAL_PORT_RANGE_END:-4099}")" \
+        >> .env
+    fi
+    local_port="$(grep '^HOST_PORT=' .env | head -n1 | cut -d= -f2)"
+
+    # Wire Postgres credentials (Zo's local pg-15 on 5432 has a 'rails' role
+    # with a database for this app). database.yml uses DB_HOST when set.
+    : "${DB_HOST:=127.0.0.1}"
+    : "${DB_USERNAME:=rails}"
+    : "${DB_PASSWORD:=rails}"
+    : "${RAILS_ENV:=development}"
+    export DB_HOST DB_USERNAME DB_PASSWORD RAILS_ENV
+
+    # Locate Ruby 4.0.1 (installed by ruby-install at /opt/rubies).
+    if [[ -x /opt/rubies/ruby-4.0.1/bin/ruby ]]; then
+      export PATH="/opt/rubies/ruby-4.0.1/bin:$PATH"
+    fi
+    command -v bundle >/dev/null || gem install --no-document bundler
+
+    bundle config set --local path "vendor/bundle"
+    bundle install --jobs="$(nproc)"
+
+    bundle exec rails db:prepare
+    bundle exec rails assets:precompile || true
+
+    # Boot Puma in the background, bound to all interfaces.
+    pidfile="$APP_DEST/tmp/pids/server.pid"
+    mkdir -p "$APP_DEST/tmp/pids" "$APP_DEST/log"
+    if [[ -f "$pidfile" ]]; then
+      old_pid="$(cat "$pidfile" 2>/dev/null || true)"
+      if [[ "$old_pid" =~ ^[0-9]+$ ]] && kill -0 "$old_pid" 2>/dev/null; then
+        kill "$old_pid" || true
+        sleep 1
+      fi
+      rm -f "$pidfile"
+    fi
+    setsid nohup bundle exec rails server -b 0.0.0.0 -p "$local_port" -e "$RAILS_ENV" \
+      > "$APP_DEST/log/rails-server.log" 2>&1 &
+
+    timeout="${RDS_WAIT_HEALTH_TIMEOUT_SEC:-120}"
+    poll_interval=2
+    iterations=$(( timeout / poll_interval ))
+    (( iterations < 1 )) && iterations=1
+    health_path="$(stack_field "$STACK" '.health_path // "/up"')"
+    if [[ -z "$health_path" || "$health_path" == "null" ]]; then health_path="/up"; fi
+    log "  waiting up to ${timeout}s for http://localhost:$local_port$health_path ..."
+    healthy=0
+    for i in $(seq 1 "$iterations"); do
+      health_code="$(curl -sS -o /dev/null -w "%{http_code}" "http://localhost:$local_port$health_path" 2>/dev/null || true)"
+      root_code="$(curl -sS -o /dev/null -w "%{http_code}" "http://localhost:$local_port/" 2>/dev/null || true)"
+      if [[ "$health_code" =~ ^[23][0-9][0-9]$ || "$root_code" =~ ^[234][0-9][0-9]$ ]]; then
+        healthy=1; break
+      fi
+      sleep "$poll_interval"
+    done
+    if [[ "$healthy" -ne 1 ]]; then
+      echo "FATAL: app did not report healthy on $health_path or / within ${timeout}s" >&2
+      echo "--- last 50 log lines ---" >&2
+      tail -50 "$APP_DEST/log/rails-server.log" >&2 || true
+      exit 1
+    fi
+    log "  app healthy on port $local_port"
+    ) 2>&1 | tee -a "$BUILD_DIR/logs/local-run.log"
+  fi
+  if [[ -f "$APP_DEST/.env" ]]; then
+    manifest_port="$(grep '^HOST_PORT=' "$APP_DEST/.env" | head -n1 | cut -d= -f2 || true)"
+    update_build_manifest_preview_port "$BUILD_DIR/build.yaml" "$manifest_port"
+  fi
+  state_set_stage "$BUILD_DIR" local-run done
+else
+  log "stage 6: local-run (resume — skipped, already done)"
+fi
+
+# -------------------- Stage 7: deploy --------------------
+if should_run_stage deploy; then
+  run_stage deploy
+  log "stage 7: deploy"
+  state_set_stage "$BUILD_DIR" deploy running
+  "$ROOT/bin/rds-deploy" --build-id="$BUILD_ID" --target="$DEPLOY_TARGET" --app-dir="$APP_DEST" \
+    2>&1 | tee -a "$BUILD_DIR/logs/deploy.log"
+  state_set_stage "$BUILD_DIR" deploy done
+else
+  log "stage 7: deploy (resume — skipped, already done)"
+  if [[ ! -s "$BUILD_DIR/preview-url.txt" ]]; then
+    state_preview="$(jq -r '.preview_url // empty' "$BUILD_DIR/state.json" 2>/dev/null || true)"
+    if [[ -n "$state_preview" ]]; then
+      printf '%s\n' "$state_preview" > "$BUILD_DIR/preview-url.txt"
+      log "  restored preview-url.txt from state: $state_preview"
+    fi
+  fi
+fi
+
+# -------------------- Stage 8: qa (Playwright crawl) --------------------
+# By default QA gaps block the review gate. Set RDS_QA_REQUIRED=0 to make
+# the crawler advisory while iterating on the harness itself.
+# Set RDS_SKIP_QA=1 to bypass entirely (e.g. teardown deploys).
+if should_run_stage qa; then
+  if [[ "${RDS_SKIP_QA:-0}" == "1" || "$DEPLOY_TARGET" == "teardown" ]]; then
+    log "stage 8: qa (skipped — RDS_SKIP_QA=1 or deploy=teardown)"
+    state_set_stage "$BUILD_DIR" qa skipped
+  else
+    run_stage qa
+    log "stage 8: qa (Playwright crawl)"
+    state_set_stage "$BUILD_DIR" qa running
+    trap - ERR
+    set +e
+    qa_max_pages="$(jq -r '.qa_max_pages // empty' "$BUILD_PLAN_PATH" 2>/dev/null || true)"
+    qa_depth="$(jq -r '.qa_depth // empty' "$BUILD_PLAN_PATH" 2>/dev/null || true)"
+    "$ROOT/bin/rds-qa" "$BUILD_ID" --no-state \
+      --max-pages="${qa_max_pages:-${RDS_QA_MAX_PAGES:-40}}" \
+      --depth="${qa_depth:-${RDS_QA_DEPTH:-3}}" \
+      2>&1 | tee -a "$BUILD_DIR/logs/qa.log"
+    qa_rc="${PIPESTATUS[0]}"
+    mockup_rc=0
+    if [[ "${RDS_MOCKUP_FIDELITY_ENABLED:-1}" == "1" ]]; then
+      preview_url="$(cat "$BUILD_DIR/preview-url.txt" 2>/dev/null || jq -r '.preview_url // empty' "$BUILD_DIR/state.json" 2>/dev/null || true)"
+      log "  mockup fidelity check"
+      "$ROOT/bin/rds-mockup" verify \
+        --build-dir="$BUILD_DIR" \
+        --app-dir="$APP_DEST" \
+        --stack="$STACK_CANONICAL" \
+        ${preview_url:+--url="$preview_url"} \
+        2>&1 | tee -a "$BUILD_DIR/logs/qa.log"
+      mockup_rc="${PIPESTATUS[0]}"
+    fi
+    set -e
+    trap on_err ERR
+    if [[ "$qa_rc" -eq 0 && "$mockup_rc" -eq 0 ]]; then
+      log "  qa converged (zero gaps)"
+      state_set_stage "$BUILD_DIR" qa done
+    elif [[ "$qa_rc" -eq 1 || "$mockup_rc" -eq 1 ]]; then
+      log "  qa found gaps — see /b/$BUILD_ID/playwright"
+      if [[ "${RDS_QA_REQUIRED:-1}" == "1" && "${RDS_TASTE_AUTO_ITERATE:-1}" != "1" ]]; then
+        state_set_stage "$BUILD_DIR" qa failed
+        state_set_error "$BUILD_DIR" "qa found gaps; see playwright and mockup fidelity results"
+        emit_event "build_failed" stage="qa" exit_code="1"
+        exit 1
+      else
+        log "  qa gaps will be handled by taste review / auto-iteration"
+        state_set_stage "$BUILD_DIR" qa done
+      fi
+    else
+      log "  qa harness failed (qa_rc=$qa_rc mockup_rc=$mockup_rc)"
+      state_set_stage "$BUILD_DIR" qa failed
+      if [[ "${RDS_QA_REQUIRED:-1}" == "1" ]]; then
+        state_set_error "$BUILD_DIR" "qa harness failed (qa_rc=$qa_rc mockup_rc=$mockup_rc)"
+        emit_event "build_failed" stage="qa" exit_code="${qa_rc:-$mockup_rc}"
+        exit "$([[ "$qa_rc" -ne 0 ]] && echo "$qa_rc" || echo "$mockup_rc")"
+      fi
+    fi
+    refresh_skill_scorecard
+    "$ROOT/bin/rds-quality-ledger" "$BUILD_ID" >/dev/null 2>&1 || true
+    "$ROOT/bin/rds-evidence-ledger" "$BUILD_ID" >/dev/null 2>&1 || true
+  fi
+else
+  log "stage 8: qa (resume — skipped, already done)"
+fi
+
+# -------------------- Stage 9: taste review + one controlled iteration --------------------
+if should_run_stage taste-review; then
+  run_stage taste-review
+  if [[ "${RDS_TASTE_ENABLED:-1}" != "1" || "${RDS_SKIP_TASTE_REVIEW:-0}" == "1" || "$DEPLOY_TARGET" == "teardown" ]]; then
+    log "stage 9: taste review (skipped)"
+    state_set_stage "$BUILD_DIR" taste-review skipped
+  else
+    log "stage 9: taste review"
+    state_set_stage "$BUILD_DIR" taste-review running
+    trap - ERR
+    set +e
+    "$ROOT/bin/rds-taste-review" "$BUILD_ID" \
+      2>&1 | tee -a "$BUILD_DIR/logs/taste-review.log"
+    taste_rc="${PIPESTATUS[0]}"
+    set -e
+    trap on_err ERR
+    if [[ "$taste_rc" -eq 0 ]]; then
+      log "  taste review passed"
+      state_set_stage "$BUILD_DIR" taste-review done
+      "$ROOT/bin/rds-quality-ledger" "$BUILD_ID" >/dev/null 2>&1 || true
+      "$ROOT/bin/rds-evidence-ledger" "$BUILD_ID" >/dev/null 2>&1 || true
+    elif [[ "$taste_rc" -eq 1 && "${RDS_TASTE_AUTO_ITERATE:-1}" == "1" ]]; then
+      log "  taste review requested one improvement pass"
+      emit_event "taste_iteration_started" prompt="builds/$BUILD_ID/taste-iteration-prompt.md"
+      trap - ERR
+      set +e
+      "$ROOT/bin/rds-iterate" "$BUILD_ID" \
+        --prompt="$(cat "$BUILD_DIR/taste-iteration-prompt.md")" \
+        --yes \
+        2>&1 | tee -a "$BUILD_DIR/logs/taste-review.log"
+      iterate_rc="${PIPESTATUS[0]}"
+      set -e
+      trap on_err ERR
+      if [[ "$iterate_rc" -ne 0 ]]; then
+        state_set_stage "$BUILD_DIR" taste-review failed
+        state_set_error "$BUILD_DIR" "taste iteration failed; see logs/taste-review.log"
+        emit_event "build_failed" stage="taste-review" exit_code="$iterate_rc"
+        exit "$iterate_rc"
+      fi
+      # rds-iterate exits 0 in two terminal cases: success, OR
+      # "needs operator review" (autonomous recovery exhausted). In the
+      # second case, the inner iterate already wrote state.review.status
+      # = "pending" via finish_needs_review. Don't blindly re-run
+      # rds-taste-review or escalate to build_failed — that turns a
+      # human-review-needed result into an infinite watchdog loop.
+      review_status="$(jq -r '.review.status // empty' "$BUILD_DIR/state.json" 2>/dev/null || true)"
+      review_reason="$(jq -r '.review.reason // empty' "$BUILD_DIR/state.json" 2>/dev/null || true)"
+      needs_review_latest="$(grep -E '"event":"(iterate_needs_review|iterate_qa_completed|iterate_started)"' "$BUILD_DIR/events.jsonl" 2>/dev/null | tail -n1 | grep -oF '"event":"iterate_needs_review"' || true)"
+      if [[ "$review_status" == "pending" && -n "$needs_review_latest" ]]; then
+        emit_event "build_pending_review" stage="taste-review" reason="${review_reason:-needs operator review}"
+        state_set_stage "$BUILD_DIR" taste-review pending-review
+        exit 0
+      fi
+      trap - ERR
+      set +e
+      "$ROOT/bin/rds-taste-review" "$BUILD_ID" \
+        2>&1 | tee -a "$BUILD_DIR/logs/taste-review.log"
+      taste_after_rc="${PIPESTATUS[0]}"
+      set -e
+      trap on_err ERR
+      if [[ "$taste_after_rc" -eq 0 || "${RDS_TASTE_REQUIRED:-1}" != "1" ]]; then
+        emit_event "taste_iteration_completed" prompt="builds/$BUILD_ID/taste-iteration-prompt.md"
+        state_set_stage "$BUILD_DIR" taste-review done
+        "$ROOT/bin/rds-quality-ledger" "$BUILD_ID" >/dev/null 2>&1 || true
+        "$ROOT/bin/rds-evidence-ledger" "$BUILD_ID" >/dev/null 2>&1 || true
+      else
+        state_set_stage "$BUILD_DIR" taste-review pending-review
+        state_set_error "$BUILD_DIR" "taste review still needs iteration after one pass; see taste-review.json"
+        state_set_review "$BUILD_DIR" pending "rds-build" "taste review still below threshold after one autonomous pass" || true
+        emit_event "build_pending_review" stage="taste-review" reason="taste below threshold after one autonomous pass"
+        exit 0
+      fi
+    elif [[ "${RDS_TASTE_REQUIRED:-1}" == "1" ]]; then
+      state_set_stage "$BUILD_DIR" taste-review failed
+      state_set_error "$BUILD_DIR" "taste review failed; see taste-review.json and taste-iteration-prompt.md"
+      emit_event "build_failed" stage="taste-review" exit_code="$taste_rc"
+      exit "$taste_rc"
+    else
+      log "  taste review needs iteration but is advisory"
+      state_set_stage "$BUILD_DIR" taste-review done
+    fi
+  fi
+else
+  log "stage 9: taste review (resume — skipped, already done)"
+fi
+
+# -------------------- Done --------------------
+trap - ERR
+clear_run_pid
+if [[ -n "$_current_stage" ]]; then
+  emit_event "stage_completed" stage="$_current_stage"
+fi
+state_mark_complete "$BUILD_DIR"
+preview="$(cat "$BUILD_DIR/preview-url.txt" 2>/dev/null || echo '<none>')"
+state_set_preview "$BUILD_DIR" "$preview"
+
+# Refresh cost telemetry from claude session logs (TD-032). Best-effort.
+"$ROOT/bin/rds-cost" "$BUILD_ID" >/dev/null 2>&1 || true
+"$ROOT/bin/rds-speed-report" "$BUILD_ID" >/dev/null 2>&1 || true
+refresh_skill_scorecard
+"$ROOT/bin/rds-quality-ledger" "$BUILD_ID" >/dev/null 2>&1 || true
+"$ROOT/bin/rds-evidence-ledger" "$BUILD_ID" >/dev/null 2>&1 || true
+
+if [[ "${RDS_READINESS_REQUIRED:-1}" == "1" && "$DEPLOY_TARGET" != "teardown" ]]; then
+  log "final gate: autonomous readiness"
+  set +e
+  "$ROOT/bin/rds-readiness" "$BUILD_ID" \
+    2>&1 | tee -a "$BUILD_DIR/logs/readiness.log"
+  readiness_rc="${PIPESTATUS[0]}"
+  set -e
+  if [[ "$readiness_rc" -ne 0 ]]; then
+    "$ROOT/bin/rds-evidence-ledger" "$BUILD_ID" >/dev/null 2>&1 || true
+    state_set_error "$BUILD_DIR" "autonomous readiness failed; see readiness.json"
+    emit_event "build_failed" stage="readiness" exit_code="$readiness_rc"
+    log_err "build $BUILD_ID failed autonomous readiness; refusing operator-review state."
+    exit "$readiness_rc"
+  fi
+  emit_event "readiness_passed" report="builds/$BUILD_ID/readiness.json"
+  "$ROOT/bin/rds-evidence-ledger" "$BUILD_ID" >/dev/null 2>&1 || true
+elif [[ "$DEPLOY_TARGET" != "teardown" ]]; then
+  log "final gate: autonomous readiness skipped (RDS_READINESS_REQUIRED=0)"
+fi
+
+# Approval gate (TD-033). Default behaviour: every successful build parks at
+# `pending_operator_review` so a human can eyeball the running app before we
+# claim "complete". Set RDS_AUTO_APPROVE=1 to bypass (CI / one-shot demos).
+if [[ "${RDS_AUTO_APPROVE:-0}" -eq 1 ]]; then
+  emit_event "build_completed" preview_url="$preview"
+  log "build $BUILD_ID complete (auto-approved) — preview: $preview"
+else
+  existing_review="$(jq -r '.review.status // "not_required"' "$BUILD_DIR/state.json" 2>/dev/null || echo not_required)"
+  case "$existing_review" in
+    approved)
+      emit_event "build_completed" preview_url="$preview"
+      log "build $BUILD_ID pipeline finished — already approved; no review ping."
+      log "  preview: $preview"
+      ;;
+    rejected)
+      log "build $BUILD_ID pipeline finished — already rejected; no review ping."
+      log "  preview: $preview"
+      ;;
+    *)
+      state_set_review "$BUILD_DIR" pending
+      emit_event "build_pending_review" preview_url="$preview"
+      "$ROOT/bin/rds-evidence-ledger" "$BUILD_ID" >/dev/null 2>&1 || true
+      log "build $BUILD_ID pipeline finished — pending operator review."
+      log "  preview: $preview"
+      log "  approve: bin/rds-approve $BUILD_ID"
+      log "  reject : bin/rds-reject  $BUILD_ID --reason=\"why\""
+      # Best-effort Telegram ping so the operator notices.
+      "$ROOT/bin/rds-notify" build_pending_review \
+        --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+        >/dev/null 2>&1 || true
+      ;;
+  esac
+fi

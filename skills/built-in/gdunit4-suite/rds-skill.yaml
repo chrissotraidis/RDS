@@ -1,0 +1,20 @@
+---
+slug: gdunit4-suite
+name: GdUnit4 suite
+status: ready
+default: false
+applies_to:
+- game-engine
+description: Godot unit test suite contract.
+install:
+  command: bin/rds-skill-materialize gdunit4-suite
+verify:
+  command: bin/rds-skill-verify gdunit4-suite
+maturity: beta
+category: testing
+rationale: Curated from the RDS V1 stack and skills research as a capability RDS should
+  understand during stack selection, skill resolution, implementation guidance, or
+  verification.
+source_links:
+- label: github.com
+  url: https://github.com/MikeSchulze/gdUnit4

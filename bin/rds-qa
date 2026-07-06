@@ -1,0 +1,407 @@
+#!/usr/bin/env bash
+# bin/rds-qa — post-build QA loop driver (TD-025 v0).
+#
+# Runs the Playwright crawler against a build's deployed URL, writes the
+# nav-graph + gap list to builds/<id>/playwright/iter-NNN/, and updates
+# state.json with the iteration outcome.
+#
+# v0 behaviour (single-iteration, advisory):
+#   - One crawl pass. No remediation auto-injection yet.
+#   - Exits 0 on converged (zero gaps), 1 on gaps found, 2 on harness fatal.
+#   - Always writes summary + gaps + screenshots to builds/<id>/playwright/.
+#
+# Usage:
+#   bin/rds-qa <build-id> [--base-url=<url>] [--max-pages=20] [--depth=2] [--no-state]
+#
+# When --base-url is omitted, rds-qa reads builds/<id>/preview-url.txt:
+#   - http(s)://...  → use as-is
+#   - pending-zo-registration://port=N;...  → fall back to http://localhost:N
+#   - empty / missing → exit 2 with explanation
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck disable=SC1091
+source "$ROOT/bin/lib/common.sh"
+# shellcheck disable=SC1091
+source "$ROOT/bin/lib/logging.sh"
+
+BUILD_ID="${1:-}"
+if [[ -z "$BUILD_ID" || "${BUILD_ID:0:2}" == "--" ]]; then
+  echo "Usage: bin/rds-qa <build-id> [--base-url=<url>]" >&2
+  exit 2
+fi
+shift || true
+
+BASE_URL="$(parse_flag --base-url   "$@" || echo "")"
+MAX_PAGES="$(parse_flag --max-pages "$@" || echo "${RDS_QA_MAX_PAGES:-40}")"
+DEPTH="$(parse_flag --depth         "$@" || echo "${RDS_QA_DEPTH:-3}")"
+NO_STATE="$(parse_flag --no-state   "$@" || echo "")"
+
+BUILD_DIR="$RDS_BUILDS_DIR/$BUILD_ID"
+[[ -d "$BUILD_DIR" ]] || { echo "FATAL: build $BUILD_ID not found" >&2; exit 2; }
+
+# Resolve base URL.
+if [[ -z "$BASE_URL" ]]; then
+  preview="$(cat "$BUILD_DIR/preview-url.txt" 2>/dev/null || true)"
+  if [[ -z "$preview" ]]; then
+    echo "FATAL: no preview-url.txt and --base-url not supplied. Build hasn't deployed yet." >&2
+    exit 2
+  fi
+  case "$preview" in
+    http://*|https://*)
+      BASE_URL="$preview"
+      ;;
+    pending-zo-registration://*)
+      port="$(printf '%s' "$preview" | sed -n 's/.*port=\([0-9][0-9]*\).*/\1/p')"
+      if [[ -z "$port" ]]; then
+        echo "FATAL: could not parse port from sentinel: $preview" >&2
+        exit 2
+      fi
+      BASE_URL="http://localhost:$port"
+      log "  preview is pending-zo-registration; crawling localhost:$port instead"
+      ;;
+    *)
+      echo "FATAL: unrecognized preview-url '$preview'" >&2
+      exit 2
+      ;;
+  esac
+fi
+
+# Iteration index.
+QA_ROOT="$BUILD_DIR/playwright"
+mkdir -p "$QA_ROOT"
+next=1
+for d in "$QA_ROOT"/iter-*; do
+  [[ -d "$d" ]] || continue
+  n="$(basename "$d")"; n="${n#iter-}"; n="${n#0}"; n="${n#0}"
+  if [[ "$n" =~ ^[0-9]+$ ]] && (( n >= next )); then next=$((n+1)); fi
+done
+ITER_DIR="$QA_ROOT/$(printf 'iter-%03d' "$next")"
+mkdir -p "$ITER_DIR"
+
+log "rds-qa $BUILD_ID iter=$next base=$BASE_URL"
+if [[ -f "$BUILD_DIR/deploy-fingerprint.json" ]]; then
+  cp "$BUILD_DIR/deploy-fingerprint.json" "$ITER_DIR/deploy-fingerprint.json"
+fi
+if [[ -f "$BUILD_DIR/service-runtime.json" ]]; then
+  cp "$BUILD_DIR/service-runtime.json" "$ITER_DIR/service-runtime.json"
+fi
+jq -n \
+  --arg base_url "$BASE_URL" \
+  --arg deploy_fingerprint "$(if [[ -f "$ITER_DIR/deploy-fingerprint.json" ]]; then printf 'playwright/%s/deploy-fingerprint.json' "$(basename "$ITER_DIR")"; else printf ''; fi)" \
+  --arg service_runtime "$(if [[ -f "$ITER_DIR/service-runtime.json" ]]; then printf 'playwright/%s/service-runtime.json' "$(basename "$ITER_DIR")"; else printf ''; fi)" \
+  '{schema:"rds.qa-target.v1", baseUrl:$base_url, capturedAt:(now | todate), deployFingerprint:(if $deploy_fingerprint == "" then null else $deploy_fingerprint end), serviceRuntime:(if $service_runtime == "" then null else $service_runtime end)}' \
+  > "$ITER_DIR/qa-target.json"
+
+APP_TYPE="$(jq -r '.app_type // "auto"' "$BUILD_DIR/state.json" 2>/dev/null || echo auto)"
+if [[ "$APP_TYPE" == "auto" || -z "$APP_TYPE" ]]; then
+  APP_TYPE="$(jq -r '.app_type // .kind // "auto"' "$BUILD_DIR/taste-brief.json" 2>/dev/null || echo auto)"
+fi
+case "$APP_TYPE" in
+  games) APP_TYPE="game" ;;
+  app|webapp|interactive_web|interactive-web) APP_TYPE="web-app" ;;
+esac
+SCENARIOS_PATH="$BUILD_DIR/qa-scenarios.json"
+
+# Self-healing scenario contract.
+# qa-scenarios.json is generated once at build time and then frozen. If the PRD
+# later evolves — or the build-time generator emitted a bogus scenario (e.g. a
+# "Submit order" workflow for an app whose PRD says it is read-only) — every QA
+# pass keeps grading the app against that stale contract and the iteration loop
+# spins on blockers that no longer reflect the spec. Before crawling, re-gate
+# the contract against the current PRD; if it fails, regenerate it from spec.md
+# and re-gate, so QA always tests what the PRD now promises. Disable with
+# RDS_QA_SCENARIO_SELFHEAL=0.
+if [[ "${RDS_QA_SCENARIO_SELFHEAL:-1}" == "1" && -f "$SCENARIOS_PATH" && -f "$BUILD_DIR/spec.md" ]]; then
+  set +e
+  python3 "$ROOT/bin/rds-scenario-gate" "$BUILD_ID" --root "$ROOT" >/dev/null 2>&1
+  gate_pre=$?
+  set -e
+  if [[ -f "$BUILD_DIR/qa-scenario-gate.json" ]]; then
+    cp "$BUILD_DIR/qa-scenario-gate.json" "$ITER_DIR/scenario-gate-pre.json"
+  fi
+  if (( gate_pre != 0 )); then
+    log "  scenario contract is stale/invalid (gate rc=$gate_pre); regenerating from current spec"
+    set +e
+    python3 "$ROOT/bin/rds-qa-scenarios" "$BUILD_ID" --root "$ROOT" > "$ITER_DIR/scenario-regen.log" 2>&1
+    regen_rc=$?
+    python3 "$ROOT/bin/rds-scenario-gate" "$BUILD_ID" --root "$ROOT" >/dev/null 2>&1
+    gate_post=$?
+    set -e
+    if [[ -f "$BUILD_DIR/qa-scenario-gate.json" ]]; then
+      cp "$BUILD_DIR/qa-scenario-gate.json" "$ITER_DIR/scenario-gate-post.json"
+    fi
+    if (( regen_rc == 0 && gate_post == 0 )); then
+      log "  scenario contract regenerated and now passes the gate"
+    else
+      log "  scenario contract still failing after regen (regen=$regen_rc gate=$gate_post); QA proceeds with best-effort contract"
+    fi
+    "$ROOT/bin/rds-event" qa_scenarios_selfhealed \
+      --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+      iteration="$next" gate_before="$gate_pre" regen_rc="$regen_rc" gate_after="$gate_post" \
+      >/dev/null 2>&1 || true
+  fi
+fi
+
+# Mark stage running unless caller asked us not to (when invoked from rds-build,
+# state is already managed by the parent script, but rds-build now relies on
+# us doing the bookkeeping consistently).
+if [[ -z "$NO_STATE" ]]; then
+  # shellcheck disable=SC1091
+  source "$ROOT/bin/lib/state.sh"
+  state_set_stage "$BUILD_DIR" qa running
+fi
+
+# Ensure dashboard's Playwright dep is reachable from lib/rds-qa/.
+# We reuse the dashboard's installed playwright by running through bun.
+cd "$ROOT/dashboard" >/dev/null
+
+set +e
+bun run "$ROOT/lib/rds-qa/crawler.ts" \
+  --base-url="$BASE_URL" \
+  --out-dir="$ITER_DIR" \
+  --max-pages="$MAX_PAGES" \
+  --depth="$DEPTH" \
+  > "$ITER_DIR/run.log" 2>&1
+rc=$?
+set -e
+
+# Surface short summary on stdout for the caller.
+if [[ -f "$ITER_DIR/summary.json" ]]; then
+  pages="$(jq -r '.pagesVisited' "$ITER_DIR/summary.json" 2>/dev/null || echo 0)"
+  gaps="$(jq -r '.gapsFound'    "$ITER_DIR/summary.json" 2>/dev/null || echo 0)"
+  conv="$(jq -r '.converged'    "$ITER_DIR/summary.json" 2>/dev/null || echo false)"
+  log "  iter=$next pages=$pages gaps=$gaps converged=$conv"
+  echo "{\"iteration\":$next,\"pagesVisited\":$pages,\"gapsFound\":$gaps,\"converged\":$conv}"
+  verdict_cmd="$ROOT/bin/rds-qa-verdict"
+  if [[ -x "$verdict_cmd" ]]; then
+    set +e
+    "$verdict_cmd" "$BUILD_ID" --iteration="$next" > "$ITER_DIR/spec-verdict.log" 2>&1
+    verdict_rc=$?
+    set -e
+  if [[ "$verdict_rc" -ne 0 ]]; then
+      log "  spec verdict failed; see $ITER_DIR/spec-verdict.json"
+      rc=1
+    else
+      verdict_overall="$(jq -r '.overall // "unknown"' "$ITER_DIR/spec-verdict.json" 2>/dev/null || echo unknown)"
+      log "  spec verdict overall=$verdict_overall"
+    fi
+  fi
+  if [[ "$APP_TYPE" == "game" ]]; then
+    set +e
+    bun run "$ROOT/lib/rds-qa/game-uat.ts" \
+      --base-url="$BASE_URL" \
+      --out-dir="$ITER_DIR" \
+      --scenarios="$SCENARIOS_PATH" \
+      > "$ITER_DIR/game-uat.log" 2>&1
+    game_rc=$?
+    set -e
+    if [[ -f "$ITER_DIR/game-verdict.json" ]]; then
+      game_status="$(jq -r '.status // "unknown"' "$ITER_DIR/game-verdict.json" 2>/dev/null || echo unknown)"
+      game_score="$(jq -r '.score // "unknown"' "$ITER_DIR/game-verdict.json" 2>/dev/null || echo unknown)"
+      log "  game UAT status=$game_status score=$game_score"
+    else
+      log "  game UAT did not produce a verdict; see $ITER_DIR/game-uat.log"
+    fi
+    if [[ "$game_rc" -eq 1 ]]; then
+      rc=1
+    elif [[ "$game_rc" -ne 0 ]]; then
+      rc=2
+    fi
+  elif [[ "$APP_TYPE" == "website" ]]; then
+    set +e
+    bun run "$ROOT/lib/rds-qa/website-uat.ts" \
+      --base-url="$BASE_URL" \
+      --out-dir="$ITER_DIR" \
+      --scenarios="$SCENARIOS_PATH" \
+      > "$ITER_DIR/website-uat.log" 2>&1
+    typed_rc=$?
+    set -e
+    if [[ -f "$ITER_DIR/website-verdict.json" ]]; then
+      typed_status="$(jq -r '.status // "unknown"' "$ITER_DIR/website-verdict.json" 2>/dev/null || echo unknown)"
+      typed_score="$(jq -r '.score // "unknown"' "$ITER_DIR/website-verdict.json" 2>/dev/null || echo unknown)"
+      log "  website UAT status=$typed_status score=$typed_score"
+    else
+      log "  website UAT did not produce a verdict; see $ITER_DIR/website-uat.log"
+    fi
+    if [[ "$typed_rc" -eq 1 ]]; then
+      rc=1
+    elif [[ "$typed_rc" -ne 0 ]]; then
+      rc=2
+    fi
+  elif [[ "$APP_TYPE" == "web-app" || "$APP_TYPE" == "dashboard" || "$APP_TYPE" == "internal-tool" ]]; then
+    set +e
+    bun run "$ROOT/lib/rds-qa/workflow-uat.ts" \
+      --base-url="$BASE_URL" \
+      --out-dir="$ITER_DIR" \
+      --scenarios="$SCENARIOS_PATH" \
+      > "$ITER_DIR/workflow-uat.log" 2>&1
+    typed_rc=$?
+    set -e
+    if [[ -f "$ITER_DIR/workflow-verdict.json" ]]; then
+      typed_status="$(jq -r '.status // "unknown"' "$ITER_DIR/workflow-verdict.json" 2>/dev/null || echo unknown)"
+      typed_score="$(jq -r '.score // "unknown"' "$ITER_DIR/workflow-verdict.json" 2>/dev/null || echo unknown)"
+      log "  workflow UAT status=$typed_status score=$typed_score"
+    else
+      log "  workflow UAT did not produce a verdict; see $ITER_DIR/workflow-uat.log"
+    fi
+    if [[ "$typed_rc" -eq 1 ]]; then
+      rc=1
+    elif [[ "$typed_rc" -ne 0 ]]; then
+      rc=2
+    fi
+  fi
+  set +e
+  bun run "$ROOT/lib/rds-qa/visual-audit.ts" \
+    --base-url="$BASE_URL" \
+    --out-dir="$ITER_DIR" \
+    > "$ITER_DIR/visual-audit.log" 2>&1
+  visual_rc=$?
+  set -e
+  if [[ -f "$ITER_DIR/visual-verdict.json" ]]; then
+    visual_status="$(jq -r '.status // "unknown"' "$ITER_DIR/visual-verdict.json" 2>/dev/null || echo unknown)"
+    visual_blockers="$(jq -r '.blockerCount // "unknown"' "$ITER_DIR/visual-verdict.json" 2>/dev/null || echo unknown)"
+    log "  visual audit status=$visual_status blockers=$visual_blockers"
+  else
+    log "  visual audit did not produce a verdict; see $ITER_DIR/visual-audit.log"
+  fi
+  if [[ "$visual_rc" -eq 1 ]]; then
+    rc=1
+  elif [[ "$visual_rc" -ne 0 ]]; then
+    rc=2
+  fi
+  if [[ "${RDS_DESIGN_REVIEW_ENABLED:-1}" == "1" ]]; then
+    design_timeout="${RDS_DESIGN_REVIEW_TIMEOUT_SEC:-180}"
+    set +e
+    timeout "$design_timeout" "$ROOT/bin/rds-design-review" "$BUILD_ID" --iteration-dir="$ITER_DIR" \
+      > "$ITER_DIR/design-review.log" 2>&1
+    design_rc=$?
+    set -e
+    if [[ "$design_rc" -eq 124 || "$design_rc" -eq 137 ]]; then
+      python3 - "$ITER_DIR/design-review.json" "$ITER_DIR" "$design_timeout" <<'PY'
+import json
+import sys
+from pathlib import Path
+out_path, iter_dir, timeout = sys.argv[1:]
+screenshots = sorted(str(p) for p in Path(iter_dir).glob("*.png"))
+payload = {
+    "schema": "rds.qa.design-review.v1",
+    "status": "skipped",
+    "score": None,
+    "summary": f"Design review skipped: reviewer exceeded {timeout}s timeout",
+    "issues": [],
+    "reviewerError": {"kind": "timeout", "evidence": f"rds-design-review exceeded {timeout}s"},
+    "screenshotsReviewed": screenshots[:10],
+}
+Path(out_path).write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+PY
+      design_rc=0
+    fi
+    if [[ -f "$ITER_DIR/design-review.json" ]]; then
+      design_status="$(jq -r '.status // "unknown"' "$ITER_DIR/design-review.json" 2>/dev/null || echo unknown)"
+      design_score="$(jq -r '.score // "unknown"' "$ITER_DIR/design-review.json" 2>/dev/null || echo unknown)"
+      log "  design review status=$design_status score=$design_score"
+    else
+      log "  design review did not produce a verdict; see $ITER_DIR/design-review.log"
+    fi
+    if [[ "$design_rc" -eq 1 ]]; then
+      rc=1
+    elif [[ "$design_rc" -ne 0 ]]; then
+      rc=2
+    fi
+  else
+    log "  design review skipped (RDS_DESIGN_REVIEW_ENABLED=0)"
+  fi
+  SOURCE_DIR=""
+  if [[ -d "$BUILD_DIR/deploy-snapshot" ]]; then
+    SOURCE_DIR="$BUILD_DIR/deploy-snapshot"
+  elif [[ -d "$BUILD_DIR/scaffold-out" ]]; then
+    SOURCE_DIR="$BUILD_DIR/scaffold-out"
+  fi
+  truth_args=(--base-url="$BASE_URL" --out-dir="$ITER_DIR")
+  if [[ -n "$SOURCE_DIR" ]]; then
+    truth_args+=(--source-dir="$SOURCE_DIR")
+  fi
+  set +e
+  bun run "$ROOT/lib/rds-qa/truthfulness-audit.ts" "${truth_args[@]}" \
+    > "$ITER_DIR/truthfulness-audit.log" 2>&1
+  truth_rc=$?
+  set -e
+  if [[ -f "$ITER_DIR/truthfulness-verdict.json" ]]; then
+    truth_status="$(jq -r '.status // "unknown"' "$ITER_DIR/truthfulness-verdict.json" 2>/dev/null || echo unknown)"
+    truth_score="$(jq -r '.score // "unknown"' "$ITER_DIR/truthfulness-verdict.json" 2>/dev/null || echo unknown)"
+    log "  truthfulness audit status=$truth_status score=$truth_score"
+  else
+    log "  truthfulness audit did not produce a verdict; see $ITER_DIR/truthfulness-audit.log"
+  fi
+  if [[ "$truth_rc" -eq 1 ]]; then
+    rc=1
+  elif [[ "$truth_rc" -ne 0 ]]; then
+    rc=2
+  fi
+  persona_args=(--base-url="$BASE_URL" --out-dir="$ITER_DIR")
+  if [[ -n "$SOURCE_DIR" ]]; then
+    persona_args+=(--source-dir="$SOURCE_DIR")
+  fi
+  set +e
+  bun run "$ROOT/lib/rds-qa/persona-uat.ts" "${persona_args[@]}" \
+    > "$ITER_DIR/persona-uat.log" 2>&1
+  persona_rc=$?
+  set -e
+  if [[ -f "$ITER_DIR/persona-verdict.json" ]]; then
+    persona_status="$(jq -r '.status // "unknown"' "$ITER_DIR/persona-verdict.json" 2>/dev/null || echo unknown)"
+    persona_score="$(jq -r '.score // "unknown"' "$ITER_DIR/persona-verdict.json" 2>/dev/null || echo unknown)"
+    log "  persona UAT status=$persona_status score=$persona_score"
+  else
+    log "  persona UAT did not produce a verdict; see $ITER_DIR/persona-uat.log"
+  fi
+  if [[ "$persona_rc" -eq 1 ]]; then
+    rc=1
+  elif [[ "$persona_rc" -ne 0 ]]; then
+    rc=2
+  fi
+  coverage_args=(--base-url="$BASE_URL" --out-dir="$ITER_DIR")
+  if [[ -n "$SOURCE_DIR" ]]; then
+    coverage_args+=(--source-dir="$SOURCE_DIR")
+  fi
+  set +e
+  bun run "$ROOT/lib/rds-qa/prd-coverage-audit.ts" "${coverage_args[@]}" \
+    > "$ITER_DIR/prd-coverage-audit.log" 2>&1
+  coverage_rc=$?
+  set -e
+  if [[ -f "$ITER_DIR/prd-coverage-verdict.json" ]]; then
+    coverage_status="$(jq -r '.status // "unknown"' "$ITER_DIR/prd-coverage-verdict.json" 2>/dev/null || echo unknown)"
+    coverage_score="$(jq -r '.score // "unknown"' "$ITER_DIR/prd-coverage-verdict.json" 2>/dev/null || echo unknown)"
+    log "  PRD coverage status=$coverage_status score=$coverage_score"
+  else
+    log "  PRD coverage did not produce a verdict; see $ITER_DIR/prd-coverage-audit.log"
+  fi
+  if [[ "$coverage_rc" -eq 1 ]]; then
+    rc=1
+  elif [[ "$coverage_rc" -ne 0 ]]; then
+    rc=2
+  fi
+else
+  log "  iter=$next harness failed (rc=$rc); see $ITER_DIR/run.log"
+fi
+
+# Mark stage status unless told not to.
+if [[ -z "$NO_STATE" ]]; then
+  if [[ "$rc" -eq 0 ]]; then
+    state_set_stage "$BUILD_DIR" qa done
+  elif [[ "$rc" -eq 1 ]]; then
+    state_set_stage "$BUILD_DIR" qa failed
+    state_set_error "$BUILD_DIR" "qa found blocking gaps; see playwright/iter-$(printf '%03d' "$next")"
+  else
+    state_set_stage "$BUILD_DIR" qa failed
+    state_set_error "$BUILD_DIR" "qa harness failed (rc=$rc); see playwright/iter-$(printf '%03d' "$next")/run.log"
+  fi
+fi
+
+# Best-effort event emission so the dashboard's stream picks it up.
+"$ROOT/bin/rds-event" qa_iteration_completed \
+  --build-id "$BUILD_ID" --build-dir "$BUILD_DIR" \
+  iteration="$next" rc="$rc" base_url="$BASE_URL" \
+  >/dev/null 2>&1 || true
+
+exit "$rc"

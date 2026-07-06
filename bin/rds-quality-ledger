@@ -1,0 +1,223 @@
+#!/usr/bin/env python3
+"""Summarize the quality gates that guarded an RDS build."""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+from typing import Any
+
+
+def read_text(path: Path, limit: int = 200_000) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="ignore")[:limit]
+    except Exception:
+        return ""
+
+
+def read_json(path: Path) -> Any:
+    try:
+        return json.loads(read_text(path))
+    except Exception:
+        return None
+
+
+def latest_iter(build_dir: Path) -> Path | None:
+    root = build_dir / "playwright"
+    iters = sorted(p for p in root.glob("iter-*") if p.is_dir()) if root.exists() else []
+    return iters[-1] if iters else None
+
+
+def status_from(path: Path, *keys: str) -> Any:
+    data = read_json(path)
+    if not isinstance(data, dict):
+        return None
+    for key in keys:
+        if key in data:
+            return data[key]
+    return None
+
+
+def blocking_value(name: str, value: Any) -> bool:
+    if value in {False, "fail", "failed", "needs_iteration", "partial"}:
+        return True
+    if name == "design" and value in {"missing", "unknown", "skipped"}:
+        return True
+    return False
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("build_id")
+    parser.add_argument("--root", default=str(Path(__file__).resolve().parents[1]))
+    args = parser.parse_args()
+
+    root = Path(args.root).resolve()
+    build_dir = root / "builds" / args.build_id
+    state = read_json(build_dir / "state.json") or {}
+    skills = read_json(build_dir / "skills" / "resolved.json") or {}
+    installed = read_json(build_dir / "skills" / "installed.json") or {}
+    scorecard = read_json(build_dir / "skills" / "scorecard.json") or {}
+    scenarios = read_json(build_dir / "qa-scenarios.json") or {}
+    iter_dir = latest_iter(build_dir)
+
+    verdicts: dict[str, Any] = {}
+    if iter_dir:
+        for name, file_name, keys in [
+            ("crawler", "summary.json", ("converged",)),
+            ("spec", "spec-verdict.json", ("overall",)),
+            ("game", "game-verdict.json", ("status",)),
+            ("website", "website-verdict.json", ("status",)),
+            ("workflow", "workflow-verdict.json", ("status",)),
+            ("truthfulness", "truthfulness-verdict.json", ("status",)),
+            ("persona", "persona-verdict.json", ("status",)),
+            ("prdCoverage", "prd-coverage-verdict.json", ("status",)),
+            ("scenarios", "scenario-verdict.json", ("status",)),
+            ("visual", "visual-verdict.json", ("status",)),
+            ("design", "design-review.json", ("status",)),
+        ]:
+            value = status_from(iter_dir / file_name, *keys)
+            if value is not None:
+                verdicts[name] = value
+    mockup_status = status_from(build_dir / "mockup-diff" / "report.json", "status")
+    if mockup_status is not None:
+        verdicts["mockup"] = mockup_status
+    taste = read_json(build_dir / "taste-review.json") or {}
+    if isinstance(taste, dict) and taste.get("status"):
+        verdicts["taste"] = taste.get("status")
+    scorecard_entries = scorecard.get("skills") if isinstance(scorecard, dict) and isinstance(scorecard.get("skills"), list) else []
+    scorecard_totals = scorecard.get("totals") if isinstance(scorecard, dict) and isinstance(scorecard.get("totals"), dict) else {}
+    skill_impact_status = None
+    if scorecard_entries:
+        if int(scorecard_totals.get("fail") or 0) > 0:
+            skill_impact_status = "fail"
+        elif int(scorecard_totals.get("partial") or 0) > 0:
+            skill_impact_status = "partial"
+        elif int(scorecard_totals.get("unknown") or 0) > 0:
+            skill_impact_status = "unknown"
+        else:
+            skill_impact_status = "pass"
+        verdicts["skillImpact"] = skill_impact_status
+
+    resolved = [s.get("slug") for s in skills.get("resolved", []) if isinstance(s, dict)]
+    scenario_verdict = read_json(iter_dir / "scenario-verdict.json") if iter_dir else {}
+    game_verdict = read_json(iter_dir / "game-verdict.json") if iter_dir else {}
+    prd_coverage = read_json(iter_dir / "prd-coverage-verdict.json") if iter_dir else {}
+    scenario_checks: list[dict[str, Any]] = []
+    if isinstance(scenario_verdict, dict):
+        for check in (scenario_verdict.get("checks") or [])[:8]:
+            if not isinstance(check, dict):
+                continue
+            transcript = check.get("transcript") if isinstance(check.get("transcript"), list) else []
+            scenario_checks.append(
+                {
+                    "id": check.get("id"),
+                    "title": check.get("title"),
+                    "status": check.get("status"),
+                    "blocking": check.get("blocking"),
+                    "evidence": check.get("evidence"),
+                    "assertionType": check.get("assertionType"),
+                    "failureKind": check.get("failureKind"),
+                    "recoveryHint": check.get("recoveryHint"),
+                    "actionTaken": check.get("actionTaken"),
+                    "transcript": [
+                        {
+                            "step": step.get("step"),
+                            "status": step.get("status"),
+                            "detail": step.get("detail"),
+                        }
+                        for step in transcript[:8]
+                        if isinstance(step, dict)
+                    ],
+                }
+            )
+    payload = {
+        "schema": "rds.quality.ledger.v1",
+        "buildId": args.build_id,
+        "status": state.get("status"),
+        "reviewStatus": (state.get("review") or {}).get("status") if isinstance(state.get("review"), dict) else None,
+        "stack": state.get("stack"),
+        "appType": state.get("app_type"),
+        "skills": {
+            "requested": skills.get("requested") or [],
+            "resolved": resolved,
+            "installed": installed.get("installed") or [],
+            "skipped": skills.get("skipped") or [],
+        },
+        "skillImpact": {
+            "available": bool(scorecard_entries),
+            "status": skill_impact_status,
+            "totals": scorecard_totals,
+            "path": f"builds/{args.build_id}/skills/scorecard.json" if scorecard_entries else None,
+            "blockingSkills": [
+                {
+                    "slug": item.get("slug"),
+                    "verdict": item.get("verdict"),
+                    "installMode": item.get("installMode"),
+                    "note": item.get("note"),
+                    "shape": item.get("shape"),
+                    "verify": item.get("verify"),
+                }
+                for item in scorecard_entries
+                if isinstance(item, dict) and item.get("verdict") in {"fail", "partial", "unknown"}
+            ][:12],
+        },
+        "scenarios": {
+            "available": bool(scenarios),
+            "count": len(scenarios.get("scenarios") or []) if isinstance(scenarios, dict) else 0,
+            "path": f"builds/{args.build_id}/qa-scenarios.json" if scenarios else None,
+            "executed": bool(scenario_verdict),
+            "status": scenario_verdict.get("status") if isinstance(scenario_verdict, dict) else None,
+            "blockingFailures": scenario_verdict.get("blockingFailures") if isinstance(scenario_verdict, dict) else None,
+            "failureBreakdown": scenario_verdict.get("failureBreakdown") if isinstance(scenario_verdict, dict) else None,
+            "verdictPath": f"builds/{args.build_id}/{iter_dir.relative_to(build_dir)}/scenario-verdict.json" if iter_dir and scenario_verdict else None,
+            "checks": scenario_checks,
+        },
+        "gamePlaytest": {
+            "available": isinstance(game_verdict, dict) and bool(game_verdict),
+            "status": game_verdict.get("status") if isinstance(game_verdict, dict) else None,
+            "score": game_verdict.get("score") if isinstance(game_verdict, dict) else None,
+            "subScores": game_verdict.get("subScores") if isinstance(game_verdict, dict) else None,
+            "durationMs": ((game_verdict.get("playtest") or {}).get("durationMs") if isinstance(game_verdict, dict) and isinstance(game_verdict.get("playtest"), dict) else None),
+            "changedPhases": ((game_verdict.get("playtest") or {}).get("changedPhases") if isinstance(game_verdict, dict) and isinstance(game_verdict.get("playtest"), dict) else None),
+            "phaseCount": (len((game_verdict.get("playtest") or {}).get("phases") or []) if isinstance(game_verdict, dict) and isinstance(game_verdict.get("playtest"), dict) else 0),
+            "verdictPath": f"builds/{args.build_id}/{iter_dir.relative_to(build_dir)}/game-verdict.json" if iter_dir and isinstance(game_verdict, dict) and game_verdict else None,
+        },
+        "prdCoverage": {
+            "available": isinstance(prd_coverage, dict) and bool(prd_coverage),
+            "status": prd_coverage.get("status") if isinstance(prd_coverage, dict) else None,
+            "score": prd_coverage.get("score") if isinstance(prd_coverage, dict) else None,
+            "summary": prd_coverage.get("promiseLedgerSummary") if isinstance(prd_coverage, dict) else None,
+            "missingRouteFamilies": prd_coverage.get("missingRouteFamilies") if isinstance(prd_coverage, dict) else None,
+            "missingActions": prd_coverage.get("missingActions") if isinstance(prd_coverage, dict) else None,
+            "unmappedPersonas": prd_coverage.get("unmappedPersonas") if isinstance(prd_coverage, dict) else None,
+            "blockingRows": [
+                {
+                    "id": item.get("id"),
+                    "kind": item.get("kind"),
+                    "promise": item.get("promise"),
+                    "routeFamily": item.get("routeFamily"),
+                    "action": item.get("action"),
+                    "persona": item.get("persona"),
+                    "status": item.get("status"),
+                    "repairHint": item.get("repairHint"),
+                    "evidence": item.get("evidence"),
+                }
+                for item in (prd_coverage.get("promiseLedger") or [])
+                if isinstance(item, dict) and item.get("status") != "verified"
+            ][:20] if isinstance(prd_coverage, dict) else [],
+            "verdictPath": f"builds/{args.build_id}/{iter_dir.relative_to(build_dir)}/prd-coverage-verdict.json" if iter_dir and isinstance(prd_coverage, dict) and prd_coverage else None,
+        },
+        "latestPlaywrightIteration": iter_dir.name if iter_dir else None,
+        "verdicts": verdicts,
+        "blocking": [name for name, value in verdicts.items() if blocking_value(name, value)],
+    }
+    out = build_dir / "quality-ledger.json"
+    out.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps({"ok": True, "path": str(out), "blocking": payload["blocking"]}))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

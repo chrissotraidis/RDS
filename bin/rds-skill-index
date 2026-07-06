@@ -1,0 +1,47 @@
+#!/usr/bin/env ruby
+# Compile skills/catalog/*.yaml and skills/built-in/*/rds-skill.yaml into skills/registry.json.
+
+require "json"
+require "yaml"
+require "time"
+
+root = File.expand_path("..", __dir__)
+catalog_paths = Dir[File.join(root, "skills", "catalog", "*.yaml")]
+built_in_paths = Dir[File.join(root, "skills", "built-in", "*", "rds-skill.yaml")]
+
+by_slug = {}
+(catalog_paths + built_in_paths).sort.each do |path|
+  data = YAML.load_file(path) || {}
+  slug = data.fetch("slug")
+  entry = {
+    slug: slug,
+    name: data["name"] || slug,
+    description: data["description"],
+    path: path.sub("#{root}/", ""),
+    status: data["status"] || "ready",
+    category: data["category"],
+    maturity: data["maturity"],
+    rationale: data["rationale"],
+    source_links: data["source_links"] || data["links"] || [],
+    applies_to: data["applies_to"] || data["stacks"] || ["universal"],
+    default: data.fetch("default", false),
+    install: data["install"] || {},
+    verify: data["verify"] || {},
+  }
+  existing = by_slug[slug]
+  if existing.nil? || existing[:status] != "ready" || entry[:status] == "ready"
+    by_slug[slug] = entry
+  end
+end
+skills = by_slug.values.sort_by { |skill| skill[:slug] }
+
+out = {
+  version: 1,
+  generated_at: Time.now.utc.iso8601,
+  status: "ready",
+  skills: skills,
+}
+
+target = File.join(root, "skills", "registry.json")
+File.write(target, JSON.pretty_generate(out) + "\n")
+puts target

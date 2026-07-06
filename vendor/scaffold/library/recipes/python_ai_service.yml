@@ -1,0 +1,91 @@
+name: Python AI Service
+type: python_ai_service
+keywords:
+  - python
+  - fastapi
+  - ai service
+  - llm
+  - agent
+  - rag
+  - api
+  - backend
+description: >
+  FastAPI service for LLM agents, structured extraction, RAG, webhooks,
+  and API-first AI workflows. The public preview is the root demo page,
+  /docs, and /health.
+
+framework:
+  primary: FastAPI
+  language: Python
+  runtime: Python 3.12
+  agent_layer: Pydantic-style typed models by default
+  deployment: Zo HTTP service
+
+workflow:
+  capabilities:
+    http_routes: true
+    streaming: true
+    structured_output: true
+    native_tests: true
+    browser_ui: false
+
+finalization:
+  commands:
+    - python3 -m venv .venv
+    - . .venv/bin/activate && pip install -r requirements.txt
+  checks:
+    - name: Python compile
+      command: . .venv/bin/activate && python -m compileall app tests
+      type: compilation
+      required: true
+
+verification:
+  setup_commands:
+    - python3 -m venv .venv
+    - . .venv/bin/activate && pip install -r requirements.txt
+  boot_command: . .venv/bin/activate && uvicorn app.main:app --host 0.0.0.0 --port 3000
+  health_checks:
+    - url: "http://localhost:3000/health"
+      expected_status: 200
+    - url: "http://localhost:3000/docs"
+      expected_status: 200
+  test_command: . .venv/bin/activate && PYTHONPATH=. pytest -q
+
+sections:
+  - name: Local Development
+    phase: pipeline
+    labels: ["setup"]
+    description: Keep the project a bootable FastAPI service with no required external credentials.
+    guidance:
+      - Preserve /health because RDS uses it as the stack health check.
+      - Preserve /docs so the public preview is inspectable without a separate client.
+      - Keep provider API keys optional; return clear configuration errors only when the endpoint truly needs a provider.
+      - Do not replace this with Rails, Flask, Next.js, or a notebook.
+
+  - name: API Contract
+    phase: pipeline
+    labels: ["backend"]
+    description: Define request/response schemas, routes, streaming endpoints, and error behavior.
+    guidance:
+      - Use Pydantic models for all public request and response payloads.
+      - Return structured JSON errors with useful status codes.
+      - Add example payloads for important endpoints.
+      - For streaming, use SSE before WebSockets unless the PRD requires bidirectional events.
+
+  - name: Agent Logic
+    phase: pipeline
+    labels: ["ai", "backend"]
+    description: Implement LLM/tool/RAG behavior behind typed service boundaries.
+    guidance:
+      - Keep prompt text in prompts/ when it is long or reused.
+      - Isolate provider calls behind functions/classes that can be stubbed in tests.
+      - Add deterministic tests for schema validation and non-provider logic.
+
+  - name: Quality
+    phase: pipeline
+    labels: ["qa"]
+    description: Verify compile, tests, and runtime health.
+    guidance:
+      - python -m compileall app tests must pass.
+      - PYTHONPATH=. pytest -q must pass for generated tests.
+      - /health and /docs must answer after boot.
