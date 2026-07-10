@@ -915,7 +915,7 @@ run_claude_prompt() {
   local turns="$3"
   local budget="$4"
 
-  local model="${RDS_CLAUDE_MODEL:-claude-opus-4-6}"
+  local model="${RDS_CLAUDE_MODEL:-claude-opus-4-8}"
   local provider="${RDS_INFERENCE_PROVIDER:-claude}"
 
   if [[ "$provider" == "codex" ]]; then

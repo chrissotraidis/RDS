@@ -581,7 +581,7 @@ rds_infer() {
         echo "FATAL: claude CLI not found." >&2
         return 2
       fi
-      local claude_args=(-p --dangerously-skip-permissions --model "${RDS_CLAUDE_MODEL:-claude-opus-4-6}" --max-turns "$turns" --max-budget-usd "$budget")
+      local claude_args=(-p --dangerously-skip-permissions --model "${RDS_CLAUDE_MODEL:-claude-opus-4-8}" --max-turns "$turns" --max-budget-usd "$budget")
       if [[ -n "$persona" ]]; then
         claude_args+=(--append-system-prompt "$persona")
       fi

@@ -381,7 +381,7 @@ async function main() {
     await page!.locator("#skill-category-filter").waitFor();
     await page!.getByText("Catalog audit").waitFor();
     await page!.locator("#skill-search").fill("context7");
-    await page!.locator("#skill-filter-count").getByText(/1 skills shown|[1-9][0-9]* skills shown/).waitFor();
+    await page!.locator("#skill-filter-count").getByText(/1 skill shown|[1-9][0-9]* skills shown/).waitFor();
     await page!.locator(`[data-settings-tab="inventory"]`).click();
     await page!.getByRole("heading", { name: "Components: what RDS is built from" }).waitFor();
     await page!.locator(`[data-settings-tab="runtime"]`).click();
@@ -410,7 +410,7 @@ async function main() {
     await page!.getByRole("heading", { name: "Find a skill" }).waitFor();
     await page!.getByText("Quick category filters").waitFor();
     await page!.locator("#skill-search").fill("context7");
-    await page!.locator("#skill-filter-count").getByText(/1 skills shown|[1-9][0-9]* skills shown/).waitFor();
+    await page!.locator("#skill-filter-count").getByText(/1 skill shown|[1-9][0-9]* skills shown/).waitFor();
     await page!.locator("#skill-status-filter").selectOption("ready");
     await page!.locator("#skill-sort").selectOption("name");
     await page!.locator("#skill-rds-context7-mount").waitFor();
@@ -418,7 +418,7 @@ async function main() {
     await page!.locator(`a[href="https://context7.com/"]`).first().waitFor();
     await page!.locator("#skill-search").fill("");
     await page!.locator("#skill-status-filter").selectOption("ready");
-    await page!.locator("#skill-filter-count").getByText(/[1-9][0-9]* skills shown/).waitFor();
+    await page!.locator("#skill-filter-count").getByText(/1 skill shown|[1-9][0-9]* skills shown/).waitFor();
     res = await page!.goto(`${BASE}/settings/components`, { waitUntil: "domcontentloaded" });
     if (!res || res.status() >= 400) throw new Error(`/settings/components status=${res?.status()}`);
     await page!.getByRole("heading", { name: "Components", exact: true }).waitFor();

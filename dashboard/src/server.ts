@@ -1042,7 +1042,7 @@ function readSettings(): RdsSettings {
   const theme = env.RDS_DASHBOARD_THEME === "light" || env.RDS_DASHBOARD_THEME === "system" ? env.RDS_DASHBOARD_THEME : "dark";
   return {
     inferenceProvider: provider,
-    claudeModel: env.RDS_CLAUDE_MODEL || "claude-opus-4-6",
+    claudeModel: env.RDS_CLAUDE_MODEL || "claude-opus-4-8",
     codexModel: env.RDS_CODEX_MODEL || "",
     theme,
   };
@@ -1390,14 +1390,16 @@ function renderSkillReferenceRow(skill: SkillOption): string {
   const searchable = `${skill.name} ${skill.slug} ${skill.description || ""} ${skill.category || ""} ${skill.status} ${applies}`.toLowerCase();
   return `
     <details id="skill-${escapeHtml(skill.slug)}" data-skill-card data-status="${escapeHtml(skill.status)}" data-category="${escapeHtml(skill.category || source)}" data-applies="${escapeHtml(skill.appliesTo.join(","))}" data-search="${escapeHtml(searchable)}" class="bg-surface-container border border-outline-variant rounded-DEFAULT p-3 flex flex-col gap-2">
-      <summary class="cursor-pointer font-ribbon text-ribbon text-primary-container mb-2">Details</summary>
-      <div class="flex items-start justify-between gap-3">
+      <summary class="cursor-pointer list-none flex items-start justify-between gap-3 group">
         <div class="min-w-0">
-          <h3 class="font-ribbon text-ribbon text-on-surface">${escapeHtml(skill.name)}</h3>
+          <h3 class="font-ribbon text-ribbon text-on-surface group-hover:text-primary-fixed transition-colors">${escapeHtml(skill.name)}</h3>
           <code class="font-code text-[10px] text-on-surface-variant break-all">${escapeHtml(skill.slug)}</code>
         </div>
-        <span class="font-code text-[10px] border ${statusTone(skill.status)} rounded px-1.5 py-0.5 shrink-0">${escapeHtml(statusLabel(skill.status))}</span>
-      </div>
+        <span class="flex items-center gap-2 shrink-0">
+          <span class="font-code text-[10px] border ${statusTone(skill.status)} rounded px-1.5 py-0.5">${escapeHtml(statusLabel(skill.status))}</span>
+          ${icon("expand_more", 16, "text-outline group-hover:text-on-surface transition-colors rds-details-caret")}
+        </span>
+      </summary>
       <p class="font-table text-table text-on-surface-variant">${escapeHtml(skill.description || "Catalog capability metadata used by skill resolution.")}</p>
       ${skill.rationale ? `<p class="font-table text-table text-on-surface-variant border-l-2 border-outline-variant pl-2">${escapeHtml(skill.rationale)}</p>` : ""}
       <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
@@ -5322,7 +5324,7 @@ app.post("/new", async (c) => {
   let stack   = (body.stack || "").replace(/[^a-z0-9_-]/gi, "");
   let appType = normalizeAppType(body.app_type || "auto");
   const provider = body.provider === "codex" ? "codex" : "claude";
-  const claudeModel = (body.claude_model || "claude-opus-4-6").trim() || "claude-opus-4-6";
+  const claudeModel = (body.claude_model || "claude-opus-4-8").trim() || "claude-opus-4-8";
   const codexModel = (body.codex_model || "").trim();
   let skills = (body.skills || "default").trim() || "default";
   const submittedStack = stack;
@@ -8301,7 +8303,7 @@ app.get("/settings", (c) => {
         var form = event.currentTarget;
         var body = {
           inferenceProvider: form.inferenceProvider ? form.inferenceProvider.value : 'claude',
-          claudeModel: form.claudeModel ? form.claudeModel.value : 'claude-opus-4-6',
+          claudeModel: form.claudeModel ? form.claudeModel.value : 'claude-opus-4-8',
           codexModel: form.codexModel ? form.codexModel.value : '',
           theme: form.theme ? form.theme.value : 'dark'
         };
@@ -8448,52 +8450,20 @@ app.get("/settings/skills", (c) => {
 
       ${settingsTabNav("catalog")}
 
-      <section class="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_320px] gap-component-gap">
-        <div class="rds-shell-panel rounded-DEFAULT p-container-padding">
-          <h2 class="font-h2 text-h2 text-on-surface">How RDS uses skills</h2>
-          <div class="grid grid-cols-1 md:grid-cols-3 gap-2 mt-gutter">
-            <div class="bg-surface border border-outline-variant rounded-DEFAULT p-3">
-              <h3 class="font-ribbon text-ribbon text-on-surface">Resolve</h3>
-              <p class="font-table text-table text-on-surface-variant mt-1">The PRD, chosen stack, and app type produce a skill list in <code>build.yaml</code>.</p>
-            </div>
-            <div class="bg-surface border border-outline-variant rounded-DEFAULT p-3">
-              <h3 class="font-ribbon text-ribbon text-on-surface">Guide</h3>
-              <p class="font-table text-table text-on-surface-variant mt-1">Each skill mounts a source-linked RDS guide into the generated app so the builder knows what to implement and verify.</p>
-            </div>
-            <div class="bg-surface border border-outline-variant rounded-DEFAULT p-3">
-              <h3 class="font-ribbon text-ribbon text-on-surface">Verify</h3>
-              <p class="font-table text-table text-on-surface-variant mt-1">Ready skills have RDS-owned metadata, guide materialization, verify hooks, and explicit credential caveats when needed.</p>
-            </div>
-          </div>
-        </div>
-        <aside class="rds-shell-panel rounded-DEFAULT p-container-padding flex flex-col gap-stack-gap">
-          <div class="grid grid-cols-3 gap-2">
-            <div class="bg-surface border border-outline-variant rounded-DEFAULT p-2">
-              <div class="font-code text-[20px] text-on-surface">${readySkills.length}</div>
-              <div class="font-ribbon text-ribbon text-on-surface-variant">verified guides</div>
-            </div>
-            <div class="bg-surface border border-outline-variant rounded-DEFAULT p-2">
-              <div class="font-code text-[20px] text-on-surface">${curatedSkills.length}</div>
-              <div class="font-ribbon text-ribbon text-on-surface-variant">curated</div>
-            </div>
-            <div class="bg-surface border border-outline-variant rounded-DEFAULT p-2">
-              <div class="font-code text-[20px] text-on-surface">${roadmapSkills.length}</div>
-              <div class="font-ribbon text-ribbon text-on-surface-variant">roadmap</div>
-            </div>
-          </div>
-          <div>
-            <h2 class="font-ribbon text-ribbon text-on-surface-variant">Core New Build skills</h2>
-            <div class="flex flex-col gap-2 mt-2">
-              ${coreSkills.map((skill) => `
-                <a href="#skill-${escapeHtml(skill.slug)}" class="bg-surface border border-outline-variant rounded-DEFAULT p-2 hover:border-primary-container transition-colors">
-                  <div class="font-ribbon text-ribbon text-on-surface">${escapeHtml(skill.name)}</div>
-                  <code class="font-code text-[10px] text-on-surface-variant">${escapeHtml(skill.slug)}</code>
-                </a>
-              `).join("")}
-            </div>
-          </div>
-        </aside>
-      </section>
+      <div class="flex items-center gap-2 flex-wrap">
+        <span class="inline-flex items-center gap-1.5 h-8 px-2.5 rounded-full border border-primary-container/40 bg-primary-container/10 font-ribbon text-ribbon text-primary-container whitespace-nowrap"><span class="font-code text-[11px]">${readySkills.length}</span><span>verified guides</span></span>
+        ${curatedSkills.length ? `<span class="inline-flex items-center gap-1.5 h-8 px-2.5 rounded-full border border-outline-variant bg-surface-container-low font-ribbon text-ribbon text-on-surface-variant whitespace-nowrap"><span class="font-code text-[11px] text-on-surface">${curatedSkills.length}</span><span>curated</span></span>` : ""}
+        ${roadmapSkills.length ? `<span class="inline-flex items-center gap-1.5 h-8 px-2.5 rounded-full border border-outline-variant bg-surface-container-low font-ribbon text-ribbon text-on-surface-variant whitespace-nowrap"><span class="font-code text-[11px] text-on-surface">${roadmapSkills.length}</span><span>roadmap</span></span>` : ""}
+        <span class="hidden md:inline-block w-px h-5 bg-outline-variant" aria-hidden="true"></span>
+        <span class="font-ribbon text-ribbon text-on-surface-variant whitespace-nowrap">Core New Build skills:</span>
+        ${coreSkills.map((skill) => `<a href="#skill-${escapeHtml(skill.slug)}" class="inline-flex items-center h-8 px-2.5 rounded-full border border-outline-variant bg-surface-container-low font-code text-[11px] text-on-surface-variant hover:text-on-surface hover:border-outline whitespace-nowrap transition-colors">${escapeHtml(skill.slug)}</a>`).join("")}
+      </div>
+
+      <p class="font-table text-table text-on-surface-variant px-1">
+        How RDS uses skills: the PRD, chosen stack, and app type resolve a skill list into
+        <code class="font-code text-code">build.yaml</code>; each skill mounts a source-linked guide into the
+        generated app; ready skills carry verify hooks and explicit credential caveats.
+      </p>
 
       <section class="rds-shell-panel rounded-DEFAULT p-container-padding">
         <div class="flex items-start justify-between gap-3 flex-wrap">
@@ -8591,7 +8561,7 @@ app.get("/settings/skills", (c) => {
           if (ok) visible += 1;
         });
         var count = document.getElementById('skill-filter-count');
-        if (count) count.textContent = visible + ' skills shown';
+        if (count) count.textContent = visible + (visible === 1 ? ' skill shown' : ' skills shown');
       }
       function rdsResetSkillFilters() {
         ['skill-search', 'skill-status-filter', 'skill-category-filter', 'skill-stack-filter'].forEach(function(id) {
@@ -8634,7 +8604,7 @@ app.post("/settings", async (c) => {
   const body = (await c.req.json().catch(() => ({}))) as Partial<Record<keyof RdsSettings, string>>;
   const inferenceProvider = body.inferenceProvider === "codex" ? "codex" : "claude";
   const theme = body.theme === "light" || body.theme === "system" ? body.theme : "dark";
-  const claudeModel = (body.claudeModel || "claude-opus-4-6").trim() || "claude-opus-4-6";
+  const claudeModel = (body.claudeModel || "claude-opus-4-8").trim() || "claude-opus-4-8";
   const codexModel = (body.codexModel || "").trim();
   if (!CLAUDE_MODELS.includes(claudeModel)) return c.json({ ok: false, error: "unsupported Claude model" }, 400);
   if (codexModel && !/^[a-zA-Z0-9._:-]{1,80}$/.test(codexModel)) return c.json({ ok: false, error: "invalid Codex model id" }, 400);
@@ -10895,7 +10865,7 @@ function clientScript(): string {
       if (provider === 'codex') {
         body.set('codex_model', f.codex_model ? f.codex_model.value : '');
       } else {
-        body.set('claude_model', f.claude_model ? f.claude_model.value : 'claude-opus-4-6');
+        body.set('claude_model', f.claude_model ? f.claude_model.value : 'claude-opus-4-8');
       }
       (window.rdsPromptAttachments || []).forEach(function(file) {
         body.append('attachments', file, file.name);
@@ -14689,6 +14659,9 @@ function layout(title: string, body: string, opts: { nav?: NavKey; topbarTab?: "
     padding: 0 20px;
     list-style: none;
   }
+  [data-skill-card] > summary::-webkit-details-marker { display: none; }
+  [data-skill-card][open] .rds-details-caret { transform: rotate(180deg); }
+  .rds-details-caret { transition: transform .15s ease; }
   .rds-inventory-disclosure > summary::-webkit-details-marker {
     display: none;
   }
