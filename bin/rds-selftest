@@ -56,9 +56,17 @@ fi
 
 cd "$ROOT/dashboard"
 
+# Resolve bun the same way bin/rds-dashboard does (BUN_BIN > Zo default > PATH).
+BUN="${BUN_BIN:-/root/.bun/bin/bun}"
+[[ -x "$BUN" ]] || BUN="$(command -v bun || true)"
+if [[ -z "$BUN" || ! -x "$BUN" ]]; then
+  echo "FATAL: bun not found. Install Bun (https://bun.sh) or set BUN_BIN." >&2
+  exit 2
+fi
+
 # Make sure playwright is installed locally; bun install is idempotent.
 if [[ ! -d node_modules/playwright ]]; then
-  /root/.bun/bin/bun install >/dev/null 2>&1 || /root/.bun/bin/bun install
+  "$BUN" install >/dev/null 2>&1 || "$BUN" install
 fi
 
 export RDS_DASHBOARD_URL="$URL"
@@ -67,4 +75,4 @@ export RDS_DASHBOARD_USER="${RDS_DASHBOARD_USER:-rds}"
 export RDS_DASHBOARD_PASSWORD="${RDS_DASHBOARD_PASSWORD:-}"
 export RDS_ROOT="$ROOT"
 
-exec /root/.bun/bin/bun run tests/selftest.ts
+exec "$BUN" run tests/selftest.ts

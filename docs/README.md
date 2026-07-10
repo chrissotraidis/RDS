@@ -13,6 +13,8 @@ that drives RDS through chat.
 | [COMPONENTS.md](COMPONENTS.md) | Vendored component inventory, upgrade workflow, third-party notices. |
 | [STACKS_AND_SKILLS.md](STACKS_AND_SKILLS.md) | Stack manifests, skill catalog, and how New Build selects them. |
 | [AUTONOMY.md](AUTONOMY.md) | Goal Mode (evidence-driven repair loop) and Agent Sessions (operator-controlled Claude/Codex workers). |
+| [DASHBOARD.md](DASHBOARD.md) | Page-by-page map of the operator console, auth model, local dev quickstart, smoke test. |
+| [DESIGN.md](DESIGN.md) | The dashboard's visual language: tokens, color discipline, typography, motion. |
 
 ## Operating RDS
 

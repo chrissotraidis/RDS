@@ -211,8 +211,10 @@ derive_app_name() {
 
 # --- Port allocation --------------------------------------------------------
 # Prints the first free TCP port in [start, end] (inclusive).
+# Defaults track the configured preview range (config/defaults.env), not the
+# retired V0 3100-3199 range.
 next_free_port() {
-  local start="${1:-3100}" end="${2:-3199}"
+  local start="${1:-${RDS_LOCAL_PORT_RANGE_START:-4000}}" end="${2:-${RDS_LOCAL_PORT_RANGE_END:-4099}}"
   local port
   for (( port=start; port<=end; port++ )); do
     if ! _port_in_use "$port"; then

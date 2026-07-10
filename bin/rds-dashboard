@@ -16,8 +16,11 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DASH="$ROOT/dashboard"
-PIDFILE="/dev/shm/rds-dashboard.pid"
-LOGFILE="/dev/shm/rds-dashboard.log"
+# /dev/shm is Linux-only; fall back to the system temp dir on macOS dev hosts.
+RUNDIR="/dev/shm"
+[[ -d "$RUNDIR" && -w "$RUNDIR" ]] || RUNDIR="${TMPDIR:-/tmp}"
+PIDFILE="${RUNDIR%/}/rds-dashboard.pid"
+LOGFILE="${RUNDIR%/}/rds-dashboard.log"
 BUN="${BUN_BIN:-/root/.bun/bin/bun}"
 [[ -x "$BUN" ]] || BUN="$(command -v bun || true)"
 PORT="${PORT:-4000}"
@@ -33,13 +36,23 @@ require_bun() {
   fi
 }
 
+# PID of whatever is listening on $1, if detectable (ss on Linux, lsof on macOS).
+_listener_pid() {
+  local port="$1"
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltnp "sport = :$port" 2>/dev/null | awk -F'pid=' 'NR>1 && $2 {split($2,a,","); print a[1]; exit}'
+  elif command -v lsof >/dev/null 2>&1; then
+    lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null | head -1
+  fi
+}
+
 cmd_status() {
   if [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
     echo "rds-dashboard: RUNNING (pid $(cat "$PIDFILE")), log $LOGFILE"
     return 0
   fi
   if curl -fsS --max-time 3 "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1; then
-    listener="$(ss -ltnp "sport = :$PORT" 2>/dev/null | awk -F'pid=' 'NR>1 && $2 {split($2,a,","); print a[1]; exit}')"
+    listener="$(_listener_pid "$PORT")"
     if [[ -n "$listener" ]]; then
       echo "rds-dashboard: RUNNING (port $PORT, pid $listener, managed service or external supervisor)"
     else
@@ -88,7 +101,7 @@ cmd_run() {
       exit 1
     fi
     if curl -fsS --max-time 3 "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1; then
-      listener="$(ss -ltnp "sport = :$PORT" 2>/dev/null | awk -F'pid=' 'NR>1 && $2 {split($2,a,","); print a[1]; exit}')"
+      listener="$(_listener_pid "$PORT")"
       if [[ -n "$listener" ]]; then
         echo "rds-dashboard: already running on port $PORT (pid $listener)" >&2
       else
@@ -97,7 +110,12 @@ cmd_run() {
       exit 0
     fi
     : > "$LOGFILE"
-    setsid nohup "$BUN" run src/server.ts </dev/null >>"$LOGFILE" 2>&1 &
+    if command -v setsid >/dev/null 2>&1; then
+      setsid nohup "$BUN" run src/server.ts </dev/null >>"$LOGFILE" 2>&1 &
+    else
+      # stock macOS has no setsid; nohup alone is enough to survive the shell
+      nohup "$BUN" run src/server.ts </dev/null >>"$LOGFILE" 2>&1 &
+    fi
     echo $! > "$PIDFILE"
     sleep 0.6
     if ! kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then

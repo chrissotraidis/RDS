@@ -265,6 +265,11 @@ async function main() {
   });
 
   await check("new build PDF attachment is extracted for shared analysis", async () => {
+    const mutool = spawnSync("mutool", ["-v"], { encoding: "utf8" });
+    if (mutool.error) {
+      console.log("(skipped — mutool not installed; PDF fixture requires mupdf)");
+      return;
+    }
     await page!.goto(`${BASE}/new`, { waitUntil: "domcontentloaded" });
     const pageSpecPath = join(outDir, "pdf-prd-page.txt");
     const pdfPath = join(outDir, "browser-extension-prd.pdf");
@@ -563,7 +568,7 @@ async function main() {
     await page!.waitForSelector("text=Live connections", { timeout: 2000 });
     await page!.waitForSelector("text=Events", { timeout: 2000 });
     await page!.waitForSelector("text=Terminal", { timeout: 2000 });
-    await page!.waitForSelector("text=/Make review-ready|Continue RDS Goal|One-off iteration/", { timeout: 2000 });
+    await page!.waitForSelector("text=/Make review-ready|Continue RDS Goal|One-off iteration|Run targeted iteration/", { timeout: 2000 });
     await page!.waitForSelector("text=Ask RDS", { timeout: 2000 });
     await page!.locator("[data-tab='files']").click();
     await page!.locator("#files-tree").waitFor({ timeout: 3000 });
@@ -1310,7 +1315,7 @@ async function main() {
     if (!buildId) throw new Error("no selected build id");
     const res = await page!.goto(`${BASE}/b/${encodeURIComponent(buildId)}/playwright`, { waitUntil: "domcontentloaded" });
     if (!res || res.status() >= 400) throw new Error(`status=${res?.status()}`);
-    await page!.waitForSelector("text=not capped at three", { timeout: 3000 });
+    await page!.waitForSelector("text=one crawl per iteration", { timeout: 3000 });
     await page!.waitForSelector("text=semantic audit", { timeout: 3000 });
   });
 

@@ -123,20 +123,30 @@ The dashboard is the operator console.
 
 ```text
 Dashboard
-├── Hub                 active builds, statuses, launch controls
-├── Build detail         logs, preview, QA, review controls
+├── Hub                  overview: engine status, PRD inbox, review queue, alerts
+├── Builds               full inventory with filters, sorting, and review state
+├── Build detail         logs, preview, QA evidence, review controls
 ├── Chat                 build-scoped requests with confirmation cards
-├── Docs                 local operating docs
+├── Agents               Claude/Codex worker sessions and diffs
+├── Activity             append-only audit log of every write action
 ├── Settings             auth, model, stack, skill, runtime knobs
-└── Agent sessions       Claude/Codex worker sessions and diffs
+└── Documentation        local operating docs
 ```
+
+See `docs/DASHBOARD.md` for the page-by-page map and a dashboard-only local
+development quickstart (works on macOS — you only need Bun, a `.env`, and a
+directory of build folders; no model workers or Linux host required).
 
 Security model:
 
 - RDS implements a built-in Basic Auth gate for all dashboard routes except
   `/healthz`.
-- If `RDS_DASHBOARD_PASSWORD` is unset, the dashboard returns `503` instead of
-  serving an unprotected control surface.
+- A fresh clone works without configuration: when no credentials are set, the
+  dashboard runs in **setup mode** — it serves direct `localhost` requests
+  only (with a visible banner) and refuses everything else with `503`, so an
+  unprotected control surface is never exposed beyond the loopback. Set
+  `RDS_DASHBOARD_PASSWORD` and `RDS_DASHBOARD_TOKEN` to secure it and enable
+  remote access.
 - Mutating routes also require `X-RDS-Token` matching `RDS_DASHBOARD_TOKEN`.
 - The dashboard is an operator console, not a multi-user permission system.
 - Public preview URLs are review artifacts, not hardened production deploys.

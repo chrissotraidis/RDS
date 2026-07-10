@@ -31,7 +31,11 @@ Every UI change should be checked against these principles.
 8. **Every state is designed.** Empty states are one quiet line with an icon —
    never a boxed placeholder. Errors state what happened and the next action.
 
-## Tokens (source of truth: `layout()` in `dashboard/src/server.ts`)
+## Tokens (source of truth: `dashboard/tailwind.config.js`)
+
+Tokens are precompiled into `dashboard/public/tailwind.css` (vendored; regenerate
+with `bun run build:css` after changing markup or tokens). Non-Tailwind
+component CSS still lives in `layout()` in `dashboard/src/server.ts`.
 
 | Role | Token | Value |
 |---|---|---|

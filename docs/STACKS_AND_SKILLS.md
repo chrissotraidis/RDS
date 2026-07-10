@@ -63,7 +63,7 @@ Current ready RDS-owned skill coverage:
 | Data, jobs, storage | `postgres-mcp`, `solid-queue`, `arq-jobs-skill`, `storage-s3-r2`, `storage-active-storage`, `vector-pgvector` |
 | Web frameworks and UI | `shadcn-add`, `hotwire-stimulus-generator`, `astro-content-collections-skill`, `starlight-add`, `hono-catchall-mount` |
 | AI/MCP/search | `llm-vercel-ai-sdk`, `llm-pydantic-ai`, `litellm-gateway-skill`, `mcp-builder`, `search-meilisearch` |
-| Mobile/extensions/deploy | `expo-skills-mount`, `wxt-config-skill`, `deploy-vercel`, `deploy-fly`, `deploy-eas-build`, `deploy-chrome-web-store` |
+| Mobile/extensions/deploy | `expo-skills-mount`, `wxt-config-skill`, `deploy-vercel`, `deploy-fly`, `deploy-eas-build`, `deploy-chrome-web-store` — note: `deploy-fly` is a capability guide only; the `fly` pipeline deploy *target* was removed (see `docs/PIPELINE.md`) |
 | 3D/game/assets | `browser-game-product-quality`, `playwright-canvas-snapshot`, `r3f-drei-helpers`, `rapier-physics`, `gltf-transform-pipeline`, `gltf-validator-skill`, `godot-scene-scaffolder` |
 
 All ready catalog entries are indexed as ready, but readiness has levels:

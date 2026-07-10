@@ -57,13 +57,13 @@ write_json "$TMP_ROOT/builds/$FAIL_ID/playwright/iter-001/scenario-verdict.json"
 write_json "$TMP_ROOT/builds/$SKIPPED_DESIGN_ID/playwright/iter-001/design-review.json" '{"status": "skipped", "score": null, "summary": "reviewer returned unparsable output", "reviewerError": {"kind": "unparsable_output", "evidence": "Done."}}'
 rm -f "$TMP_ROOT/builds/$SKIPPED_DESIGN_ID/quality-ledger.json"
 
-"$ROOT/bin/rds-readiness" "$PASS_ID" --root "$TMP_ROOT" >/tmp/rds-readiness-pass.out
-"$ROOT/bin/rds-quality-ledger" "$SKIPPED_DESIGN_ID" --root "$TMP_ROOT" >/tmp/rds-readiness-skipped-design-ledger.out
-if "$ROOT/bin/rds-readiness" "$SKIPPED_DESIGN_ID" --root "$TMP_ROOT" >/tmp/rds-readiness-skipped-design.out 2>&1; then
+"$ROOT/bin/rds-readiness" "$PASS_ID" --root "$TMP_ROOT" >"$TMP_ROOT"/rds-readiness-pass.out
+"$ROOT/bin/rds-quality-ledger" "$SKIPPED_DESIGN_ID" --root "$TMP_ROOT" >"$TMP_ROOT"/rds-readiness-skipped-design-ledger.out
+if "$ROOT/bin/rds-readiness" "$SKIPPED_DESIGN_ID" --root "$TMP_ROOT" >"$TMP_ROOT"/rds-readiness-skipped-design.out 2>&1; then
   echo "FATAL: skipped design review passed readiness" >&2
   exit 1
 fi
-"$ROOT/bin/rds-evidence-ledger" "$SKIPPED_DESIGN_ID" --root "$TMP_ROOT" >/tmp/rds-readiness-skipped-design-evidence.out
+"$ROOT/bin/rds-evidence-ledger" "$SKIPPED_DESIGN_ID" --root "$TMP_ROOT" >"$TMP_ROOT"/rds-readiness-skipped-design-evidence.out
 if ! jq -e '(.blocking // []) | index("design")' "$TMP_ROOT/builds/$SKIPPED_DESIGN_ID/quality-ledger.json" >/dev/null; then
   echo "FATAL: skipped design review did not block the quality ledger" >&2
   exit 1
@@ -76,7 +76,7 @@ if ! jq -e '.blockers[]? | select(.code == "quality_ledger_blocking")' "$TMP_ROO
   echo "FATAL: skipped design review did not block evidence ledger" >&2
   exit 1
 fi
-if "$ROOT/bin/rds-readiness" "$FAIL_ID" --root "$TMP_ROOT" >/tmp/rds-readiness-fail.out 2>&1; then
+if "$ROOT/bin/rds-readiness" "$FAIL_ID" --root "$TMP_ROOT" >"$TMP_ROOT"/rds-readiness-fail.out 2>&1; then
   echo "FATAL: failing readiness fixture passed unexpectedly" >&2
   exit 1
 fi

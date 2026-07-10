@@ -32,6 +32,7 @@ uname -a
 cat /etc/os-release
 which git ruby bundler curl jq rsync python3 bun
 ruby --version
+python3 --version   # README requires python3.12
 psql --version
 ```
 

@@ -2,7 +2,8 @@
 
 > What the operator says → what the RDS agent does. Every pattern here must
 > be recognized by AGENT.md-driven Claude Code. If a chat pattern doesn't
-> match any row here, AGENT.md §3.3 applies — ask the operator for clarification.
+> match any row here, follow AGENT.md "Operating Rules" — ask the operator
+> for clarification.
 
 ## Build triggers
 
@@ -175,6 +176,7 @@ the pipeline.
 
 ## Voice
 
-AGENT.md §10 and §11 specify terse, factual replies. Include concrete
+AGENT.md ("Completion Report" and "Status Questions") specifies terse,
+factual replies. Include concrete
 numbers (elapsed minutes, current stage, URL) and avoid narrating your
 reasoning. The RDS agent is the operator's build system, not a chatty assistant.

@@ -1,0 +1,5 @@
+/* Input for the Tailwind build — see tailwind.config.js.
+   Regenerate public/tailwind.css with:  bun run build:css */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;

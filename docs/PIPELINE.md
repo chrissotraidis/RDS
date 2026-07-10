@@ -368,8 +368,9 @@ Default resolves stack-compatible RDS built-ins from `skills/registry.json`;
 `builds/<id>/skills/resolved.json` for the installer and
 `builds/<id>/skills-resolved.yaml` for operators/agents, then updates
 `build.yaml`. `skill-install` writes `.rds/skills/*.json` plus any ready
-built-in guide files into the app tree. All 90 catalog entries now compile as
-ready RDS-owned skill guides with source links, stack applicability, rationale,
+built-in guide files into the app tree. Every entry in `skills/registry.json`
+(91 at last count — the registry is authoritative) compiles as a ready
+RDS-owned skill guide with source links, stack applicability, rationale,
 app-local materialization, and verify hooks. This is a guide/verification
 contract, not a promise that external services can be used without credentials:
 deploy, payments, app-store, OAuth, and hosted-service skills still require the

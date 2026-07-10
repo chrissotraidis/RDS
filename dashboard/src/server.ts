@@ -32,6 +32,7 @@
 
 import { Hono } from "hono";
 import { basicAuth } from "hono/basic-auth";
+import { getConnInfo } from "hono/bun";
 import { stream } from "hono/streaming";
 import { existsSync, readFileSync, statSync, writeFileSync, mkdirSync, appendFileSync, unlinkSync, readdirSync, rmSync, realpathSync } from "node:fs";
 import { readdir, stat } from "node:fs/promises";
@@ -1557,7 +1558,14 @@ function pidCommandLine(pid: number): string {
   try {
     return readFileSync(`/proc/${pid}/cmdline`, "utf8").replace(/\0/g, " ").trim();
   } catch {
-    return "";
+    // No /proc outside Linux (macOS dev hosts) — fall back to ps so running
+    // builds are still detected instead of silently reading as stopped.
+    try {
+      const out = spawnSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8", timeout: 2000 });
+      return out.status === 0 ? (out.stdout || "").trim() : "";
+    } catch {
+      return "";
+    }
   }
 }
 
@@ -2856,7 +2864,7 @@ function computeBuildTiming(state: StateJson, row: BuildRow, events: RdsEvent[])
   const startedMs = parseTimeMs(startedAt);
   const endedMs = parseTimeMs(endedAt);
   const durationMs = startedMs ? Math.max(0, (endedMs || (row.running ? Date.now() : 0)) - startedMs) : undefined;
-  const label = durationMs != null ? formatDuration(durationMs) : "-";
+  const label = durationMs != null ? formatDuration(durationMs) : "not started";
   const statusText = row.running ? "Running" : terminalEvent?.event === "build_failed" ? "Failed" : terminalEvent?.event === "build_pending_review" ? "Awaiting review" : terminalEvent?.event === "build_completed" ? "Completed" : "Last known";
   const hintParts = [
     `${statusText} elapsed time from pipeline start${endedAt ? ` to ${terminalEvent?.event.replace(/^build_/, "")}` : ""}.`,
@@ -3004,12 +3012,51 @@ function withoutQueryParam(reqUrl: string, key: string): string {
   return `${url.pathname}${query ? `?${query}` : ""}`;
 }
 
-function tokenGate(c: { req: { header: (k: string) => string | undefined }; text: (b: string, s?: number) => Response }): Response | null {
+// Constant-time string compare for secrets; plain === leaks length/prefix
+// timing. Hand-rolled XOR walk (always over the expected secret's full
+// length) instead of crypto.timingSafeEqual so the public bundle check,
+// which builds with browser polyfills, keeps passing.
+function secretsEqual(supplied: string, expected: string): boolean {
+  const enc = new TextEncoder();
+  const a = enc.encode(supplied);
+  const b = enc.encode(expected);
+  let diff = a.length === b.length ? 0 : 1;
+  for (let i = 0; i < b.length; i++) diff |= (a[i % (a.length || 1)] ?? 0) ^ b[i];
+  return diff === 0;
+}
+
+// True when the request arrived on the loopback interface AND was addressed
+// to a localhost host header. Both checks matter: a reverse proxy can make
+// the remote address loopback (host header exposes it), and DNS rebinding
+// can make a hostile page resolve to 127.0.0.1 (remote address alone would
+// pass). Used only to enable first-run "setup mode" when no credentials are
+// configured yet.
+function isLocalDirectRequest(c: { req: { raw: Request; header: (k: string) => string | undefined } }): boolean {
+  let ip = "";
+  try {
+    ip = (getConnInfo(c as never).remote.address || "").replace(/^::ffff:/i, "");
+  } catch {
+    return false;
+  }
+  if (ip !== "127.0.0.1" && ip !== "::1") return false;
+  const host = (c.req.header("host") || "").toLowerCase().replace(/\]?:\d+$/, "").replace(/^\[/, "");
+  return host === "localhost" || host === "127.0.0.1" || host === "::1";
+}
+
+// First-run setup mode: no password AND no token configured. The dashboard
+// serves to direct localhost requests only, so a fresh clone works out of
+// the box without ever exposing an unprotected control surface remotely.
+function setupModeActive(): boolean {
+  return !DASHBOARD_PASS && !DASHBOARD_TOKEN;
+}
+
+function tokenGate(c: { req: { raw: Request; header: (k: string) => string | undefined }; text: (b: string, s?: number) => Response }): Response | null {
   if (!DASHBOARD_TOKEN) {
+    if (setupModeActive() && isLocalDirectRequest(c)) return null;
     return c.text("RDS_DASHBOARD_TOKEN not configured on the dashboard service.", 503);
   }
   const supplied = c.req.header("x-rds-token") || "";
-  if (supplied !== DASHBOARD_TOKEN) return c.text("forbidden", 403);
+  if (!secretsEqual(supplied, DASHBOARD_TOKEN)) return c.text("forbidden", 403);
   return null;
 }
 
@@ -3472,7 +3519,11 @@ function totalUnread(): number {
 }
 
 function defaultTitleForBuild(buildId: string): string {
-  return `Build ${buildId}`;
+  // Prefer the human display name; a thread titled "Build lumen-finance-
+  // 20260710-093012" truncates uselessly in the sidebar.
+  const state = safeReadJson<StateJson>(join(BUILDS_DIR, buildId, "state.json"));
+  const name = (state as { display_name?: string } | null)?.display_name;
+  return name ? String(name) : `Build ${buildId}`;
 }
 
 function findOrCreateBuildSession(buildId: string): ChatSession {
@@ -4034,17 +4085,104 @@ app.use("*", async (c, next) => {
     c.req.path.startsWith("/static/")
   ) return next();
   if (!DASHBOARD_PASS) {
-    return c.text("RDS_DASHBOARD_PASSWORD not configured on the dashboard service.", 503);
+    // Fresh clone, nothing configured yet: serve direct localhost requests in
+    // setup mode with a visible banner. Anything else is refused — an
+    // unprotected control surface is never exposed beyond the loopback.
+    if (setupModeActive() && isLocalDirectRequest(c)) {
+      await next();
+      const type = c.res.headers.get("content-type") || "";
+      if (type.includes("text/html")) {
+        const html = await c.res.text();
+        const headers = new Headers(c.res.headers);
+        headers.delete("content-length");
+        c.res = new Response(html.replace("</body>", `${SETUP_MODE_BANNER}</body>`), { status: c.res.status, headers });
+      }
+      return;
+    }
+    return c.html(refusalPage(
+      "Dashboard locked until setup completes",
+      setupModeActive()
+        ? "No dashboard credentials are configured, so RDS only serves this console to direct localhost requests. To use it remotely, set <code>RDS_DASHBOARD_PASSWORD</code> and <code>RDS_DASHBOARD_TOKEN</code> in <code>.env</code> and restart."
+        : "A write token is set but <code>RDS_DASHBOARD_PASSWORD</code> is missing. Set it in <code>.env</code> and restart to finish securing the dashboard.",
+    ), 503);
   }
-  if (DASHBOARD_TOKEN && c.req.header("x-rds-token") === DASHBOARD_TOKEN) {
+  if (DASHBOARD_TOKEN && secretsEqual(c.req.header("x-rds-token") || "", DASHBOARD_TOKEN)) {
     return next();
   }
   const mw = basicAuth({
-    verifyUser: (_user, pass) => pass === DASHBOARD_PASS,
+    verifyUser: (_user, pass) => secretsEqual(pass, DASHBOARD_PASS),
     realm: "RDS",
   });
-  return mw(c, next);
+  // basicAuth throws an HTTPException(401) whose default body is bare text
+  // served as octet-stream — a blank page if the browser's credential dialog
+  // is dismissed. Serve a quiet, on-brand hint instead (WWW-Authenticate
+  // preserved so the prompt returns on reload).
+  try {
+    await mw(c, next);
+  } catch (err) {
+    const res: Response | undefined = typeof (err as { getResponse?: () => Response })?.getResponse === "function"
+      ? (err as { getResponse: () => Response }).getResponse()
+      : undefined;
+    if (res?.status !== 401) throw err;
+    const authHeader = res.headers.get("www-authenticate") ?? 'Basic realm="RDS"';
+    return new Response(refusalPage(
+      "Sign-in required",
+      "This dashboard is protected by HTTP Basic Auth. Use the operator credentials (<code>RDS_DASHBOARD_USER</code> / <code>RDS_DASHBOARD_PASSWORD</code>) configured on this host.",
+      `<a class="cta" href="/">Sign in</a>`,
+    ), {
+      status: 401,
+      headers: { "WWW-Authenticate": authHeader, "Content-Type": "text/html; charset=utf-8" },
+    });
+  }
 });
+
+// Minimal self-contained page for auth/setup refusals — quiet, on-brand,
+// never a blank screen.
+function refusalPage(title: string, bodyHtml: string, extraHtml = ""): string {
+  return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RDS — ${escapeHtml(title)}</title>
+<style>
+  body { margin: 0; min-height: 100dvh; display: grid; place-items: center;
+         background: #0b0d0c; color: #e9eeea;
+         font: 14px/1.6 Inter, system-ui, -apple-system, sans-serif; }
+  main { text-align: center; padding: 24px; }
+  .mark { font-weight: 700; letter-spacing: .02em; color: #8beebb; font-size: 18px; }
+  .mark span { color: #a5b0a9; font-weight: 400; margin-left: 8px; font-size: 13px; }
+  h1 { font-size: 15px; font-weight: 650; margin: 20px 0 6px; }
+  p { color: #a5b0a9; margin: 0 auto; max-width: 46ch; }
+  code { font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 12.5px; color: #b9c2bc; }
+  .cta { display: inline-block; margin-top: 20px; padding: 8px 16px; border-radius: 8px;
+      background: #6ad7a3; color: #072012; font-weight: 600; text-decoration: none; }
+</style></head><body><main>
+  <div class="mark">RDS<span>Remote Deployment System</span></div>
+  <h1>${escapeHtml(title)}</h1>
+  <p>${bodyHtml}</p>
+  ${extraHtml}
+</main></body></html>`;
+}
+
+// Injected above the closing body tag on every HTML response while running
+// without credentials. Amber = attention, per the design language.
+const SETUP_MODE_BANNER = `<div id="rds-setup-banner" style="position:fixed;left:0;right:0;bottom:0;z-index:9999;pointer-events:none;background:#241c10;border-top:1px solid rgba(240,184,105,.4);color:#ffd9a0;font:12.5px/1.5 Inter,system-ui,sans-serif;padding:7px 16px;text-align:center;">
+  <strong style="font-weight:650;">Setup mode</strong> — no dashboard credentials configured; serving to localhost only.
+  Set <code style="font-family:'JetBrains Mono',ui-monospace,monospace;color:#f0b869;">RDS_DASHBOARD_PASSWORD</code> and
+  <code style="font-family:'JetBrains Mono',ui-monospace,monospace;color:#f0b869;">RDS_DASHBOARD_TOKEN</code> in <code style="font-family:'JetBrains Mono',ui-monospace,monospace;color:#f0b869;">.env</code> to secure and enable remote access.
+</div>
+<script>(function(){
+  var b = document.getElementById('rds-setup-banner');
+  if (!b) return;
+  function pad() {
+    var h = b.offsetHeight;
+    // Reserve space so the fixed banner never covers page footers or the
+    // sidebar's bottom links.
+    document.body.style.paddingBottom = h + 'px';
+    var nav = document.getElementById('rds-sidenav');
+    if (nav) nav.style.paddingBottom = (h + 8) + 'px';
+  }
+  pad();
+  window.addEventListener('resize', pad);
+})();</script>`;
 
 // Vendored static assets (e.g. ansi_up.min.js for terminal rendering).
 app.get("/static/:name", (c) => {
@@ -4057,17 +4195,21 @@ app.get("/static/:name", (c) => {
     js: "application/javascript", css: "text/css", svg: "image/svg+xml",
     png: "image/png", json: "application/json", ico: "image/x-icon"
   };
+  // existsSync alone is racy — the file can vanish between check and read.
+  let body: Buffer;
+  try { body = readFileSync(path); } catch { return c.text("not found", 404); }
   c.header("Content-Type", mime[ext ?? ""] ?? "text/plain");
   c.header("Cache-Control", "public, max-age=86400");
-  return c.body(readFileSync(path));
+  return c.body(body);
 });
 
 app.get("/favicon.ico", (c) => {
   const path = join(RDS_ROOT, "dashboard", "public", "favicon.ico");
-  if (!existsSync(path)) return c.text("not found", 404);
+  let body: Buffer;
+  try { body = readFileSync(path); } catch { return c.text("not found", 404); }
   c.header("Content-Type", "image/x-icon");
   c.header("Cache-Control", "public, max-age=604800");
-  return c.body(readFileSync(path));
+  return c.body(body);
 });
 
 app.get("/site.webmanifest", (c) => c.json({
@@ -4222,11 +4364,14 @@ app.get("/", async (c) => {
 
   const criticalCard = lastFailed
     ? `<div class="bg-[#101412] border border-[#ffb4ab]/30 p-2 rounded flex flex-col gap-1">
-        <div class="flex justify-between items-start gap-2">
-          <div class="font-code text-code text-error truncate">${escapeHtml(lastFailed.id)} Failed</div>
-          <span class="font-table text-table text-on-surface-variant shrink-0">${lastFailed.lastActivityMs ? escapeHtml(relativeTime(lastFailed.lastActivityMs)) : "-"}</span>
+        <div class="flex justify-between items-start gap-2 min-w-0">
+          <div class="min-w-0">
+            <div class="font-body text-body text-on-surface truncate">${escapeHtml(lastFailed.displayName || lastFailed.slug || lastFailed.id)}</div>
+            <div class="font-code text-[10px] leading-4 text-on-surface-variant truncate">${escapeHtml(lastFailed.id)}</div>
+          </div>
+          <span class="font-ribbon text-ribbon text-error shrink-0">Failed${lastFailed.lastActivityMs ? ` · ${escapeHtml(relativeTime(lastFailed.lastActivityMs))}` : ""}</span>
         </div>
-        <div class="font-table text-table text-on-surface-variant truncate">${escapeHtml(lastFailed.stage ?? "-")} stage</div>
+        <div class="font-table text-table text-on-surface-variant truncate">failed at ${escapeHtml(lastFailed.stage ?? "unknown")} stage</div>
         <div class="mt-1 flex justify-end gap-2">
           <button type="button" onclick="dismissAlert('${escapeHtml(lastFailed.id)}')" class="font-ribbon text-ribbon text-on-surface bg-[#1b211e] px-2 py-1 rounded hover:bg-[#242b28] transition-colors border border-[#242b28]">Dismiss</button>
           <a href="/b/${escapeHtml(lastFailed.id)}" class="font-ribbon text-ribbon text-on-surface bg-[#1b211e] px-2 py-1 rounded hover:bg-[#242b28] transition-colors border border-[#242b28]">View build</a>
@@ -4247,7 +4392,7 @@ app.get("/", async (c) => {
         </div>
       </div>
 
-      <div class="grid grid-cols-1 lg:grid-cols-3 gap-gutter">
+      <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-gutter">
 
         <!-- Build Engine -->
         <div class="rds-hub-card rds-hub-card-compact bg-surface-container panel-border rounded-DEFAULT flex flex-col p-unit">
@@ -4267,9 +4412,9 @@ app.get("/", async (c) => {
               ${icon("play_arrow", 14)}<span>Start</span>
             </a>
           </div>
-          <div class="hidden md:flex flex-1 flex-col justify-center items-center py-6 text-center">
-            <a href="${escapeHtml(activeBuildHref)}" class="text-[32px] font-code text-primary-container mb-1 hover:underline" title="${runningBuilds.length === 1 ? `Open ${runningBuilds[0].id}` : "View running builds"}">${running}</a>
-            <a href="${escapeHtml(activeBuildHref)}" class="font-ribbon text-ribbon text-on-surface-variant hover:text-primary-container mb-6 uppercase tracking-wider">Active Builds</a>
+          <div class="hidden md:flex flex-1 flex-col justify-center items-center py-4 text-center">
+            <a href="${escapeHtml(activeBuildHref)}" class="text-[30px] leading-9 font-body font-bold tabular-nums text-primary-container hover:underline" title="${runningBuilds.length === 1 ? `Open ${runningBuilds[0].id}` : "View running builds"}">${running}</a>
+            <a href="${escapeHtml(activeBuildHref)}" class="font-ribbon text-ribbon text-on-surface-variant hover:text-primary-container mb-4 uppercase tracking-wider">Active Builds</a>
             <a href="/new" class="rds-action-primary w-full">
               ${icon("play_arrow", 18)}<span>New Build</span>
             </a>
@@ -4323,7 +4468,7 @@ app.get("/", async (c) => {
         </div>
 
         <!-- Hosted Services -->
-        <div class="rds-hub-card bg-surface-container panel-border rounded-DEFAULT flex flex-col p-unit md:min-h-[200px]">
+        <div class="rds-hub-card bg-surface-container panel-border rounded-DEFAULT flex flex-col p-unit lg:min-h-[200px]">
           <div class="flex justify-between items-center mb-unit border-b border-[#242b28] pb-unit">
             <h2 class="font-h2 text-h2 text-on-surface flex items-center gap-2">
               ${icon("cloud_done", 16, "text-primary-container")}<span>Zo Hosting</span>
@@ -4343,7 +4488,7 @@ app.get("/", async (c) => {
         </div>
 
         <!-- Needs Review -->
-        <div class="rds-hub-card bg-surface-container panel-border rounded-DEFAULT flex flex-col p-unit ${pending.length ? "md:min-h-[200px]" : "rds-compact-empty"}">
+        <div class="rds-hub-card bg-surface-container panel-border rounded-DEFAULT flex flex-col p-unit ${pending.length ? "lg:min-h-[200px]" : "rds-compact-empty"}">
           <div class="flex justify-between items-center mb-unit border-b border-[#242b28] pb-unit">
             <h2 class="font-h2 text-h2 text-on-surface flex items-center gap-2">
               ${icon("pending_actions", 16, "text-error")}<span>Needs Review</span>
@@ -4354,7 +4499,7 @@ app.get("/", async (c) => {
         </div>
 
         <!-- Recent Builds -->
-        <div class="rds-hub-card bg-surface-container panel-border rounded-DEFAULT flex flex-col p-unit md:min-h-[200px]">
+        <div class="rds-hub-card bg-surface-container panel-border rounded-DEFAULT flex flex-col p-unit lg:min-h-[200px]">
           <div class="flex justify-between items-center mb-unit border-b border-[#242b28] pb-unit">
             <h2 class="font-h2 text-h2 text-on-surface flex items-center gap-2">
               ${icon("history", 16)}<span>Recent Builds</span>
@@ -4362,15 +4507,15 @@ app.get("/", async (c) => {
             <a class="font-ribbon text-ribbon text-primary-container hover:underline" href="/builds">View All</a>
           </div>
           <div class="md:hidden flex-1 overflow-y-auto custom-scrollbar pr-1">
-            ${recentMobileItems || `<div class="py-2 font-table text-table text-on-surface-variant italic">No builds yet — start one from /new.</div>`}
+            ${recentMobileItems || `<div class="py-2 font-table text-table text-on-surface-variant italic">No builds yet — <a href="/new" class="text-primary-container hover:underline not-italic">start your first build</a>.</div>`}
           </div>
           <div class="hidden md:flex flex-1 flex-col gap-1 overflow-y-auto custom-scrollbar pr-1">
-            ${recentRows || `<div class="py-2 px-2 font-table text-table text-on-surface-variant italic">No builds yet — start one from /new.</div>`}
+            ${recentRows || `<div class="py-2 px-2 font-table text-table text-on-surface-variant italic">No builds yet — <a href="/new" class="text-primary-container hover:underline not-italic">start your first build</a>.</div>`}
           </div>
         </div>
 
         <!-- Critical Alerts -->
-        <div class="rds-hub-card bg-surface-container panel-border rounded-DEFAULT flex flex-col p-unit ${lastFailed ? "md:min-h-[200px]" : "rds-compact-empty md:hidden"}">
+        <div class="rds-hub-card bg-surface-container panel-border rounded-DEFAULT flex flex-col p-unit ${lastFailed ? "lg:min-h-[200px]" : "rds-compact-empty md:hidden"}">
           <div class="flex justify-between items-center mb-unit border-b border-[#242b28] pb-unit">
             <h2 class="font-h2 text-h2 text-on-surface flex items-center gap-2">
               ${icon("warning", 16, "text-error")}<span>Critical Alerts</span>
@@ -4381,7 +4526,7 @@ app.get("/", async (c) => {
         </div>
 
         <!-- Live Activity (full width) -->
-        <div class="rds-hub-card rds-hub-activity bg-surface-container panel-border rounded-DEFAULT flex flex-col p-unit lg:col-span-3 md:min-h-[280px]">
+        <div class="rds-hub-card rds-hub-activity bg-surface-container panel-border rounded-DEFAULT flex flex-col p-unit md:col-span-2 lg:col-span-3 lg:min-h-[280px]">
           <div class="flex justify-between items-center mb-unit border-b border-[#242b28] pb-unit">
             <h2 class="font-h2 text-h2 text-on-surface flex items-center gap-2">
               ${icon("list_alt", 16)}<span>Live Activity</span>
@@ -4488,10 +4633,10 @@ app.get("/builds", async (c) => {
       b.mode ? tagPill(b.mode) : "",
       b.provider ? tagPill(b.provider) : "",
     ].filter(Boolean).join("");
-    return `<tr class="row-clickable hover:bg-[#1b211e] transition-colors group cursor-pointer ${rowBg}" data-href="/b/${escapeHtml(b.id)}" data-search="${escapeHtml((b.id + " " + (b.slug ?? "") + " " + (b.displayName ?? "") + " " + (b.stage ?? "")).toLowerCase())}">
+    return `<tr class="row-clickable hover:bg-[#1b211e] transition-colors group cursor-pointer ${rowBg}" tabindex="0" aria-label="Open build ${escapeHtml(b.displayName || b.slug || b.id)}" data-href="/b/${escapeHtml(b.id)}" data-search="${escapeHtml((b.id + " " + (b.slug ?? "") + " " + (b.displayName ?? "") + " " + (b.stage ?? "")).toLowerCase())}">
       <td class="py-2.5 px-4">${statusDot(b)}</td>
       <td class="py-2.5 px-4 text-on-surface">
-        <div class="flex flex-col gap-0.5 min-w-[360px]">
+        <div class="flex flex-col gap-0.5 min-w-[260px]">
           <span class="font-body text-body truncate" title="${escapeHtml(b.id)}">${escapeHtml(b.displayName || b.slug || compactBuildId(b.id))}</span>
           <span class="font-code text-[10px] leading-4 text-on-surface-variant truncate">${escapeHtml(b.id)}</span>
         </div>
@@ -4503,17 +4648,17 @@ app.get("/builds", async (c) => {
           ${b.hasZoService ? `<button type="button" data-stop="1" onclick="deleteHostedBuild('${escapeHtml(b.id)}')" class="ml-1 inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-error/30 bg-error/10 text-error hover:bg-error/20" title="Delete Zo service and free the slot">${icon("delete", 13)}<span>Delete service</span></button>` : ""}
         </div>
       </td>
-      <td class="py-2.5 px-4 text-on-surface">${escapeHtml(b.stage ?? "—")}</td>
-      <td class="py-2.5 px-4">${statusBadge(b)}</td>
-      <td class="py-2.5 px-4">${reviewBadge(b) || `<span class="text-on-surface-variant">—</span>`}</td>
-      <td class="py-2.5 px-4 text-right font-code text-code text-on-surface">${escapeHtml(cost)}</td>
-      <td class="py-2.5 px-4 text-on-surface-variant text-[11px]">${b.lastActivityMs ? escapeHtml(relativeTime(b.lastActivityMs)) : "—"}</td>
-      <td class="py-2.5 px-4"><div class="flex gap-1">${tags}</div></td>
+      <td class="py-2.5 px-4 text-on-surface whitespace-nowrap">${escapeHtml(b.stage ?? "—")}</td>
+      <td class="py-2.5 px-4 whitespace-nowrap">${statusBadge(b)}</td>
+      <td class="py-2.5 px-4 whitespace-nowrap">${reviewBadge(b) || `<span class="text-on-surface-variant">—</span>`}</td>
+      <td class="py-2.5 px-4 text-right font-code text-code text-on-surface whitespace-nowrap">${escapeHtml(cost)}</td>
+      <td class="py-2.5 px-4 text-on-surface-variant text-[11px] whitespace-nowrap">${b.lastActivityMs ? escapeHtml(relativeTime(b.lastActivityMs)) : "—"}</td>
+      <td class="py-2.5 px-4"><div class="flex flex-wrap gap-1">${tags}</div></td>
       <td class="py-2.5 px-4 text-right opacity-0 group-hover:opacity-100 transition-opacity">
-        ${b.running ? `<button type="button" data-stop="1" onclick="pauseBuild('${escapeHtml(b.id)}')" class="mr-2 text-tertiary-container hover:text-[#ffd8c2]" title="Pause build">${icon("pause", 16)}</button>` : ""}
-        ${b.paused ? `<button type="button" data-stop="1" onclick="resumeBuild('${escapeHtml(b.id)}')" class="mr-2 text-primary-container hover:text-[#8beebb]" title="Resume build">${icon("play_arrow", 16)}</button>` : ""}
-        ${b.hasZoService ? `<button type="button" data-stop="1" onclick="deleteHostedBuild('${escapeHtml(b.id)}')" class="mr-2 text-error hover:text-[#ffd3cf]" title="Delete Zo service">${icon("delete", 16)}</button>` : ""}
-        <a href="/b/${escapeHtml(b.id)}" data-stop="1" class="text-on-surface-variant hover:text-on-surface" title="Open build">${icon("arrow_forward", 16)}</a>
+        ${b.running ? `<button type="button" data-stop="1" onclick="pauseBuild('${escapeHtml(b.id)}')" class="mr-2 text-tertiary-container hover:text-[#ffd8c2]" title="Pause build" aria-label="Pause build">${icon("pause", 16)}</button>` : ""}
+        ${b.paused ? `<button type="button" data-stop="1" onclick="resumeBuild('${escapeHtml(b.id)}')" class="mr-2 text-primary-container hover:text-[#8beebb]" title="Resume build" aria-label="Resume build">${icon("play_arrow", 16)}</button>` : ""}
+        ${b.hasZoService ? `<button type="button" data-stop="1" onclick="deleteHostedBuild('${escapeHtml(b.id)}')" class="mr-2 text-error hover:text-[#ffd3cf]" title="Delete Zo service" aria-label="Delete Zo service">${icon("delete", 16)}</button>` : ""}
+        <a href="/b/${escapeHtml(b.id)}" data-stop="1" class="text-on-surface-variant hover:text-on-surface" title="Open build" aria-label="Open build">${icon("arrow_forward", 16)}</a>
       </td>
     </tr>`;
   }).join("");
@@ -4706,12 +4851,12 @@ app.get("/builds", async (c) => {
           </div>
         </div>
         <div class="md:hidden p-3 space-y-3">
-          ${mobileCards || `<div class="py-6 px-4 text-on-surface-variant italic font-table text-table">No builds match your filters.</div>`}
+          ${mobileCards || `<div class="py-6 px-4 text-on-surface-variant italic font-table text-table">${builds.length ? "No builds match your filters." : `No builds yet — <a href="/new" class="text-primary-container hover:underline not-italic">start your first build</a>.`}</div>`}
         </div>
         <div class="hidden md:block rds-scroll-table">
-        <table class="rds-desktop-table w-full text-left border-collapse whitespace-nowrap">
+        <table class="rds-desktop-table w-full text-left border-collapse">
           <thead class="sticky top-[70px] bg-[#101412] z-20 border-b border-[#242b28]">
-            <tr class="font-ribbon text-ribbon text-on-surface-variant">
+            <tr class="font-ribbon text-ribbon text-on-surface-variant whitespace-nowrap">
               <th class="py-2 px-4 font-medium w-8"></th>
               <th class="py-2 px-4 font-medium">${sortableHeader(c.req.url, "slug", "Slug / ID", sort, dir)}</th>
               <th class="py-2 px-4 font-medium">${sortableHeader(c.req.url, "stage", "Stage", sort, dir)}</th>
@@ -4724,7 +4869,7 @@ app.get("/builds", async (c) => {
             </tr>
           </thead>
           <tbody class="font-table text-table divide-y divide-outline-variant/30">
-            ${rows || `<tr><td colspan="9" class="py-6 px-4 text-on-surface-variant italic font-table text-table">No builds match your filters.</td></tr>`}
+            ${rows || `<tr><td colspan="9" class="py-6 px-4 text-on-surface-variant italic font-table text-table">${builds.length ? "No builds match your filters." : `No builds yet — <a href="/new" class="text-primary-container hover:underline not-italic">start your first build</a>.`}</td></tr>`}
           </tbody>
         </table>
         </div>
@@ -4901,9 +5046,9 @@ app.get("/new", (c) => {
           <p class="rds-page-copy">Start with source. RDS analyzes the PRD, explains the stack and skills it wants, then you approve or override before the build begins.</p>
         </div>
         <div class="flex items-center gap-3 flex-wrap">
-          <a href="/settings/stacks" class="font-ribbon text-ribbon text-on-surface-variant hover:text-on-surface">Stack guide</a>
-          <a href="/settings/skills" class="font-ribbon text-ribbon text-on-surface-variant hover:text-on-surface">Skills guide</a>
-          <a href="/builds" class="font-ribbon text-ribbon text-on-surface-variant hover:text-on-surface">← back to builds</a>
+          <a href="/settings/stacks" class="font-ribbon text-ribbon text-on-surface-variant hover:text-on-surface whitespace-nowrap">Stack guide</a>
+          <a href="/settings/skills" class="font-ribbon text-ribbon text-on-surface-variant hover:text-on-surface whitespace-nowrap">Skills guide</a>
+          <a href="/builds" class="font-ribbon text-ribbon text-on-surface-variant hover:text-on-surface whitespace-nowrap">← back to builds</a>
         </div>
       </div>
 
@@ -4975,7 +5120,7 @@ app.get("/new", (c) => {
                 <button id="rds-analyze-button" type="button" onclick="rdsAnalyzeBuildInputRemote(document.getElementById('new-build'), false, true)" class="rds-action-secondary">
                   <span id="rds-analyze-label">Analyze source</span>
                 </button>
-                <button id="rds-use-plan-button" type="button" onclick="rdsApplyRecommendation(document.getElementById('new-build'))" disabled class="rds-action-primary disabled:opacity-40 disabled:cursor-not-allowed">
+                <button id="rds-use-plan-button" type="button" onclick="rdsApplyRecommendation(document.getElementById('new-build'))" disabled title="Run Analyze source first — RDS applies the recommended stack and skills." class="rds-action-primary disabled:opacity-40 disabled:cursor-not-allowed">
                   Apply plan
                 </button>
               </div>
@@ -5488,7 +5633,7 @@ app.get("/b/:id", async (c) => {
          ${icon("cloud_done", 18, "text-primary-container shrink-0")}
          <div class="flex-1 min-w-0 font-body text-body">
            <div class="font-bold text-primary-container mb-0.5">Live on Zo</div>
-           <div class="text-on-surface-variant break-all">Hosted service URL: <a id="deploy-url-link" href="${escapeHtml(serviceInfo?.url || row.preview || "")}" target="_blank" class="font-code text-code text-primary-container hover:underline">${escapeHtml(serviceInfo?.url || row.preview || "")}</a></div>
+           <div class="text-on-surface-variant break-words">Hosted service URL: <a id="deploy-url-link" href="${escapeHtml(serviceInfo?.url || row.preview || "")}" target="_blank" class="font-code text-code text-primary-container hover:underline break-all">${escapeHtml(serviceInfo?.url || row.preview || "")}</a></div>
          </div>
          <div class="rds-deploy-actions flex gap-2 shrink-0">
            <a href="${escapeHtml(serviceInfo?.url || row.preview || "")}" target="_blank" class="px-3 py-1.5 bg-primary-container hover:bg-surface-tint text-on-primary-container rounded-DEFAULT font-ribbon text-ribbon font-bold transition-colors flex items-center gap-1">${icon("open_in_new", 14)}<span>Open</span></a>
@@ -5501,7 +5646,7 @@ app.get("/b/:id", async (c) => {
            ${icon("cloud_sync", 18, "text-tertiary-container shrink-0")}
            <div class="flex-1 min-w-0 font-body text-body">
              <div class="font-bold text-tertiary-container mb-0.5">Zo service recorded; verify status</div>
-             <div class="text-on-surface-variant break-all">RDS has service <code class="font-code text-code">${escapeHtml(serviceInfo?.service_id || "unknown")}</code>, but it is not marked live. URL: <a id="deploy-url-link" href="${escapeHtml(serviceInfo?.url || row.preview || "")}" target="_blank" class="font-code text-code text-tertiary-container hover:underline">${escapeHtml(serviceInfo?.url || row.preview || "")}</a></div>
+             <div class="text-on-surface-variant break-words">RDS has service <code class="font-code text-code break-all">${escapeHtml(serviceInfo?.service_id || "unknown")}</code>, but it is not marked live. URL: <a id="deploy-url-link" href="${escapeHtml(serviceInfo?.url || row.preview || "")}" target="_blank" class="font-code text-code text-tertiary-container hover:underline break-all">${escapeHtml(serviceInfo?.url || row.preview || "")}</a></div>
            </div>
            <div class="rds-deploy-actions flex gap-2 shrink-0">
              <button type="button" onclick="deploy('zo')" class="px-3 py-1.5 bg-tertiary-container hover:bg-tertiary-container/80 text-on-tertiary-container rounded-DEFAULT font-ribbon text-ribbon font-bold transition-colors flex items-center gap-1">${icon("sync", 14)}<span>Redeploy</span></button>
@@ -5513,7 +5658,7 @@ app.get("/b/:id", async (c) => {
            ${icon(row.localPreviewRunning ? "computer" : "power_settings_new", 18, `${row.localPreviewRunning ? "text-on-surface-variant" : "text-error"} shrink-0`)}
            <div class="flex-1 min-w-0 font-body text-body">
              <div class="font-bold ${row.localPreviewRunning ? "text-on-surface" : "text-error"} mb-0.5">${row.localPreviewRunning ? "Local preview only" : "Local preview stopped"}</div>
-             <div class="text-on-surface-variant break-all">${row.localPreviewRunning ? `Running locally at <code class="font-code text-code">${escapeHtml(row.preview || "")}</code>. This is not hosted on Zo and should not consume a service slot.` : `The old local preview URL is no longer active. RDS will not offer an Open button until the local process is running again or the build is redeployed to Zo.`}</div>
+             <div class="text-on-surface-variant break-words">${row.localPreviewRunning ? `Running locally at <code class="font-code text-code break-all">${escapeHtml(row.preview || "")}</code>. This is not hosted on Zo and should not consume a service slot.` : `The old local preview URL is no longer active. RDS will not offer an Open button until the local process is running again or the build is redeployed to Zo.`}</div>
            </div>
            <div class="rds-deploy-actions flex gap-2 shrink-0">
              ${row.localPreviewRunning ? `<a href="${escapeHtml(row.preview || "")}" target="_blank" class="px-3 py-1.5 border border-outline-variant bg-surface hover:bg-surface-bright text-on-surface rounded-DEFAULT font-ribbon text-ribbon transition-colors flex items-center gap-1">${icon("open_in_new", 14)}<span>Open local</span></a><button type="button" onclick="deploy('teardown')" class="px-3 py-1.5 border border-outline-variant bg-surface hover:bg-surface-bright text-on-surface rounded-DEFAULT font-ribbon text-ribbon transition-colors flex items-center gap-1">${icon("power_settings_new", 14)}<span>Stop local preview</span></button>` : `<button type="button" disabled class="px-3 py-1.5 border border-outline-variant bg-surface text-on-surface-variant rounded-DEFAULT font-ribbon text-ribbon opacity-50 cursor-not-allowed flex items-center gap-1">${icon("open_in_new_off", 14)}<span>Preview stopped</span></button>`}
@@ -5525,7 +5670,7 @@ app.get("/b/:id", async (c) => {
            ${icon("pending", 18, "text-tertiary-container shrink-0")}
            <div class="flex-1 min-w-0 font-body text-body">
              <div class="font-bold text-tertiary-container mb-0.5">Pending Zo registration</div>
-             <div class="text-on-surface-variant break-all">RDS finished local deploy, but the public service registration has not completed yet. Sentinel: <code class="font-code text-code">${escapeHtml(row.preview || "")}</code></div>
+             <div class="text-on-surface-variant break-words">RDS finished local deploy, but the public service registration has not completed yet. Sentinel: <code class="font-code text-code break-all">${escapeHtml(row.preview || "")}</code></div>
            </div>
            <div class="rds-deploy-actions flex gap-2 shrink-0">
              <button type="button" onclick="deploy('zo')" class="px-3 py-1.5 bg-tertiary-container hover:bg-tertiary-container/80 text-on-tertiary-container rounded-DEFAULT font-ribbon text-ribbon font-bold transition-colors flex items-center gap-1">${icon("sync", 14)}<span>Retry deploy</span></button>
@@ -5571,7 +5716,7 @@ app.get("/b/:id", async (c) => {
     : "";
 
   const costPill = row.costUsd != null
-    ? `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-DEFAULT font-code text-[11px] bg-surface-container border border-outline-variant text-on-surface" title="${row.costTokens?.toLocaleString() ?? 0} tokens">${icon("attach_money", 12, "text-primary-container")}<span>$${row.costUsd.toFixed(4)} · ${(row.costTokens ?? 0).toLocaleString()} tok</span></span>`
+    ? `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-DEFAULT font-code text-[11px] bg-surface-container border border-outline-variant text-on-surface" title="$${row.costUsd.toFixed(4)}${row.costTokens ? ` · ${row.costTokens.toLocaleString()} tokens` : ""}">${icon("attach_money", 12, "text-primary-container")}<span>${row.costUsd.toFixed(2)}${row.costTokens ? ` · ${row.costTokens.toLocaleString()} tok` : ""}</span></span>`
     : `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-DEFAULT font-code text-[11px] bg-surface-container border border-outline-variant text-outline" title="POST /b/:id/refresh-cost to compute">${icon("attach_money", 12, "text-outline")}<span>no cost yet</span></span>`;
   const elapsedPill = `<span id="build-elapsed-pill" data-build-elapsed-pill data-start-ms="${buildTiming.startedAt ? parseTimeMs(buildTiming.startedAt) : ""}" data-end-ms="${buildTiming.endedAt ? parseTimeMs(buildTiming.endedAt) : ""}" data-running="${buildTiming.running ? "1" : "0"}" class="rds-elapsed-pill inline-flex items-center gap-1.5 px-2.5 py-1 rounded-DEFAULT font-code text-[11px] bg-primary-container/10 border border-primary-container/35 text-primary-container" title="${escapeHtml(buildTiming.hint)}">${icon(buildTiming.running ? "timer" : "timer_off", 13, buildTiming.running ? "animate-pulse" : "")}<span class="text-primary-container/75">Elapsed</span><strong data-build-elapsed-label>${escapeHtml(buildTiming.label)}</strong></span>`;
   const activeRunLabel = activeRunTiming.running
@@ -5809,7 +5954,7 @@ app.get("/b/:id", async (c) => {
                 <button data-refresh-cost="1" class="min-w-[92px] justify-center border border-outline-variant bg-surface hover:bg-surface-bright text-on-surface transition-colors flex items-center gap-1 font-code text-[11px] rounded-DEFAULT px-2 py-0.5 disabled:opacity-50 disabled:cursor-wait" onclick="refreshCost(event)" title="Recompute cost from available session logs">${icon("refresh", 14)}<span>Refresh cost</span></button>
               </div>
             </div>
-            <div class="rds-mobile-build-summary hidden">
+            <div class="rds-mobile-build-summary ${showHeaderStage ? "" : "rds-mobile-summary-3"} hidden">
               ${showHeaderStage ? `<div>
                 <span class="text-outline">Stage</span>
                 <strong id="mobile-stage-label" data-live-stage-label>${escapeHtml(stageLabel)}</strong>
@@ -5967,7 +6112,7 @@ app.get("/b/:id", async (c) => {
             <div class="flex flex-col gap-stack-gap">
               <h2 class="font-h2 text-h2 text-on-surface flex items-center gap-2">${icon("source_notes", 18, "text-outline")}<span>Diagnostic log index</span></h2>
               <div class="bg-surface border border-outline-variant rounded-DEFAULT overflow-hidden">
-                <div class="rds-scroll-table">
+                <div class="rds-scroll-table overflow-x-auto">
                 <table class="rds-desktop-table w-full font-code text-[11px] text-on-surface">
                   <thead class="bg-surface-container-high text-on-surface-variant">
                     <tr class="text-left">
@@ -6017,12 +6162,12 @@ app.get("/b/:id", async (c) => {
               : pendingPreview
                 ? `<div class="bg-tertiary-container/10 border border-tertiary-container/40 rounded-DEFAULT p-3 text-on-surface-variant font-body text-body">
                      <div class="font-bold text-tertiary-container mb-1">No public preview URL yet.</div>
-                     <div class="break-all">Zo registration is pending: <code class="font-code text-code">${escapeHtml(row.preview || "")}</code></div>
+                     <div class="break-words">Zo registration is pending: <code class="font-code text-code break-all">${escapeHtml(row.preview || "")}</code></div>
                    </div>`
                 : row.preview
                   ? `<div class="bg-error/10 border border-error/30 rounded-DEFAULT p-3 text-on-surface-variant font-body text-body">
                        <div class="font-bold text-error mb-1">Preview is stopped.</div>
-                       <div class="break-all">Recorded URL <code class="font-code text-code">${escapeHtml(row.preview || "")}</code> is not clickable because RDS cannot find a running local process or active Zo service for this build.</div>
+                       <div class="break-words">Recorded URL <code class="font-code text-code break-all">${escapeHtml(row.preview || "")}</code> is not clickable because RDS cannot find a running local process or active Zo service for this build.</div>
                      </div>`
               : `<p class="text-on-surface-variant font-body text-body italic">No preview URL on this build yet. The deploy stage publishes one to <code class="font-code text-code">state.json.preview_url</code>.</p>`}
           </section>
@@ -6090,7 +6235,7 @@ app.get("/b/:id/state.json", (c) => {
   const path = existingFileIn(dir, "state.json");
   if (!path) return c.text("not found", 404);
   c.header("Content-Type", "application/json; charset=utf-8");
-  return c.body(readFileSync(path, "utf8"));
+  try { return c.body(readFileSync(path, "utf8")); } catch { return c.text("not found", 404); }
 });
 
 app.get("/b/:id/evidence-ledger.json", (c) => {
@@ -6100,7 +6245,7 @@ app.get("/b/:id/evidence-ledger.json", (c) => {
   const path = existingFileIn(dir, "evidence-ledger.json");
   if (!path) return c.text("not found", 404);
   c.header("Content-Type", "application/json; charset=utf-8");
-  return c.body(readFileSync(path, "utf8"));
+  try { return c.body(readFileSync(path, "utf8")); } catch { return c.text("not found", 404); }
 });
 
 app.get("/b/:id/truth.json", (c) => {
@@ -6110,7 +6255,7 @@ app.get("/b/:id/truth.json", (c) => {
   const path = existingFileIn(dir, "truth.json");
   if (!path) return c.text("not found", 404);
   c.header("Content-Type", "application/json; charset=utf-8");
-  return c.body(readFileSync(path, "utf8"));
+  try { return c.body(readFileSync(path, "utf8")); } catch { return c.text("not found", 404); }
 });
 
 const LIVE_HEALTH_CACHE = new Map<string, { ts: number; ok: boolean; status: number; checkedAt: string }>();
@@ -6287,7 +6432,7 @@ app.get("/b/:id/timing.json", (c) => {
   const path = existingFileIn(dir, "timing.json");
   if (!path) return c.json({ ok: false, error: "no timing.json yet" }, 404);
   c.header("Content-Type", "application/json; charset=utf-8");
-  return c.body(readFileSync(path, "utf8"));
+  try { return c.body(readFileSync(path, "utf8")); } catch { return c.text("not found", 404); }
 });
 
 app.get("/b/:id/logs.json", (c) => {
@@ -6753,11 +6898,14 @@ function qaIterationsSummary(id: string, iters: { name: string; index: number; m
   const parts = ordered.map((it) => {
     const summary = safeReadJson<QaIterationSummary>(join(BUILDS_DIR, id, "playwright", it.name, "summary.json"));
     const gameVerdict = safeReadJson<QaGameVerdict>(join(BUILDS_DIR, id, "playwright", it.name, "game-verdict.json"));
-    const status = summary?.converged ? "passed" : summary ? `${summary.gapsFound} gap${summary.gapsFound === 1 ? "" : "s"}` : "failed";
+    const gapCount = typeof summary?.gapsFound === "number" ? summary.gapsFound : null;
+    const status = summary?.converged ? "passed"
+      : gapCount !== null ? `${gapCount} gap${gapCount === 1 ? "" : "s"}`
+      : summary ? "completed" : "failed";
     const game = gameVerdict ? `, game ${gameVerdict.status} ${gameVerdict.score}` : "";
     return `${it.name}: ${qaIterationOrigin(id, it.index)}, ${status}${game}`;
   });
-  return `Playwright runs one crawl per iteration; it is not capped at three. ${parts.join(" · ")}`;
+  return `Playwright runs one crawl per iteration. ${parts.join(" · ")}.`;
 }
 
 function listQaIterations(id: string): { name: string; index: number; mtime: number }[] {
@@ -6816,9 +6964,10 @@ app.get("/b/:id/playwright", async (c) => {
     const fileBase = `/b/${encodeURIComponent(id)}/playwright/file/${encodeURIComponent(selected.name)}`;
 
     if (summary) {
+      const gapCount = typeof summary.gapsFound === "number" ? summary.gapsFound : gaps.length;
       const statusBadge = summary.converged
         ? `<span class="inline-flex items-center gap-1 bg-success/15 text-success px-2 py-0.5 rounded-DEFAULT font-ribbon text-ribbon">${icon("check_circle", 14)}<span>converged</span></span>`
-        : `<span class="inline-flex items-center gap-1 bg-warn-container/30 text-warn px-2 py-0.5 rounded-DEFAULT font-ribbon text-ribbon">${icon("warning", 14)}<span>${summary.gapsFound} gap${summary.gapsFound === 1 ? "" : "s"}</span></span>`;
+        : `<span class="inline-flex items-center gap-1 bg-warn-container/30 text-warn px-2 py-0.5 rounded-DEFAULT font-ribbon text-ribbon">${icon("warning", 14)}<span>${gapCount} gap${gapCount === 1 ? "" : "s"}</span></span>`;
 
       const gapsByKind: Record<string, number> = {};
       for (const g of gaps) gapsByKind[g.kind] = (gapsByKind[g.kind] || 0) + 1;
@@ -6966,17 +7115,17 @@ app.get("/b/:id/playwright", async (c) => {
               <h2 class="font-h2 text-h2 text-on-surface">${escapeHtml(selected.name)}</h2>
               ${statusBadge}
               <span class="inline-flex items-center gap-1 bg-surface border border-outline-variant px-2 py-0.5 rounded-DEFAULT font-ribbon text-ribbon text-on-surface-variant">${escapeHtml(origin)}</span>
-              <span class="font-code text-[11px] text-outline">${escapeHtml(summary.startedAt)}</span>
+              ${summary.startedAt ? `<span class="font-code text-[11px] text-outline">${escapeHtml(summary.startedAt)}</span>` : ""}
             </div>
             <div class="flex items-center gap-2 text-on-surface-variant font-body text-body">
-              <span><span class="text-on-surface">${summary.pagesVisited}</span> pages</span>
+              <span><span class="text-on-surface">${summary.pagesVisited ?? (summary.pages || []).length}</span> pages</span>
               <span class="text-outline-variant">·</span>
-              <span><span class="text-on-surface">${summary.totalElements}</span> elements</span>
+              <span><span class="text-on-surface">${summary.totalElements ?? "—"}</span> elements</span>
               <span class="text-outline-variant">·</span>
               <span><span class="text-on-surface">${Math.round((summary.durationMs || 0) / 100) / 10}s</span></span>
             </div>
           </div>
-          <div class="font-code text-[11px] text-on-surface-variant break-all">base: ${escapeHtml(summary.baseUrl)}</div>
+          ${summary.baseUrl ? `<div class="font-code text-[11px] text-on-surface-variant break-all">base: ${escapeHtml(summary.baseUrl)}</div>` : ""}
           ${kindChips ? `<div class="flex flex-wrap gap-2 pt-1">${kindChips}</div>` : ""}
         </div>
 
@@ -7039,7 +7188,7 @@ app.get("/b/:id/playwright", async (c) => {
       </div>
       ${previewRaw ? `<div class="bg-surface border border-outline-variant rounded-DEFAULT px-container-padding py-2 font-code text-[11px] text-on-surface-variant break-all"><span class="text-outline">preview:</span> ${escapeHtml(previewRaw)}</div>` : ""}
       <div class="bg-surface border border-outline-variant rounded-DEFAULT px-container-padding py-2 font-body text-body text-on-surface-variant">
-        ${escapeHtml(qaIterationsSummary(id, iters))} It checks runtime behavior, console/network errors, clickable controls, DOM/canvas changes, and screenshots. It is not yet a full semantic audit of every original spec line.
+        ${escapeHtml(qaIterationsSummary(id, iters))} The crawler checks runtime behavior, console/network errors, clickable controls, DOM/canvas changes, and screenshots — it is not yet a full semantic audit of every original spec line.
       </div>
       ${switcherHtml}
       ${bodyHtml}
@@ -7100,7 +7249,7 @@ app.get("/b/:id/playwright/file/:iter/:name", (c) => {
     json: "application/json", txt: "text/plain", log: "text/plain", html: "text/html"
   };
   c.header("Content-Type", mime[ext ?? ""] ?? "application/octet-stream");
-  return c.body(readFileSync(path));
+  try { return c.body(readFileSync(path)); } catch { return c.text("not found", 404); }
 });
 
 // Legacy route for files dropped directly into builds/<id>/playwright/ (not in iter-NNN/).
@@ -7119,7 +7268,7 @@ app.get("/b/:id/playwright/file/:name", (c) => {
     json: "application/json", txt: "text/plain", log: "text/plain", html: "text/html"
   };
   c.header("Content-Type", mime[ext ?? ""] ?? "application/octet-stream");
-  return c.body(readFileSync(path));
+  try { return c.body(readFileSync(path)); } catch { return c.text("not found", 404); }
 });
 
 // POST /b/:id/playwright/run — kick off bin/rds-qa as a detached background task.
@@ -7276,7 +7425,11 @@ function annotateSession(s: ChatSession): {
 }
 
 app.get("/chat/sessions", (c) => {
-  const sessions = listChatSessions().map(annotateSession);
+  // Same visibility rule as the Builds list: threads for fixture/smoke builds
+  // (_-prefixed) stay out of the operator's sidebar.
+  const sessions = listChatSessions()
+    .filter((s) => !s.build_id || (!s.build_id.startsWith("_") && !s.build_id.startsWith("rds-smoke-")))
+    .map(annotateSession);
   return c.json({ sessions });
 });
 
@@ -7485,7 +7638,7 @@ app.get("/b/:id/cost.json", (c) => {
     return c.json({ ok: false, error: "no cost.json yet — POST /b/:id/refresh-cost to compute" }, 404);
   }
   c.header("Content-Type", "application/json");
-  return c.body(readFileSync(path));
+  try { return c.body(readFileSync(path)); } catch { return c.text("not found", 404); }
 });
 
 // Human-readable cost view (HTML wrapper around cost.json).
@@ -7504,10 +7657,22 @@ app.get("/b/:id/cost", (c) => {
             <h1 class="font-h1 text-h1 text-on-surface flex items-center gap-2">${icon("attach_money", 20, "text-primary-container")}<span>Cost · <code class="font-code text-primary-container">${escapeHtml(id)}</code></span></h1>
           </div>
         </div>
+        ${(() => {
+          // No computed breakdown yet, but state.json may already carry a
+          // recorded total — show what is known instead of claiming nothing.
+          const state = safeReadJson<StateJson>(join(dir, "state.json")) as { cost?: { total_usd?: number; input_tokens?: number; output_tokens?: number } } | null;
+          const sc = state?.cost;
+          return typeof sc?.total_usd === "number" ? `
+        <div class="bg-surface-container border border-outline-variant rounded-DEFAULT p-container-padding flex items-center gap-4 flex-wrap">
+          <span class="inline-flex items-center gap-1 px-2 py-1 rounded-DEFAULT bg-primary-container/10 border border-primary-container/30 text-primary-container"><b class="font-h2 text-h2">$${sc.total_usd.toFixed(2)}</b><span>recorded total</span></span>
+          ${sc.input_tokens || sc.output_tokens ? `<span class="font-code text-[12px] text-on-surface-variant">${(sc.input_tokens ?? 0).toLocaleString()} in · ${(sc.output_tokens ?? 0).toLocaleString()} out tokens</span>` : ""}
+          <span class="font-body text-body text-on-surface-variant">From <code class="font-code text-code">state.json</code> — no per-session breakdown yet.</span>
+        </div>` : "";
+        })()}
         <div class="bg-surface-container border border-outline-variant rounded-DEFAULT p-container-padding text-on-surface-variant font-body text-body flex items-center gap-3 flex-wrap">
-          <span>No <code class="font-code text-code">cost.json</code> yet.</span>
+          <span>No per-session breakdown yet.</span>
           <button class="px-3 py-1.5 border border-outline-variant bg-surface hover:bg-surface-bright text-on-surface rounded-DEFAULT font-ribbon text-ribbon transition-colors flex items-center gap-1" onclick="fetch('/b/${escapeHtml(id)}/refresh-cost',{method:'POST',headers:{'X-RDS-Token':localStorage.getItem('rds_token')||''}}).then(()=>location.reload())">${icon("refresh", 14)}<span>Refresh cost</span></button>
-          <span>to compute from claude session logs.</span>
+          <span>computes it from model session logs.</span>
         </div>
       </div>
     `, { nav: "builds", topbarTab: "builds" }));
@@ -7714,7 +7879,7 @@ app.post("/upload-prd", async (c) => {
 app.get("/docs", (c) => {
   const statusItems = [
     ["Source of truth", "The installed checkout is the operating copy; runtime data lives in the configured data root, not in Git."],
-    ["Canonical remote", "New work should target github.com/chrissotraidis/RDS."],
+    ["Canonical remote", "Push RDS changes to your checkout's Git remote; the dashboard itself never writes to Git."],
     ["Service naming", "Do not rename service labels, paths, or runtime files during ordinary feature work."],
   ];
   const docSections = [
@@ -7742,7 +7907,7 @@ app.get("/docs", (c) => {
         <div>
           <div class="rds-page-eyebrow">Reference</div>
           <h1 class="rds-page-title flex items-center gap-2">${icon("menu_book", 24, "text-primary-container")}<span>RDS Documentation</span></h1>
-          <p class="rds-page-copy">Operator-facing map for the live Remote Deployment System on Zo.</p>
+          <p class="rds-page-copy">Operator-facing map of the documentation for this RDS install.</p>
         </div>
         <a class="rds-action-secondary" href="https://github.com/chrissotraidis/RDS" target="_blank" rel="noopener noreferrer">${icon("open_in_new", 14)}<span>GitHub</span></a>
       </div>
@@ -7752,7 +7917,7 @@ app.get("/docs", (c) => {
           <div class="rds-doc-section-head">
             <div>
               <div class="font-ribbon text-ribbon text-tertiary-container uppercase tracking-wide">Repo status</div>
-              <h2 class="font-h2 text-h2 text-on-surface mt-1">Zo is the working copy</h2>
+              <h2 class="font-h2 text-h2 text-on-surface mt-1">The checkout is the working copy</h2>
             </div>
             <span class="rds-doc-count">3 rules</span>
           </div>
@@ -8283,8 +8448,8 @@ app.get("/settings/stacks", (c) => {
           <h1 class="rds-page-title flex items-center gap-2">${icon("layers", 24, "text-primary-container")}<span>Build Types</span></h1>
           <p class="rds-page-copy">A build type combines the runtime stack with the app-type lens QA and taste review should use.</p>
         </div>
-        <div class="flex items-center gap-3 flex-wrap">
-          <a class="text-primary-container hover:underline font-ribbon text-ribbon" href="/new">New Build</a>
+        <div class="flex items-center gap-3 shrink-0">
+          <a class="text-primary-container hover:underline font-ribbon text-ribbon whitespace-nowrap" href="/new">New Build</a>
           <a class="rds-action-secondary" href="/settings">${icon("arrow_back", 14)}<span>Settings</span></a>
         </div>
       </div>
@@ -8381,8 +8546,8 @@ app.get("/settings/skills", (c) => {
           <h1 class="rds-page-title flex items-center gap-2">${icon("extension", 24, "text-primary-container")}<span>Skills Catalog</span></h1>
           <p class="rds-page-copy">Skills are RDS capability packs. They add context, verification, integrations, deploy instructions, or stack-specific recipes when the PRD calls for them.</p>
         </div>
-        <div class="flex items-center gap-3 flex-wrap">
-          <a class="text-primary-container hover:underline font-ribbon text-ribbon" href="/new">New Build</a>
+        <div class="flex items-center gap-3 shrink-0">
+          <a class="text-primary-container hover:underline font-ribbon text-ribbon whitespace-nowrap" href="/new">New Build</a>
           <a class="rds-action-secondary" href="/settings">${icon("arrow_back", 14)}<span>Settings</span></a>
         </div>
       </div>
@@ -8685,12 +8850,12 @@ app.get("/audit", (c) => {
           <a class="text-outline hover:text-on-surface flex items-center gap-1" href="/">${icon("arrow_back", 14)}<span>Hub</span></a>
         </div>
       </div>
-      <p class="text-on-surface-variant font-body text-body">Append-only log of all write actions (build start/stop, deploy, approve/reject, watchdog toggle, PRD upload). Source: <code class="font-code text-code">${escapeHtml(AUDIT_LOG)}</code></p>
+      <p class="text-on-surface-variant font-body text-body">Append-only log of all write actions (build start/stop, deploy, approve/reject, watchdog toggle, PRD upload). Source: <code class="font-code text-code" title="${escapeHtml(AUDIT_LOG)}">${escapeHtml(basename(AUDIT_LOG))}</code> <span class="text-outline">in the dashboard state dir</span></p>
       <div class="md:hidden space-y-3">
         ${mobileRows || `<div class="px-3 py-6 text-center text-on-surface-variant italic">No audit entries yet.</div>`}
       </div>
       <div class="hidden md:block bg-surface border border-outline-variant rounded-DEFAULT overflow-hidden">
-        <div class="rds-scroll-table">
+        <div class="rds-scroll-table overflow-x-auto">
         <table class="rds-desktop-table w-full font-table text-table">
           <thead class="bg-surface-container-high border-b border-outline-variant">
             <tr class="text-on-surface-variant font-ribbon text-ribbon uppercase tracking-wider">
@@ -8893,6 +9058,14 @@ function statusDot(b: BuildRow): string {
   return `<span class="inline-block w-2 h-2 rounded-full ${cls}"></span>`;
 }
 
+// Raw pipeline statuses are snake_case tokens (e.g. "pending_review");
+// operator-facing chips always show the humanized form.
+function humanStatus(status?: string | null): string {
+  if (!status) return "—";
+  const label = status.replace(/[_-]+/g, " ").trim();
+  return label.charAt(0).toUpperCase() + label.slice(1);
+}
+
 function statusBadge(b: BuildRow): string {
   const k = statusKind(b);
   const map: Record<string, { label: string; cls: string }> = {
@@ -8901,7 +9074,7 @@ function statusBadge(b: BuildRow): string {
     failed:  { label: "Failed", cls: "bg-error/10 text-error border border-error/30" },
     paused:  { label: "Paused", cls: "bg-tertiary-container/10 text-tertiary-container border border-tertiary-container/30" },
     done:    { label: "Done",   cls: "bg-surface-container text-on-surface-variant border border-outline-variant" },
-    other:   { label: b.status ?? "—", cls: "bg-surface-container text-on-surface-variant border border-outline-variant" },
+    other:   { label: humanStatus(b.status), cls: "bg-surface-container text-on-surface-variant border border-outline-variant" },
   };
   const entry = map[k];
   return `<span class="rds-status-badge inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[11px] font-medium ${entry.cls}">${escapeHtml(entry.label)}</span>`;
@@ -8960,6 +9133,188 @@ function icon(name: string, size = 16, extra = ""): string {
   return `<span class="material-symbols-outlined ${extra}" data-icon="${escapeHtml(name)}" aria-hidden="true" style="font-size:${size}px"></span>`;
 }
 
+// Real-time canvas globe for the sidebar: rotating dot-cloud continents on a
+// tilted 3D graticule. Deterministic (seeded PRNG), renders at ~30fps, honors
+// prefers-reduced-motion (single static frame) and pauses in hidden tabs.
+// This is the app's one ambient animation (docs/DESIGN.md).
+function globeScript(): string {
+  return `(function () {
+    var canvas = document.getElementById('rds-globe-canvas');
+    if (!canvas || !canvas.getContext) return;
+    var ctx = canvas.getContext('2d');
+    var DPR = Math.min(2, window.devicePixelRatio || 1);
+    var TILT = 23.4 * Math.PI / 180;
+    var cosT = Math.cos(TILT), sinT = Math.sin(TILT);
+
+    // Seeded PRNG so the planet is identical on every load.
+    var seed = 1337;
+    function rand() { seed |= 0; seed = seed + 0x6D2B79F5 | 0; var t = Math.imul(seed ^ seed >>> 15, 1 | seed); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }
+    function gauss() { var u = 0, v = 0; while (!u) u = rand(); while (!v) v = rand(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+
+    // Continent dot clusters: [latDeg, lonDeg, spreadDeg, weight]
+    var CL = [
+      [55, -105, 11, 10], [40, -98, 9, 8], [63, -95, 10, 6], [20, -102, 5, 3],
+      [72, -40, 5, 2],
+      [-8, -58, 9, 7], [-28, -63, 6, 3], [3, -74, 4, 2],
+      [50, 12, 7, 6], [60, 28, 6, 3],
+      [12, 8, 8, 5], [25, 18, 8, 4], [-8, 22, 8, 5], [-24, 26, 6, 3],
+      [26, 45, 6, 3], [38, 68, 8, 4],
+      [58, 95, 13, 9], [34, 105, 8, 7], [22, 79, 6, 5], [48, 128, 6, 3],
+      [36, 138, 3, 2], [12, 102, 4, 2], [-3, 117, 6, 3],
+      [-25, 135, 7, 4], [-40, 175, 3, 1]
+    ];
+    var totalW = 0, cum = [];
+    for (var i = 0; i < CL.length; i++) { totalW += CL[i][3]; cum.push(totalW); }
+    var DOTS = [];
+    for (var d = 0; d < 1500; d++) {
+      var pick = rand() * totalW, ci = 0;
+      while (cum[ci] < pick) ci++;
+      var c = CL[ci];
+      var lat = c[0] + gauss() * c[2];
+      var lon = c[1] + gauss() * c[2] / Math.max(0.35, Math.cos(lat * Math.PI / 180));
+      if (lat > 84 || lat < -80) continue;
+      var phi = lat * Math.PI / 180, lam = lon * Math.PI / 180;
+      DOTS.push([Math.cos(phi) * Math.sin(lam), Math.sin(phi), Math.cos(phi) * Math.cos(lam), 0.6 + rand() * 0.4]);
+    }
+
+    // Graticule polylines (unit sphere): latitude rings + meridians.
+    var LINES = [];
+    var latDeg, lonDeg, a, pts;
+    for (latDeg = -60; latDeg <= 60; latDeg += 30) {
+      pts = [];
+      for (a = 0; a <= 96; a++) { var la = latDeg * Math.PI / 180, lo = a / 96 * 2 * Math.PI; pts.push([Math.cos(la) * Math.sin(lo), Math.sin(la), Math.cos(la) * Math.cos(lo)]); }
+      LINES.push({ pts: pts, eq: latDeg === 0 });
+    }
+    for (lonDeg = 0; lonDeg < 180; lonDeg += 30) {
+      pts = [];
+      for (a = 0; a <= 96; a++) { var lp = (a / 96 * 2 - 1) * Math.PI / 2 * 1.999, ll = lonDeg * Math.PI / 180; pts.push([Math.cos(lp) * Math.sin(ll), Math.sin(lp), Math.cos(lp) * Math.cos(ll)]); }
+      LINES.push({ pts: pts, eq: false });
+    }
+
+    var W = 0, H = 0, R = 0, CX = 0, CY = 0;
+    function resize() {
+      var box = canvas.parentElement.getBoundingClientRect();
+      var size = Math.max(96, Math.min(box.width, box.height || box.width));
+      W = Math.round(size * DPR); H = W;
+      canvas.width = W; canvas.height = H;
+      canvas.style.width = size + 'px'; canvas.style.height = size + 'px';
+      CX = W / 2; CY = H / 2; R = W / 2 - 3 * DPR;
+    }
+
+    function rot(p, cosA, sinA) {
+      var x = p[0] * cosA + p[2] * sinA;
+      var z = -p[0] * sinA + p[2] * cosA;
+      var y = p[1] * cosT - z * sinT;
+      var zz = p[1] * sinT + z * cosT;
+      return [x, y, zz];
+    }
+
+    function render(theta) {
+      var cosA = Math.cos(theta), sinA = Math.sin(theta);
+      ctx.clearRect(0, 0, W, H);
+
+      // Sphere body: dark green-graphite with a top-left key light.
+      var body = ctx.createRadialGradient(CX - R * 0.42, CY - R * 0.48, R * 0.1, CX, CY, R);
+      body.addColorStop(0, 'rgba(30,48,39,0.95)');
+      body.addColorStop(0.55, 'rgba(13,21,17,0.97)');
+      body.addColorStop(1, 'rgba(4,8,6,1)');
+      ctx.beginPath(); ctx.arc(CX, CY, R, 0, 2 * Math.PI);
+      ctx.fillStyle = body; ctx.fill();
+
+      ctx.save();
+      ctx.beginPath(); ctx.arc(CX, CY, R, 0, 2 * Math.PI); ctx.clip();
+
+      // Graticule: faint far side first, brighter near side.
+      var pass, li, pi, p, q, vis;
+      for (pass = 0; pass < 2; pass++) {
+        ctx.lineWidth = (pass ? 0.8 : 0.6) * DPR;
+        for (li = 0; li < LINES.length; li++) {
+          var line = LINES[li];
+          ctx.strokeStyle = pass
+            ? (line.eq ? 'rgba(106,215,163,0.30)' : 'rgba(106,215,163,0.16)')
+            : 'rgba(106,215,163,0.05)';
+          ctx.beginPath(); vis = false;
+          for (pi = 0; pi < line.pts.length; pi++) {
+            p = rot(line.pts[pi], cosA, sinA);
+            var front = pass ? p[2] > 0 : p[2] <= 0;
+            if (front) {
+              q = [CX + p[0] * R, CY - p[1] * R];
+              if (vis) ctx.lineTo(q[0], q[1]); else ctx.moveTo(q[0], q[1]);
+              vis = true;
+            } else vis = false;
+          }
+          ctx.stroke();
+        }
+      }
+
+      // Continent dots — city-light cloud. Far side barely visible haze.
+      for (pi = 0; pi < DOTS.length; pi++) {
+        p = rot(DOTS[pi], cosA, sinA);
+        var sx = CX + p[0] * R, sy = CY - p[1] * R;
+        if (p[2] > 0) {
+          var depth = p[2];
+          var alpha = (0.32 + 0.6 * depth) * DOTS[pi][3];
+          var size = (0.42 + 0.62 * depth) * DPR;
+          ctx.fillStyle = 'rgba(139,238,187,' + alpha.toFixed(3) + ')';
+          ctx.beginPath(); ctx.arc(sx, sy, size, 0, 2 * Math.PI); ctx.fill();
+        } else if (p[2] > -0.35) {
+          ctx.fillStyle = 'rgba(106,215,163,0.05)';
+          ctx.beginPath(); ctx.arc(sx, sy, 0.7 * DPR, 0, 2 * Math.PI); ctx.fill();
+        }
+      }
+
+      // Terminator: night falls toward the lower-right.
+      var night = ctx.createLinearGradient(CX - R, CY - R, CX + R, CY + R);
+      night.addColorStop(0, 'rgba(0,0,0,0)');
+      night.addColorStop(0.62, 'rgba(0,0,0,0)');
+      night.addColorStop(1, 'rgba(2,5,4,0.55)');
+      ctx.fillStyle = night; ctx.fillRect(0, 0, W, H);
+
+      // Atmosphere: inner rim light.
+      var atm = ctx.createRadialGradient(CX, CY, R * 0.86, CX, CY, R);
+      atm.addColorStop(0, 'rgba(106,215,163,0)');
+      atm.addColorStop(1, 'rgba(139,238,187,0.20)');
+      ctx.fillStyle = atm; ctx.fillRect(0, 0, W, H);
+      ctx.restore();
+
+      // Crisp limb + specular arc top-left.
+      ctx.beginPath(); ctx.arc(CX, CY, R, 0, 2 * Math.PI);
+      ctx.strokeStyle = 'rgba(106,215,163,0.42)'; ctx.lineWidth = 1 * DPR; ctx.stroke();
+      ctx.beginPath(); ctx.arc(CX, CY, R - 1.2 * DPR, Math.PI * 1.08, Math.PI * 1.62);
+      ctx.strokeStyle = 'rgba(185,255,224,0.30)'; ctx.lineWidth = 1.6 * DPR; ctx.lineCap = 'round'; ctx.stroke();
+    }
+
+    var reduced = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)');
+    // Start facing the Europe/Africa/Asia hemisphere — the densest view.
+    var theta = -0.35, speed = 0.000048, targetSpeed = speed, lastT = 0, raf = 0;
+    function frame(t) {
+      raf = requestAnimationFrame(frame);
+      if (t - lastT < 33) return; // ~30fps is plenty for ambient motion
+      var dt = lastT ? Math.min(100, t - lastT) : 16;
+      lastT = t;
+      speed += (targetSpeed - speed) * 0.05;
+      theta += speed * dt;
+      render(theta);
+    }
+    function start() {
+      cancelAnimationFrame(raf);
+      resize();
+      if (reduced && reduced.matches) { render(theta); return; }
+      lastT = 0;
+      raf = requestAnimationFrame(frame);
+    }
+    var link = canvas.closest('.rds-wire-globe-link') || canvas;
+    link.addEventListener('mouseenter', function () { targetSpeed = 0.00016; });
+    link.addEventListener('mouseleave', function () { targetSpeed = 0.000048; });
+    document.addEventListener('visibilitychange', function () {
+      if (document.hidden) cancelAnimationFrame(raf); else start();
+    });
+    if (reduced && reduced.addEventListener) reduced.addEventListener('change', start);
+    if (window.ResizeObserver) new ResizeObserver(function () { start(); }).observe(canvas.parentElement);
+    start();
+  })();`;
+}
+
 function sidenav(active: NavKey): string {
   const hostedCount = activeZoServiceCountSync();
   const items: { key: NavKey; href: string; label: string; icon: string }[] = [
@@ -8990,53 +9345,11 @@ function sidenav(active: NavKey): string {
       <div class="rds-wire-globe-wrap px-4 mb-4">
         <a href="/" class="rds-wire-globe-link" aria-label="Operator Console">
         <div class="rds-wire-globe" aria-hidden="true">
-          <svg class="rds-wire-globe-svg" viewBox="0 0 160 160" role="presentation" focusable="false">
-            <defs>
-              <radialGradient id="rdsWireGlobeShade" cx="34%" cy="25%" r="72%">
-                <stop offset="0%" stop-color="#b9ffe0" stop-opacity=".18" />
-                <stop offset="48%" stop-color="#6ad7a3" stop-opacity=".07" />
-                <stop offset="100%" stop-color="#020604" stop-opacity=".42" />
-              </radialGradient>
-              <clipPath id="rdsWireGlobeClip">
-                <circle cx="80" cy="80" r="62" />
-              </clipPath>
-              <filter id="rdsWireGlobeGlow" x="-35%" y="-35%" width="170%" height="170%">
-                <feGaussianBlur stdDeviation="2.1" result="blur" />
-                <feMerge>
-                  <feMergeNode in="blur" />
-                  <feMergeNode in="SourceGraphic" />
-                </feMerge>
-              </filter>
-            </defs>
-            <circle class="rds-wire-globe-aura" cx="80" cy="80" r="63" />
-            <circle class="rds-wire-globe-fill" cx="80" cy="80" r="62" />
-            <g clip-path="url(#rdsWireGlobeClip)">
-              <g class="rds-wire-globe-lines">
-                <ellipse cx="80" cy="80" rx="62" ry="62" />
-                <ellipse cx="80" cy="80" rx="48" ry="62" />
-                <ellipse cx="80" cy="80" rx="29" ry="62" />
-                <ellipse cx="80" cy="80" rx="11" ry="62" />
-                <path d="M20 80 H140" />
-                <ellipse cx="80" cy="80" rx="59" ry="38" />
-                <ellipse cx="80" cy="80" rx="52" ry="22" />
-                <ellipse cx="80" cy="80" rx="39" ry="10" />
-                <path d="M27 50 C45 58 59 62 80 62 C101 62 116 58 133 50" />
-                <path d="M27 110 C45 102 59 98 80 98 C101 98 116 102 133 110" />
-              </g>
-            </g>
-            <g clip-path="url(#rdsWireGlobeClip)" filter="url(#rdsWireGlobeGlow)">
-              <g class="rds-wire-globe-land">
-                <path d="M38 52 C45 43 59 42 64 51 C69 59 61 65 64 75 C68 89 83 89 80 101 C77 113 67 119 59 112 C53 107 55 95 47 90 C39 85 28 88 26 77 C24 66 31 61 38 52 Z" />
-                <path d="M73 39 C81 35 92 38 96 47 C99 54 93 59 98 66 C103 73 116 70 122 78 C129 88 119 101 109 98 C99 96 94 84 84 86 C75 88 68 80 70 70 C72 61 63 48 73 39 Z" />
-                <path d="M98 103 C108 98 123 102 126 113 C129 123 114 130 103 126 C93 122 88 109 98 103 Z" />
-                <path d="M130 56 C138 58 143 66 139 74 C134 71 129 68 123 67 C120 61 123 55 130 56 Z" />
-              </g>
-            </g>
-            <path class="rds-wire-globe-highlight" d="M41 44 C57 23 94 20 118 40" />
-          </svg>
+          <canvas id="rds-globe-canvas" class="rds-globe-canvas"></canvas>
         </div>
         </a>
       </div>
+      <script>${globeScript()}</script>
       <div class="px-4 mb-4">
         <a href="/new" class="rds-action-primary w-full">
           ${icon("add", 16)}<span>New Build</span>
@@ -9762,6 +10075,13 @@ function renderBuildCommandCenter(opts: {
     attempts.iterateStarted ? `${attempts.iterateStarted} iteration attempts` : "",
     attempts.needsReview ? `${attempts.needsReview} handoff` : "",
   ].filter(Boolean).join(" · ") || "no recovery attempts";
+  // Idle-build chips only state what is known: absent evidence stays quiet
+  // ("scenarios missing · 0/0 skills · no recovery attempts" on a clean build
+  // reads like a problem when nothing is wrong).
+  const idleChips: string[] = [blockerClass === "none" ? "no blockers" : displayTokenLabel(blockerClass)];
+  if (qualityLedger?.scenarios?.executed || qualityLedger?.scenarios?.available) idleChips.push(scenarioStatus);
+  if ((qualityLedger?.skills?.requested?.length ?? 0) > 0) idleChips.push(skillCount);
+  if (attempts.fixerStarted || attempts.iterateStarted || attempts.needsReview) idleChips.push(attemptText);
   const activeRunChips = row.running
     ? [
         `stage ${displayTokenLabel(row.stage || "build")}`,
@@ -9770,7 +10090,7 @@ function renderBuildCommandCenter(opts: {
       ]
     : staleTasteOnly
       ? ["No active runner", `${escapeHtml(qualityLedger?.latestPlaywrightIteration || "latest QA")} passed`, "Taste review predates latest QA", attemptText]
-      : [displayTokenLabel(blockerClass), scenarioStatus, skillCount, attemptText];
+      : idleChips;
   const blockerSourceLabel = (source?: string | null): string => {
     const parts = String(source || "").split("/").filter(Boolean);
     if (!parts.length) return "";
@@ -12369,10 +12689,9 @@ function chatScript(): string {
       title.textContent = session.title;
       if (session.build_id) {
         rdsChatState.activeBuildId = session.build_id;
-        if (buildLink) {
-          buildLink.classList.remove('hidden');
-          buildLink.innerHTML = '· <a href="/b/' + encodeURIComponent(session.build_id) + '" class="text-primary-container hover:underline inline-block max-w-[42vw] truncate align-bottom" title="' + escapeChatHtml(session.build_id) + '">' + escapeChatHtml(session.build_id) + '</a>';
-        }
+        // The build id already appears in the Build-context strip below the
+        // header — repeating it next to the title just truncates both.
+        if (buildLink) { buildLink.classList.add('hidden'); buildLink.innerHTML = ''; }
         if (buildActions) buildActions.classList.remove('hidden');
         if (buildActionsId) buildActionsId.textContent = session.build_id;
         if (openBuild) openBuild.setAttribute('href', '/b/' + encodeURIComponent(session.build_id));
@@ -12810,56 +13129,8 @@ function chatScript(): string {
 
 function layout(title: string, body: string, opts: { nav?: NavKey; topbarTab?: "builds" | "overview" } = {}): string {
   const navKey: NavKey = opts.nav ?? "hub";
-  const tailwindConfig = `
-    tailwind.config = {
-      darkMode: "class",
-      theme: {
-        extend: {
-          colors: {
-            "surface-variant": "#2c332f", "on-primary": "#04170d", "surface-dim": "#0b0d0c",
-            "on-tertiary": "#3d2a08", "inverse-primary": "#1f6b47", "outline-variant": "#242b28",
-            "on-background": "#e9eeea", "primary-fixed": "#8beebb", "secondary-fixed-dim": "#b9c2bc",
-            "secondary": "#b9c2bc", "surface-tint": "#7ee2ae", "surface-container": "#141917",
-            "primary-container": "#6ad7a3", "error": "#ffb4ab", "on-tertiary-container": "#3d2a08",
-            "surface-container-highest": "#242b28", "on-tertiary-fixed": "#341f00",
-            "on-error": "#690005", "inverse-surface": "#e9eeea", "surface": "#0b0d0c",
-            "surface-container-high": "#1b211e", "on-surface-variant": "#a5b0a9",
-            "on-secondary": "#272b28", "on-primary-container": "#042315",
-            "primary": "#8beebb", "inverse-on-surface": "#262c28", "tertiary-fixed": "#ffe7c2",
-            "tertiary": "#ffd9a0", "secondary-fixed": "#dde4de",
-            "on-primary-fixed-variant": "#0a5233", "on-error-container": "#ffdad6",
-            "tertiary-container": "#f0b869", "surface-container-low": "#101412",
-            "background": "#0b0d0c", "surface-bright": "#2d3531",
-            "error-container": "#93000a", "surface-container-lowest": "#070908",
-            "secondary-container": "#39413c", "on-surface": "#e9eeea",
-            "on-secondary-fixed-variant": "#3d453f", "primary-fixed-dim": "#6ad7a3",
-            "tertiary-fixed-dim": "#f0b869", "on-primary-fixed": "#002113",
-            "outline": "#75817a", "on-secondary-fixed": "#171c18",
-            "on-secondary-container": "#b7c1ba", "on-tertiary-fixed-variant": "#6b4d14"
-          },
-          borderRadius: { DEFAULT: "0.5rem", lg: "0.625rem", xl: "0.875rem", full: "9999px" },
-          spacing: {
-            "stack-gap": "8px", "container-padding": "20px", unit: "12px",
-            gutter: "16px", "component-gap": "12px"
-          },
-          fontFamily: {
-            h2: ["Inter", "system-ui", "sans-serif"], body: ["Inter", "system-ui", "sans-serif"],
-            table: ["Inter", "system-ui", "sans-serif"], h1: ["Inter", "system-ui", "sans-serif"],
-            ribbon: ["Inter", "system-ui", "sans-serif"],
-            code: ["JetBrains Mono", "ui-monospace", "SFMono-Regular", "Menlo", "monospace"]
-          },
-          fontSize: {
-            h2: ["15px", { lineHeight: "22px", letterSpacing: "-0.005em", fontWeight: "650" }],
-            body: ["14px", { lineHeight: "21px", fontWeight: "400" }],
-            table: ["13px", { lineHeight: "19.5px", fontWeight: "400" }],
-            h1: ["22px", { lineHeight: "30px", letterSpacing: "-0.015em", fontWeight: "700" }],
-            ribbon: ["12.5px", { lineHeight: "18px", letterSpacing: "0", fontWeight: "600" }],
-            code: ["12.5px", { lineHeight: "19px", fontWeight: "400" }]
-          }
-        }
-      }
-    };
-  `;
+  // Styles are precompiled (tailwind.config.js → public/tailwind.css) and
+  // served from /static — no CDN JIT, no unstyled flash, works offline.
   return `<!doctype html>
 <html class="dark" lang="en">
 <head>
@@ -12872,12 +13143,11 @@ function layout(title: string, body: string, opts: { nav?: NavKey; topbarTab?: "
 <link rel="icon" type="image/png" sizes="16x16" href="/static/favicon-16.png">
 <link rel="apple-touch-icon" sizes="180x180" href="/static/apple-touch-icon.png">
 <link rel="manifest" href="/site.webmanifest">
-<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<link rel="stylesheet" href="/static/tailwind.css">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
 <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap" rel="stylesheet">
-<script id="tailwind-config">${tailwindConfig}</script>
 <script src="/static/ansi_up.min.js"></script>
 <script>
   (function () {
@@ -12904,6 +13174,22 @@ function layout(title: string, body: string, opts: { nav?: NavKey; topbarTab?: "
 </script>
 <style>
   html { font-size: 16px; }
+  :root {
+    /* Native controls (checkboxes, radios, scrollbars, date pickers) follow
+       the console theme instead of defaulting to platform blue. */
+    accent-color: #6ad7a3;
+    color-scheme: dark;
+  }
+  /* No cross-document view transitions: they freeze rendering during
+     navigation snapshots, which breaks Playwright-driven QA (including our
+     own selftest) waiting for elements to become stable. */
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
   body {
     font-family: "Inter", system-ui, sans-serif;
     -webkit-font-smoothing: antialiased;
@@ -13003,6 +13289,8 @@ function layout(title: string, body: string, opts: { nav?: NavKey; topbarTab?: "
     font-size: 12.5px;
     line-height: 17px;
     font-weight: 750;
+    /* Action labels never wrap — a two-line button reads as broken. */
+    white-space: nowrap;
     transition: background .15s ease, border-color .15s ease, color .15s ease, transform .15s ease;
   }
   .rds-action-primary {
@@ -13066,70 +13354,16 @@ function layout(title: string, body: string, opts: { nav?: NavKey; topbarTab?: "
     background: radial-gradient(ellipse, rgba(106,215,163,.3), rgba(106,215,163,0) 70%);
     filter: blur(5px);
   }
-  .rds-wire-globe-svg {
-    position: relative;
+  .rds-globe-canvas {
+    display: block;
     width: 100%;
     height: 100%;
-    overflow: visible;
-    animation: rds-wire-globe-float 6s ease-in-out infinite;
-  }
-  .rds-wire-globe-aura {
-    fill: none;
-    stroke: rgba(106,215,163,.28);
-    stroke-width: 1.1;
-  }
-  .rds-wire-globe-fill {
-    fill: url(#rdsWireGlobeShade);
-    stroke: rgba(139,238,187,.82);
-    stroke-width: 1.4;
-    filter: drop-shadow(0 0 12px rgba(106,215,163,.36));
-  }
-  .rds-wire-globe-lines {
-    transform-origin: 80px 80px;
-    animation: rds-wire-globe-grid 9s linear infinite;
-  }
-  .rds-wire-globe-lines ellipse,
-  .rds-wire-globe-lines path {
-    fill: none;
-    stroke: rgba(139,238,187,.5);
-    stroke-width: .9;
-    vector-effect: non-scaling-stroke;
-  }
-  .rds-wire-globe-lines path {
-    stroke: rgba(106,215,163,.38);
-  }
-  .rds-wire-globe-land {
-    transform-origin: 80px 80px;
-    animation: rds-wire-globe-land 11s linear infinite;
-  }
-  .rds-wire-globe-land path {
-    fill: rgba(106,215,163,.055);
-    stroke: rgba(154,255,202,.82);
-    stroke-width: 1.05;
-    stroke-linejoin: round;
-    vector-effect: non-scaling-stroke;
-  }
-  .rds-wire-globe-highlight {
-    fill: none;
-    stroke: rgba(227,255,239,.42);
-    stroke-width: 1.2;
-    stroke-linecap: round;
+    border-radius: 50%;
+    animation: rds-wire-globe-float 7s ease-in-out infinite;
   }
   @keyframes rds-wire-globe-float {
-    0%, 100% { transform: translate3d(0, 0, 0) rotateZ(-1deg); }
-    50% { transform: translate3d(0, -6px, 0) rotateZ(1.5deg); }
-  }
-  @keyframes rds-wire-globe-grid {
-    0% { transform: translateX(-4px) skewX(-2deg); }
-    50% { transform: translateX(4px) skewX(2deg); }
-    100% { transform: translateX(-4px) skewX(-2deg); }
-  }
-  @keyframes rds-wire-globe-land {
-    0% { transform: translateX(-38px) scaleX(.94); opacity: .45; }
-    18% { opacity: .9; }
-    50% { transform: translateX(0) scaleX(1); opacity: .88; }
-    82% { opacity: .62; }
-    100% { transform: translateX(38px) scaleX(.94); opacity: .45; }
+    0%, 100% { transform: translate3d(0, 0, 0); }
+    50% { transform: translate3d(0, -5px, 0); }
   }
   @media (min-width: 768px) {
     .rds-sidenav {
@@ -13152,9 +13386,7 @@ function layout(title: string, body: string, opts: { nav?: NavKey; topbarTab?: "
     }
   }
   @media (prefers-reduced-motion: reduce) {
-    .rds-wire-globe-svg,
-    .rds-wire-globe-lines,
-    .rds-wire-globe-land {
+    .rds-globe-canvas {
       animation: none !important;
     }
   }
@@ -14981,6 +15213,11 @@ function layout(title: string, body: string, opts: { nav?: NavKey; topbarTab?: "
       width: 100%;
       margin-top: 2px;
     }
+    /* Idle builds show exactly three stat cards (Elapsed / run / Cost) —
+       lay them out in one even row instead of 2 + 1. */
+    .rds-mobile-build-summary.rds-mobile-summary-3 {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
     .rds-mobile-build-summary > div {
       border: 1px solid #242b28;
       border-radius: 4px;
@@ -15457,10 +15694,12 @@ function layout(title: string, body: string, opts: { nav?: NavKey; topbarTab?: "
     }
     .rds-skill-picker label span:first-of-type {
       min-width: 0;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
+      flex: 1;
+      overflow-wrap: break-word;
     }
+    /* Readiness chip is catalog metadata — drop it on narrow rows so the
+       skill name stays readable. It remains in Settings → Skills. */
+    .rds-skill-picker label span.font-code { display: none; }
     .rds-mobile-actions { width: 100%; }
     .rds-mobile-actions > * { flex: 1 1 auto; justify-content: center; }
     .rds-mobile-hide { display: none !important; }
@@ -16086,6 +16325,12 @@ ${sidenav(navKey)}
   });
   document.addEventListener('keydown', function (ev) {
     if (ev.key === 'Escape') rdsToggleNav(false);
+    // Keyboard access for click-to-open table rows.
+    if ((ev.key === 'Enter' || ev.key === ' ') && ev.target && ev.target.classList &&
+        ev.target.classList.contains('row-clickable')) {
+      var href = ev.target.getAttribute('data-href');
+      if (href) { ev.preventDefault(); location.href = href; }
+    }
   });
   window.addEventListener('resize', function () {
     if (window.innerWidth >= 768) rdsToggleNav(false);
