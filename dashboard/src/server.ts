@@ -7975,37 +7975,16 @@ app.get("/agents", (c) => {
         <a class="rds-action-secondary" href="/docs">${icon("menu_book", 14)}<span>Docs</span></a>
       </div>
 
-      <section class="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_320px] gap-component-gap">
-        <div class="rds-agent-panel rds-shell-panel rounded-DEFAULT p-container-padding flex flex-col gap-gutter">
-          <div>
-            <h2 class="font-h2 text-h2 text-on-surface">Worker sessions are chat-driven</h2>
-            <p class="font-table text-table text-on-surface-variant mt-1">Start Claude Code or Codex from the relevant build chat so the request, confirmation, build id, and artifacts stay in one thread. This page is for monitoring, review, handoff, merge, stop, and discard after a session exists.</p>
-          </div>
-          <div class="grid grid-cols-1 md:grid-cols-3 gap-2">
-            <div class="rds-agent-step bg-surface border border-outline-variant rounded-DEFAULT p-3">
-              <div class="font-ribbon text-ribbon text-primary-container flex items-center gap-1">${icon("chat", 14)}<span>1. Ask in chat</span></div>
-              <p class="font-table text-table text-on-surface-variant mt-1">Example: "Start a Codex worker to review the current diff."</p>
-            </div>
-            <div class="rds-agent-step bg-surface border border-outline-variant rounded-DEFAULT p-3">
-              <div class="font-ribbon text-ribbon text-primary-container flex items-center gap-1">${icon("fact_check", 14)}<span>2. Confirm action</span></div>
-              <p class="font-table text-table text-on-surface-variant mt-1">RDS proposes a scoped action card before creating a worktree or tmux session.</p>
-            </div>
-            <div class="rds-agent-step bg-surface border border-outline-variant rounded-DEFAULT p-3">
-              <div class="font-ribbon text-ribbon text-primary-container flex items-center gap-1">${icon("monitoring", 14)}<span>3. Manage here</span></div>
-              <p class="font-table text-table text-on-surface-variant mt-1">Use the session table for status, diff, review, handoff, stop, merge, or discard.</p>
-            </div>
-          </div>
-        </div>
-
-        <aside class="rds-agent-panel rds-shell-panel rounded-DEFAULT p-container-padding flex flex-col gap-stack-gap">
-          <h2 class="font-h2 text-h2 text-on-surface">Runtime health</h2>
-          ${health.map((row) => `<div class="bg-surface border border-outline-variant rounded-DEFAULT p-2">
-            <div class="font-ribbon text-ribbon ${row.ok ? "text-primary-container" : "text-error"}">${icon(row.ok ? "check_circle" : "error", 14)}<span>${escapeHtml(row.name)}</span></div>
-            <div class="font-code text-[11px] text-on-surface break-all mt-1">${escapeHtml(row.value)}</div>
-            <div class="font-table text-table text-on-surface-variant">${escapeHtml(row.note)}</div>
-          </div>`).join("")}
-        </aside>
-      </section>
+      <div class="flex items-center gap-2 flex-wrap" aria-label="Runtime health">
+        ${health.map((row) => {
+          const okChip = row.ok;
+          const value = row.value === "missing" ? "not installed" : row.value;
+          const tone = okChip
+            ? "border-primary-container/40 bg-primary-container/10 text-primary-container"
+            : "border-outline-variant bg-surface-container-low text-on-surface-variant";
+          return `<span class="inline-flex items-center gap-1.5 h-8 px-2.5 rounded-full border font-ribbon text-ribbon whitespace-nowrap ${tone}" title="${escapeHtml(row.note)}">${icon(okChip ? "check_circle" : "do_not_disturb_on", 14)}<span>${escapeHtml(row.name)}</span><span class="font-code text-[10.5px] ${okChip ? "text-primary-container/80" : "text-outline"}">${escapeHtml(value)}</span></span>`;
+        }).join("")}
+      </div>
 
       <section class="rds-agent-sessions rds-shell-panel rounded-DEFAULT overflow-hidden">
         <header class="px-container-padding py-gutter border-b border-outline-variant flex items-center justify-between gap-3">
@@ -8017,10 +7996,16 @@ app.get("/agents", (c) => {
             <thead class="bg-surface text-on-surface-variant font-ribbon text-ribbon">
               <tr><th class="px-3 py-2">session</th><th class="px-3 py-2">task</th><th class="px-3 py-2">status</th><th class="px-3 py-2">branch/worktree</th><th class="px-3 py-2">attach/changes</th><th class="px-3 py-2">actions</th></tr>
             </thead>
-            <tbody>${sessionRows || `<tr><td colspan="6" class="px-3 py-6 text-on-surface-variant font-body text-body italic">No agent sessions yet. When sessions exist, actions include Status, Diff, Review, Handoff, Stop, Merge, and Discard.</td></tr>`}</tbody>
+            <tbody>${sessionRows || `<tr><td colspan="6" class="px-3 py-6 text-on-surface-variant font-body text-body italic">No worker sessions yet — start one from a build\'s chat ("Start a Codex worker to review the current diff").</td></tr>`}</tbody>
           </table>
         </div>
       </section>
+
+      <p class="font-table text-table text-on-surface-variant px-1">
+        Workers are chat-driven: ask in the build\'s chat, confirm the scoped action card RDS proposes,
+        then monitor, review, handoff, merge, stop, or discard the session here. Nothing merges or
+        pushes without you. <a href="/docs" class="text-primary-container hover:underline">Details in docs</a>.
+      </p>
     </div>
     <script>
       ${clientScript()}
@@ -8154,42 +8139,12 @@ app.get("/settings", (c) => {
         <a class="rds-action-secondary" href="/">${icon("arrow_back", 14)}<span>Hub</span></a>
       </div>
 
-      <section class="grid grid-cols-1 md:grid-cols-3 gap-2">
-        <a href="/new" class="bg-primary-container text-on-primary-container rounded-DEFAULT p-3 hover:bg-surface-tint transition-colors">
-          <div class="font-ribbon text-ribbon uppercase tracking-wide">Start</div>
-          <div class="font-h2 text-h2 mt-1">Analyze a PRD</div>
-          <p class="font-table text-table mt-1">Paste source, get a stack + skill plan, then approve or override.</p>
-        </a>
-        <a href="/settings/stacks" class="bg-surface-container border border-outline-variant rounded-DEFAULT p-3 hover:border-primary-container transition-colors">
-          <div class="font-ribbon text-ribbon text-primary-container uppercase tracking-wide">Reference</div>
-          <div class="font-h2 text-h2 text-on-surface mt-1">Compare stacks</div>
-          <p class="font-table text-table text-on-surface-variant mt-1">Runtime choices, app-type lenses, source links, and when-to-use guidance.</p>
-        </a>
-        <a href="/settings/skills" class="bg-surface-container border border-outline-variant rounded-DEFAULT p-3 hover:border-primary-container transition-colors">
-          <div class="font-ribbon text-ribbon text-primary-container uppercase tracking-wide">Catalog</div>
-          <div class="font-h2 text-h2 text-on-surface mt-1">Browse skills</div>
-          <p class="font-table text-table text-on-surface-variant mt-1">Search by category, status, stack, rationale, and external source.</p>
-        </a>
-      </section>
-
-      <section class="rds-settings-stats grid grid-cols-2 lg:grid-cols-4 gap-2">
-        <div class="bg-surface-container border border-outline-variant rounded-DEFAULT p-3">
-          <div class="font-code text-[22px] leading-none text-on-surface">${readyStacks.length}</div>
-          <div class="font-ribbon text-ribbon text-on-surface-variant mt-1">ready stacks</div>
-        </div>
-        <div class="bg-surface-container border border-outline-variant rounded-DEFAULT p-3">
-          <div class="font-code text-[22px] leading-none text-on-surface">${readySkills.length}/${skills.length}</div>
-          <div class="font-ribbon text-ribbon text-on-surface-variant mt-1">ready skills</div>
-        </div>
-        <div class="bg-surface-container border border-outline-variant rounded-DEFAULT p-3">
-          <div class="font-code text-[22px] leading-none ${tokenConfigured ? "text-primary-container" : "text-error"}">${tokenConfigured ? "set" : "missing"}</div>
-          <div class="font-ribbon text-ribbon text-on-surface-variant mt-1">write token</div>
-        </div>
-        <div class="bg-surface-container border border-outline-variant rounded-DEFAULT p-3">
-          <div class="font-code text-[22px] leading-none text-on-surface">${settings.inferenceProvider}</div>
-          <div class="font-ribbon text-ribbon text-on-surface-variant mt-1">default builder</div>
-        </div>
-      </section>
+      <div class="flex items-center gap-2 flex-wrap">
+        <span class="inline-flex items-center gap-1.5 h-8 px-2.5 rounded-full border border-outline-variant bg-surface-container-low font-ribbon text-ribbon text-on-surface-variant whitespace-nowrap"><span class="font-code text-[11px] text-on-surface">${readyStacks.length}</span><span>ready stacks</span></span>
+        <span class="inline-flex items-center gap-1.5 h-8 px-2.5 rounded-full border border-outline-variant bg-surface-container-low font-ribbon text-ribbon text-on-surface-variant whitespace-nowrap"><span class="font-code text-[11px] text-on-surface">${readySkills.length}/${skills.length}</span><span>ready skills</span></span>
+        <span class="inline-flex items-center gap-1.5 h-8 px-2.5 rounded-full border font-ribbon text-ribbon whitespace-nowrap ${tokenConfigured ? "border-primary-container/40 bg-primary-container/10 text-primary-container" : "border-tertiary-container/40 bg-tertiary-container/10 text-tertiary-container"}" title="${tokenConfigured ? "X-RDS-Token write gate is active" : "Set RDS_DASHBOARD_TOKEN to enable the write gate"}">${icon(tokenConfigured ? "check_circle" : "schedule", 14)}<span>write token ${tokenConfigured ? "set" : "not set"}</span></span>
+        <span class="inline-flex items-center gap-1.5 h-8 px-2.5 rounded-full border border-outline-variant bg-surface-container-low font-ribbon text-ribbon text-on-surface-variant whitespace-nowrap"><span>default builder</span><span class="font-code text-[11px] text-on-surface">${escapeHtml(settings.inferenceProvider)}</span></span>
+      </div>
 
       ${settingsTabNav("start")}
 
@@ -8219,7 +8174,7 @@ app.get("/settings", (c) => {
             </label>
             <div class="grid grid-cols-2 gap-2">
               <div class="bg-surface border border-outline-variant rounded-DEFAULT p-2 font-ribbon text-ribbon ${claudeOk ? "text-primary-container" : "text-error"}">${icon(claudeOk ? "check_circle" : "error", 14)}<span>Claude CLI</span></div>
-              <div class="bg-surface border border-outline-variant rounded-DEFAULT p-2 font-ribbon text-ribbon ${codexOk ? "text-primary-container" : "text-error"}">${icon(codexOk ? "check_circle" : "error", 14)}<span>Codex CLI</span></div>
+              <div class="bg-surface border border-outline-variant rounded-DEFAULT p-2 font-ribbon text-ribbon ${codexOk ? "text-primary-container" : "text-on-surface-variant"}">${icon(codexOk ? "check_circle" : "do_not_disturb_on", 14)}<span>Codex CLI${codexOk ? "" : " · not installed"}</span></div>
             </div>
           </div>
 
@@ -8228,9 +8183,9 @@ app.get("/settings", (c) => {
             <div class="divide-y divide-outline-variant/60">
               ${agentHealth.map((row) => `
                 <div class="px-3 py-2 grid grid-cols-[140px_1fr] gap-2 items-start">
-                  <div class="font-ribbon text-ribbon ${row.ok ? "text-primary-container" : "text-error"}">${icon(row.ok ? "check_circle" : "error", 14)}<span>${escapeHtml(row.name)}</span></div>
+                  <div class="font-ribbon text-ribbon ${row.ok ? "text-primary-container" : "text-on-surface-variant"}">${icon(row.ok ? "check_circle" : "do_not_disturb_on", 14)}<span>${escapeHtml(row.name)}</span></div>
                   <div class="min-w-0">
-                    <div class="font-code text-[11px] text-on-surface break-all">${escapeHtml(row.value)}</div>
+                    <div class="font-code text-[11px] text-on-surface break-all">${escapeHtml(row.value === "missing" ? "not installed" : row.value)}</div>
                     <div class="font-table text-table text-on-surface-variant">${escapeHtml(row.note)}</div>
                   </div>
                 </div>`).join("")}
@@ -8737,6 +8692,39 @@ app.get("/audit", (c) => {
     return c.json({ entries, total: entries.length });
   }
 
+  // Humanized action names for common write routes; the raw route stays in a tooltip.
+  const auditAction = (route?: string | null): string => {
+    const r = String(route || "");
+    const map: Array<[RegExp, string]> = [
+      [/^POST \/new\/analyze/, "Analyzed a PRD"],
+      [/^POST \/new/, "Started a build"],
+      [/^POST \/b\/:id\/cmd/, "Build command"],
+      [/^POST \/b\/:id\/fix/, "Spawned fixer"],
+      [/^POST \/b\/:id\/iterate/, "Ran iteration"],
+      [/^POST \/b\/:id\/goal/, "Ran goal loop"],
+      [/^POST \/b\/:id\/approve/, "Approved build"],
+      [/^POST \/b\/:id\/reject/, "Rejected build"],
+      [/^POST \/b\/:id\/deploy/, "Deployed preview"],
+      [/^POST \/b\/:id\/playwright\/run/, "Ran QA crawl"],
+      [/^POST \/b\/:id\/refresh-cost/, "Refreshed cost"],
+      [/^POST \/b\/:id\/upload-prd/, "Uploaded PRD"],
+      [/^POST \/b\/:id\/service\/deregister/, "Deleted Zo service"],
+      [/^POST \/builds\/refresh/, "Refreshed build index"],
+      [/^POST \/watchdog/, "Toggled watchdog"],
+      [/^POST \/settings/, "Saved settings"],
+      [/^POST \/chat\/sessions\/:id\/messages/, "Sent chat message"],
+      [/^POST \/chat\/sessions\/:id\/actions/, "Ran chat action"],
+      [/^POST \/chat\/sessions\/by-build/, "Opened build chat"],
+      [/^POST \/chat\/sessions/, "Created chat thread"],
+      [/^DELETE \/chat\/sessions/, "Deleted chat thread"],
+      [/^POST \/agent-sessions\/:sid\/action/, "Agent session action"],
+      [/^POST .*agent-sessions/, "Started agent session"],
+      [/^POST \/alerts\/dismiss/, "Dismissed alert"],
+      [/^POST \/reviews\/dismiss/, "Dismissed review"],
+    ];
+    for (const [re, label] of map) if (re.test(r)) return label;
+    return r || "-";
+  };
   const rows = entries.map((e) => {
     const ts = e.ts ? new Date(e.ts).toLocaleString() : "-";
     const outcome = e.outcome === "denied"
@@ -8747,7 +8735,7 @@ app.get("/audit", (c) => {
     const status = e.status ? ` <span class="font-code text-[11px] text-outline">${escapeHtml(String(e.status))}</span>` : "";
     return `<tr class="border-b border-outline-variant/40 hover:bg-surface-container-high/50 transition-colors">
       <td class="px-3 py-2 font-code text-[11px] text-on-surface-variant whitespace-nowrap">${escapeHtml(ts)}</td>
-      <td class="px-3 py-2"><code class="font-code text-[12px] text-on-surface">${escapeHtml(String(e.route ?? "-"))}</code></td>
+      <td class="px-3 py-2"><span class="font-body text-[13px] text-on-surface" title="${escapeHtml(String(e.route ?? "-"))}">${escapeHtml(auditAction(e.route))}</span></td>
       <td class="px-3 py-2">${e.build_id ? `<a href="/b/${escapeHtml(e.build_id)}" class="text-primary-container hover:underline font-code text-[12px]">${escapeHtml(e.build_id)}</a>` : `<span class="text-outline">-</span>`}</td>
       <td class="px-3 py-2">${outcome}${status}</td>
       <td class="px-3 py-2 font-code text-[11px] text-on-surface-variant">${escapeHtml(String(e.ip ?? "-"))}</td>
@@ -8767,7 +8755,7 @@ app.get("/audit", (c) => {
         <div class="font-code text-[11px] text-on-surface-variant">${escapeHtml(ts)}</div>
         <div class="shrink-0">${outcome}${e.status ? ` <span class="font-code text-[11px] text-outline">${escapeHtml(String(e.status))}</span>` : ""}</div>
       </div>
-      <div class="mt-2 font-code text-[12px] text-on-surface break-all">${escapeHtml(String(e.route ?? "-"))}</div>
+      <div class="mt-2 font-body text-[13px] text-on-surface" title="${escapeHtml(String(e.route ?? "-"))}">${escapeHtml(auditAction(e.route))}</div>
       <div class="mt-2 grid grid-cols-2 gap-2">
         <div><div class="text-outline uppercase text-[10px]">Build</div><div>${e.build_id ? `<a href="/b/${escapeHtml(e.build_id)}" class="text-primary-container hover:underline font-code text-[11px] break-all">${escapeHtml(e.build_id)}</a>` : `<span class="text-outline">-</span>`}</div></div>
         <div><div class="text-outline uppercase text-[10px]">IP</div><div class="font-code text-[11px] text-on-surface-variant break-all">${escapeHtml(String(e.ip ?? "-"))}</div></div>
@@ -8799,7 +8787,7 @@ app.get("/audit", (c) => {
           <thead class="bg-surface-container-high border-b border-outline-variant">
             <tr class="text-on-surface-variant font-ribbon text-ribbon uppercase tracking-wider">
               <th class="px-3 py-2 text-left">${sortableHeader(c.req.url, "when", "when", sort, dir)}</th>
-              <th class="px-3 py-2 text-left">${sortableHeader(c.req.url, "route", "route", sort, dir)}</th>
+              <th class="px-3 py-2 text-left">${sortableHeader(c.req.url, "route", "action", sort, dir)}</th>
               <th class="px-3 py-2 text-left">${sortableHeader(c.req.url, "build", "build", sort, dir)}</th>
               <th class="px-3 py-2 text-left">${sortableHeader(c.req.url, "outcome", "outcome", sort, dir)}</th>
               <th class="px-3 py-2 text-left">${sortableHeader(c.req.url, "ip", "ip", sort, dir)}</th>
@@ -13883,7 +13871,8 @@ function layout(title: string, body: string, opts: { nav?: NavKey; topbarTab?: "
     gap: 12px;
     min-width: 0;
     border-bottom: 1px solid rgba(36,43,40,.62);
-    background: rgba(16,20,18,.42);
+    /* rows read as list lines, not nested boxes (DESIGN: light, not boxes) */
+    background: transparent;
     padding: 10px 12px;
   }
   .rds-doc-mini-row:last-child,

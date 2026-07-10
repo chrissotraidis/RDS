@@ -430,8 +430,10 @@ async function main() {
     const res = await page!.goto(`${BASE}/agents`, { waitUntil: "domcontentloaded" });
     if (!res || res.status() >= 400) throw new Error(`/agents status=${res?.status()}`);
     await page!.getByRole("heading", { name: "Agent Sessions" }).first().waitFor();
-    await page!.getByRole("heading", { name: "Worker sessions are chat-driven" }).waitFor();
-    await page!.getByText("Runtime health").waitFor();
+    // Guidance strip + runtime-health chips (compact anatomy; was boxed cards).
+    await page!.getByText("Workers are chat-driven").waitFor();
+    await page!.locator('[aria-label="Runtime health"]').waitFor();
+    await page!.getByText("Claude Code").first().waitFor();
     await page!.getByPlaceholder("/home/workspace/Projects/foo").waitFor({ timeout: 1000, state: "detached" });
     await page!.getByRole("button", { name: "Launch worker" }).waitFor({ timeout: 1000, state: "detached" });
     await page!.getByRole("button", { name: "New Claude" }).waitFor({ timeout: 1000, state: "detached" });
