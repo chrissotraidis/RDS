@@ -4636,7 +4636,7 @@ app.get("/builds", async (c) => {
     return `<tr class="row-clickable hover:bg-[#1b211e] transition-colors group cursor-pointer ${rowBg}" tabindex="0" aria-label="Open build ${escapeHtml(b.displayName || b.slug || b.id)}" data-href="/b/${escapeHtml(b.id)}" data-search="${escapeHtml((b.id + " " + (b.slug ?? "") + " " + (b.displayName ?? "") + " " + (b.stage ?? "")).toLowerCase())}">
       <td class="py-2.5 px-4">${statusDot(b)}</td>
       <td class="py-2.5 px-4 text-on-surface">
-        <div class="flex flex-col gap-0.5 min-w-[260px]">
+        <div class="flex flex-col gap-0.5 min-w-[200px]">
           <span class="font-body text-body truncate" title="${escapeHtml(b.id)}">${escapeHtml(b.displayName || b.slug || compactBuildId(b.id))}</span>
           <span class="font-code text-[10px] leading-4 text-on-surface-variant truncate">${escapeHtml(b.id)}</span>
         </div>
@@ -4650,10 +4650,10 @@ app.get("/builds", async (c) => {
       </td>
       <td class="py-2.5 px-4 text-on-surface whitespace-nowrap">${escapeHtml(b.stage ?? "—")}</td>
       <td class="py-2.5 px-4 whitespace-nowrap">${statusBadge(b)}</td>
-      <td class="py-2.5 px-4 whitespace-nowrap">${reviewBadge(b) || `<span class="text-on-surface-variant">—</span>`}</td>
-      <td class="py-2.5 px-4 text-right font-code text-code text-on-surface whitespace-nowrap">${escapeHtml(cost)}</td>
-      <td class="py-2.5 px-4 text-on-surface-variant text-[11px] whitespace-nowrap">${b.lastActivityMs ? escapeHtml(relativeTime(b.lastActivityMs)) : "—"}</td>
-      <td class="py-2.5 px-4"><div class="flex flex-wrap gap-1">${tags}</div></td>
+      <td class="py-2.5 px-4 whitespace-nowrap hidden xl:table-cell">${reviewBadge(b) || `<span class="text-on-surface-variant">—</span>`}</td>
+      <td class="py-2.5 px-4 text-right font-code text-code text-on-surface whitespace-nowrap hidden lg:table-cell">${escapeHtml(cost)}</td>
+      <td class="py-2.5 px-4 text-on-surface-variant text-[11px] whitespace-nowrap hidden lg:table-cell">${b.lastActivityMs ? escapeHtml(relativeTime(b.lastActivityMs)) : "—"}</td>
+      <td class="py-2.5 px-4 hidden 2xl:table-cell"><div class="flex flex-wrap gap-1">${tags}</div></td>
       <td class="py-2.5 px-4 text-right opacity-0 group-hover:opacity-100 transition-opacity">
         ${b.running ? `<button type="button" data-stop="1" onclick="pauseBuild('${escapeHtml(b.id)}')" class="mr-2 text-tertiary-container hover:text-[#ffd8c2]" title="Pause build" aria-label="Pause build">${icon("pause", 16)}</button>` : ""}
         ${b.paused ? `<button type="button" data-stop="1" onclick="resumeBuild('${escapeHtml(b.id)}')" class="mr-2 text-primary-container hover:text-[#8beebb]" title="Resume build" aria-label="Resume build">${icon("play_arrow", 16)}</button>` : ""}
@@ -4717,159 +4717,98 @@ app.get("/builds", async (c) => {
     </div>`;
   }).join("");
 
-  const isOn = (key: string, list: string[]) => list.includes(key) ? "checked" : "";
   const activeFilterCount = wantStatus.length + wantStack.length + (wantMode ? 1 : 0) + (wantHosting ? 1 : 0) + (q ? 1 : 0);
+  // Toggle URL for a status chip: preserves every other query param.
+  const toggleStatusUrl = (k: string) => {
+    const url = new URL(c.req.url);
+    const cur = url.searchParams.getAll("status");
+    url.searchParams.delete("status");
+    for (const v of cur.filter((sv) => sv !== k)) url.searchParams.append("status", v);
+    if (!cur.includes(k)) url.searchParams.append("status", k);
+    const qs = url.searchParams.toString();
+    return url.pathname + (qs ? "?" + qs : "");
+  };
+  const chip = (k: string, label: string, n: number) => {
+    const active = wantStatus.includes(k);
+    const tone = active
+      ? "bg-primary-container/15 border-primary-container/50 text-primary-container"
+      : "bg-surface-container-low border-outline-variant text-on-surface-variant hover:text-on-surface hover:border-outline";
+    return `<a href="${escapeHtml(toggleStatusUrl(k))}" role="checkbox" aria-checked="${active ? "true" : "false"}" class="inline-flex items-center gap-1.5 px-2.5 h-8 rounded-full border font-ribbon text-ribbon whitespace-nowrap transition-colors ${tone}">${escapeHtml(label)}<span class="${active ? "text-primary-container/80" : "text-outline"} font-code text-[10px]">${n}</span></a>`;
+  };
+  const selectCls = "h-8 bg-surface-container-low border border-outline-variant rounded px-2 text-[12.5px] text-on-surface focus:border-primary-container focus:ring-0 focus:outline-none";
+  const emptyLine = builds.length
+    ? `No builds match these filters — <a href="/builds" class="text-primary-container hover:underline not-italic">clear them</a>.`
+    : `No builds yet — <a href="/new" class="text-primary-container hover:underline not-italic">start your first build</a>.`;
 
   return c.html(layout("Builds", `
-    <div class="flex flex-col md:flex-row md:h-full md:overflow-hidden md:-m-container-padding" style="min-height:calc(100dvh - 80px)">
-      <details class="md:hidden bg-surface border border-outline-variant rounded-DEFAULT mb-gutter">
-        <summary class="cursor-pointer p-3 flex items-center justify-between gap-3 list-none">
-          <span class="font-h2 text-h2 text-on-surface flex items-center gap-2">${icon("filter_alt", 16)}<span>Filters</span></span>
-          <span class="font-ribbon text-ribbon text-on-surface-variant">${activeFilterCount ? `${activeFilterCount} active` : `${filtered.length} builds`}</span>
-        </summary>
-        <form method="get" action="/builds" class="px-3 pb-3 grid grid-cols-1 gap-3">
-          <label class="block">
-            <span class="block font-ribbon text-ribbon text-on-surface-variant mb-unit">ID or slug</span>
-            <input name="q" value="${escapeHtml(q)}" oninput="rdsSearch(event)" class="w-full bg-[#070908] border border-outline-variant rounded h-8 px-3 text-[12px] text-on-surface focus:border-primary-container focus:ring-0 focus:outline-none" placeholder="Search builds" type="text">
-          </label>
-          <div class="grid grid-cols-2 gap-2">
-            ${[["running", "Running", counts.running], ["failed", "Failed", counts.failed], ["stuck", "Stuck", counts.stuck], ["paused", "Paused", counts.paused], ["done", "Done", counts.done]].map(([k, label, n]) => `
-              <label class="flex items-center gap-2 cursor-pointer bg-[#101412] border border-outline-variant rounded px-2 py-1.5">
-                <input type="checkbox" name="status" value="${k}" ${isOn(String(k), wantStatus)}
-                  class="form-checkbox h-3.5 w-3.5 rounded-sm border-outline-variant bg-[#070908] text-primary-container focus:ring-0 focus:ring-offset-0">
-                <span class="font-table text-table text-on-surface">${label}</span>
-                <span class="ml-auto text-[10px] text-on-surface-variant">${n}</span>
-              </label>`).join("")}
-          </div>
-          <div class="grid grid-cols-2 gap-2">
-            ${stacks.map((s) => `
-              <label class="flex items-center gap-2 cursor-pointer bg-[#101412] border border-outline-variant rounded px-2 py-1.5">
-                <input type="checkbox" name="stack" value="${escapeHtml(s.id)}" ${isOn(s.id, wantStack)}
-                  class="form-checkbox h-3.5 w-3.5 rounded-sm border-outline-variant bg-[#070908] text-primary-container focus:ring-0 focus:ring-offset-0">
-                <span class="font-table text-table text-on-surface truncate">${escapeHtml(s.name)}</span>
-              </label>`).join("")}
-          </div>
-          <div class="flex gap-2">
-            ${["", "green", "brown"].map((m) => {
-              const label = m === "" ? "All" : m === "green" ? "Green" : "Brown";
-              const active = wantMode === m;
-              return `<button type="submit" name="mode" value="${m}" class="flex-1 ${active ? "bg-surface-bright text-on-surface border-primary-container" : "bg-surface border-outline-variant text-on-surface-variant"} border font-table text-table py-1.5 rounded">${label}</button>`;
-            }).join("")}
-          </div>
-          <div class="grid grid-cols-3 gap-2">
-            ${[["hosted", "Hosted", counts.hosted], ["unhosted", "Not hosted", counts.unhosted], ["local", "Local", counts.local]].map(([k, label, n]) => {
-              const active = wantHosting === k;
-              return `<button type="submit" name="hosting" value="${k}" class="${active ? "bg-surface-bright text-on-surface border-primary-container" : "bg-surface border-outline-variant text-on-surface-variant"} border font-table text-table py-1.5 rounded">${label} <span class="text-[10px]">${n}</span></button>`;
-            }).join("")}
-          </div>
-          <div class="grid grid-cols-2 gap-2">
-            <button type="submit" class="bg-primary-container text-[#070908] font-ribbon text-ribbon py-2 rounded flex items-center justify-center gap-1">${icon("filter_alt", 14)}<span>Apply</span></button>
-            <a href="/builds" class="border border-outline-variant bg-surface text-on-surface font-ribbon text-ribbon py-2 rounded flex items-center justify-center">Clear</a>
-          </div>
-        </form>
-      </details>
-
-      <aside class="rds-build-filter-panel hidden md:block w-full md:w-[280px] bg-surface flex-shrink-0 border border-outline-variant md:border-y-0 md:border-l-0 md:border-r overflow-y-auto custom-scrollbar rounded-DEFAULT md:rounded-none mb-gutter md:mb-0">
-        <form method="get" action="/builds" class="p-4 grid grid-cols-1 sm:grid-cols-2 md:block gap-4 md:space-y-4">
-          <div class="hidden md:block">
-            <div class="rds-page-eyebrow">Build inventory</div>
-            <h1 class="font-h1 text-[24px] leading-8 text-on-surface mt-1">Filters</h1>
-            <p class="font-table text-table text-on-surface-variant mt-1">Narrow state, stack, mode, hosting, or ID.</p>
-          </div>
-          <div>
-            <label class="block font-ribbon text-ribbon text-on-surface-variant mb-unit">Filter by ID or slug</label>
-            <div class="relative">
-              ${icon("search", 16, "absolute left-2 top-1.5 text-outline")}
-              <input name="q" value="${escapeHtml(q)}" oninput="rdsSearch(event)" class="w-full bg-[#070908] border border-outline-variant rounded h-8 pl-8 pr-3 text-[12px] text-on-surface focus:border-primary-container focus:ring-0 focus:outline-none" placeholder="e.g. acme-foo or 1709…" type="text">
-            </div>
-          </div>
-
-          <div>
-            <h3 class="font-ribbon text-ribbon text-on-surface-variant mb-unit uppercase tracking-wider">Status</h3>
-            <div class="rds-filter-option-list">
-              ${[["running", "Running", counts.running], ["failed", "Failed", counts.failed], ["stuck", "Stuck", counts.stuck], ["paused", "Paused", counts.paused], ["done", "Completed", counts.done]].map(([k, label, n]) => `
-                <label class="rds-filter-option group">
-                  <input type="checkbox" name="status" value="${k}" ${isOn(String(k), wantStatus)}
-                    class="form-checkbox h-3.5 w-3.5 rounded-sm border-outline-variant bg-[#070908] text-primary-container focus:ring-0 focus:ring-offset-0">
-                  <span class="font-table text-table text-on-surface group-hover:text-primary-fixed transition-colors">${label}</span>
-                  <span class="ml-auto text-[10px] text-on-surface-variant bg-surface-container px-1.5 rounded">${n}</span>
-                </label>`).join("")}
-            </div>
-          </div>
-
-          <div>
-            <h3 class="font-ribbon text-ribbon text-on-surface-variant mb-unit uppercase tracking-wider">Stack</h3>
-            <div class="rds-filter-option-list rds-filter-option-list-scroll">
-              ${stacks.map((s) => `
-                <label class="rds-filter-option group">
-                  <input type="checkbox" name="stack" value="${escapeHtml(s.id)}" ${isOn(s.id, wantStack)}
-                    class="form-checkbox h-3.5 w-3.5 rounded-sm border-outline-variant bg-[#070908] text-primary-container focus:ring-0 focus:ring-offset-0">
-                  <span class="font-table text-table text-on-surface group-hover:text-primary-fixed transition-colors">${escapeHtml(s.name)}</span>
-                  ${s.status !== "ready" ? `<span class="ml-auto font-ribbon text-[9px] text-on-surface-variant uppercase">${escapeHtml(s.status)}</span>` : ""}
-                </label>`).join("")}
-            </div>
-          </div>
-
-          <div>
-            <h3 class="font-ribbon text-ribbon text-on-surface-variant mb-unit uppercase tracking-wider">Mode</h3>
-            <div class="rds-segmented-filter flex gap-1">
-              ${["", "green", "brown"].map((m) => {
-                const label = m === "" ? "All" : m === "green" ? "Green" : "Brown";
-                const active = wantMode === m;
-                return `<button type="submit" name="mode" value="${m}" class="flex-1 ${active ? "is-active" : ""}">${label}</button>`;
-              }).join("")}
-            </div>
-          </div>
-
-          <div>
-            <h3 class="font-ribbon text-ribbon text-on-surface-variant mb-unit uppercase tracking-wider">Zo hosting</h3>
-            <div class="rds-filter-option-list">
-              ${[["hosted", "Hosted on Zo", counts.hosted], ["unhosted", "Not hosted", counts.unhosted], ["local", "Local preview running", counts.local]].map(([k, label, n]) => {
-                const active = wantHosting === k;
-                return `<button type="submit" name="hosting" value="${k}" class="w-full flex items-center gap-2 text-left ${active ? "bg-surface-bright text-on-surface border-primary-container" : "bg-surface border-outline-variant text-on-surface-variant"} border font-table text-table py-1.5 px-2 rounded hover:bg-surface-variant transition-colors"><span>${label}</span><span class="ml-auto text-[10px]">${n}</span></button>`;
-              }).join("")}
-              ${wantHosting ? `<a href="${escapeHtml(withoutQueryParam(c.req.url, "hosting"))}" class="block text-on-surface-variant hover:text-on-surface font-ribbon text-ribbon">Clear hosting filter</a>` : ""}
-            </div>
-          </div>
-
-          <button type="submit" class="rds-action-primary w-full">
-            ${icon("filter_alt", 16)}<span>Apply filters</span>
-          </button>
-          <a href="/builds" class="block text-center font-ribbon text-ribbon text-on-surface-variant hover:text-on-surface">Clear all</a>
-        </form>
-      </aside>
-
-      <section class="flex-1 min-w-0 bg-surface-dim overflow-auto custom-scrollbar relative border border-outline-variant md:border-0 rounded-DEFAULT md:rounded-none">
-        <div class="rds-builds-toolbar sticky top-0 bg-[#101412] border-b border-[#242b28] flex items-center justify-between px-4 py-2 z-30">
-          <div>
-            <h1 class="font-h1 text-h1 text-on-surface">Builds <span class="rds-build-count font-ribbon text-ribbon text-on-surface-variant ml-2">${filtered.length} of ${builds.length}</span></h1>
-            <div class="hidden md:block font-table text-table text-on-surface-variant">Evidence-backed app runs, previews, review state, and operator actions.</div>
-          </div>
-          <div class="flex items-center gap-2">
-            <button type="button" onclick="refreshBuilds()" class="rds-action-secondary !min-h-[34px] !py-1 !px-3">${icon("refresh", 14)}<span class="hidden sm:inline">Refresh</span></button>
-            <a href="/new" class="rds-new-build-button rds-action-primary !min-h-[34px] !py-1 !px-3">${icon("add", 16)}<span>New Build</span></a>
-          </div>
+    <div class="max-w-[1560px] mx-auto flex flex-col gap-gutter">
+      <div class="rds-page-header">
+        <div>
+          <div class="rds-page-eyebrow">Build inventory</div>
+          <h1 class="rds-page-title">Builds <span class="rds-build-count font-ribbon text-ribbon text-on-surface-variant ml-1">${filtered.length} of ${builds.length}</span></h1>
+          <p class="rds-page-copy">Evidence-backed app runs, previews, review state, and operator actions.</p>
         </div>
-        <div class="md:hidden p-3 space-y-3">
-          ${mobileCards || `<div class="py-6 px-4 text-on-surface-variant italic font-table text-table">${builds.length ? "No builds match your filters." : `No builds yet — <a href="/new" class="text-primary-container hover:underline not-italic">start your first build</a>.`}</div>`}
+        <div class="flex items-center gap-2 shrink-0">
+          <button type="button" onclick="refreshBuilds()" class="rds-action-secondary !min-h-[34px] !py-1 !px-3">${icon("refresh", 14)}<span class="hidden sm:inline">Refresh</span></button>
+          <a href="/new" class="rds-new-build-button rds-action-primary !min-h-[34px] !py-1 !px-3">${icon("add", 16)}<span>New Build</span></a>
         </div>
-        <div class="hidden md:block rds-scroll-table">
+      </div>
+
+      <form method="get" action="/builds" class="rds-builds-filterbar flex flex-wrap items-center gap-2">
+        ${wantStatus.map((v) => `<input type="hidden" name="status" value="${escapeHtml(v)}">`).join("")}
+        ${explicitSort ? `<input type="hidden" name="sort" value="${escapeHtml(sort)}"><input type="hidden" name="dir" value="${escapeHtml(dir)}">` : ""}
+        <div class="relative flex-1 min-w-[200px] max-w-[340px]">
+          ${icon("search", 15, "absolute left-2.5 top-1/2 -translate-y-1/2 text-outline pointer-events-none")}
+          <input name="q" value="${escapeHtml(q)}" oninput="rdsSearch(event)" class="w-full h-8 bg-surface-container-low border border-outline-variant rounded pl-8 pr-3 text-[12.5px] text-on-surface placeholder-outline focus:border-primary-container focus:ring-0 focus:outline-none" placeholder="Filter by name, slug, or id" type="text" aria-label="Filter builds">
+        </div>
+        <div class="flex items-center gap-1.5 flex-wrap">
+          ${chip("running", "Running", counts.running)}
+          ${chip("failed", "Failed", counts.failed)}
+          ${chip("stuck", "Stuck", counts.stuck)}
+          ${chip("paused", "Paused", counts.paused)}
+          ${chip("done", "Done", counts.done)}
+        </div>
+        <span class="hidden xl:inline-block w-px h-5 bg-outline-variant" aria-hidden="true"></span>
+        <select name="stack" onchange="this.form.submit()" class="${selectCls}" aria-label="Filter by stack">
+          <option value="">All stacks</option>
+          ${stacks.map((st) => `<option value="${escapeHtml(st.id)}" ${wantStack.includes(st.id) ? "selected" : ""}>${escapeHtml(st.name)}</option>`).join("")}
+        </select>
+        <select name="mode" onchange="this.form.submit()" class="${selectCls}" aria-label="Filter by mode">
+          <option value="">Green + brown</option>
+          <option value="green" ${wantMode === "green" ? "selected" : ""}>Greenfield</option>
+          <option value="brown" ${wantMode === "brown" ? "selected" : ""}>Brownfield</option>
+        </select>
+        <select name="hosting" onchange="this.form.submit()" class="${selectCls}" aria-label="Filter by hosting">
+          <option value="">Any hosting</option>
+          <option value="hosted" ${wantHosting === "hosted" ? "selected" : ""}>Hosted on Zo (${counts.hosted})</option>
+          <option value="unhosted" ${wantHosting === "unhosted" ? "selected" : ""}>Not hosted (${counts.unhosted})</option>
+          <option value="local" ${wantHosting === "local" ? "selected" : ""}>Local preview (${counts.local})</option>
+        </select>
+        <button type="submit" class="sr-only">Apply filters</button>
+        ${activeFilterCount ? `<a href="/builds" class="font-ribbon text-ribbon text-on-surface-variant hover:text-on-surface whitespace-nowrap">Clear filters (${activeFilterCount})</a>` : ""}
+      </form>
+
+      <div class="lg:hidden space-y-3">
+        ${mobileCards || `<div class="py-6 px-1 text-on-surface-variant italic font-table text-table">${emptyLine}</div>`}
+      </div>
+      <section class="hidden lg:block bg-surface border border-outline-variant rounded-DEFAULT overflow-hidden">
+        <div class="rds-scroll-table">
         <table class="rds-desktop-table w-full text-left border-collapse">
-          <thead class="sticky top-[70px] bg-[#101412] z-20 border-b border-[#242b28]">
+          <thead class="sticky top-0 bg-[#101412] z-20 border-b border-[#242b28]">
             <tr class="font-ribbon text-ribbon text-on-surface-variant whitespace-nowrap">
               <th class="py-2 px-4 font-medium w-8"></th>
-              <th class="py-2 px-4 font-medium">${sortableHeader(c.req.url, "slug", "Slug / ID", sort, dir)}</th>
+              <th class="py-2 px-4 font-medium">${sortableHeader(c.req.url, "slug", "Build", sort, dir)}</th>
               <th class="py-2 px-4 font-medium">${sortableHeader(c.req.url, "stage", "Stage", sort, dir)}</th>
               <th class="py-2 px-4 font-medium">${sortableHeader(c.req.url, "status", "Status", sort, dir)}</th>
-              <th class="py-2 px-4 font-medium">${sortableHeader(c.req.url, "review", "Review", sort, dir)}</th>
-              <th class="py-2 px-4 font-medium text-right">${sortableHeader(c.req.url, "cost", "Cost", sort, dir, "justify-end")}</th>
-              <th class="py-2 px-4 font-medium">${sortableHeader(c.req.url, "last", "Last activity", sort, dir)}</th>
-              <th class="py-2 px-4 font-medium">${sortableHeader(c.req.url, "tags", "Tags", sort, dir)}</th>
+              <th class="py-2 px-4 font-medium hidden xl:table-cell">${sortableHeader(c.req.url, "review", "Review", sort, dir)}</th>
+              <th class="py-2 px-4 font-medium text-right hidden lg:table-cell">${sortableHeader(c.req.url, "cost", "Cost", sort, dir, "justify-end")}</th>
+              <th class="py-2 px-4 font-medium hidden lg:table-cell">${sortableHeader(c.req.url, "last", "Last activity", sort, dir)}</th>
+              <th class="py-2 px-4 font-medium hidden 2xl:table-cell">${sortableHeader(c.req.url, "tags", "Tags", sort, dir)}</th>
               <th class="py-2 px-4 font-medium w-8"></th>
             </tr>
           </thead>
           <tbody class="font-table text-table divide-y divide-outline-variant/30">
-            ${rows || `<tr><td colspan="9" class="py-6 px-4 text-on-surface-variant italic font-table text-table">${builds.length ? "No builds match your filters." : `No builds yet — <a href="/new" class="text-primary-container hover:underline not-italic">start your first build</a>.`}</td></tr>`}
+            ${rows || `<tr><td colspan="9" class="py-6 px-4 text-on-surface-variant italic font-table text-table">${emptyLine}</td></tr>`}
           </tbody>
         </table>
         </div>
