@@ -5570,7 +5570,7 @@ app.get("/b/:id", async (c) => {
   const deployBanner = canOpenPreview && row.liveOnZo
     ? `<div id="deploy-banner" class="rds-deploy-banner bg-primary-container/10 border border-primary-container/40 rounded-DEFAULT p-3 flex items-center gap-3 flex-wrap">
          ${icon("cloud_done", 18, "text-primary-container shrink-0")}
-         <div class="flex-1 min-w-0 font-body text-body">
+         <div class="flex-1 min-w-[220px] font-body text-body">
            <div class="font-bold text-primary-container mb-0.5">Live on Zo</div>
            <div class="text-on-surface-variant break-words">Hosted service URL: <a id="deploy-url-link" href="${escapeHtml(serviceInfo?.url || row.preview || "")}" target="_blank" class="font-code text-code text-primary-container hover:underline break-all">${escapeHtml(serviceInfo?.url || row.preview || "")}</a></div>
          </div>
@@ -5583,7 +5583,7 @@ app.get("/b/:id", async (c) => {
     : row.hasZoService
       ? `<div id="deploy-banner" class="rds-deploy-banner bg-tertiary-container/10 border border-tertiary-container/40 rounded-DEFAULT p-3 flex items-center gap-3 flex-wrap">
            ${icon("cloud_sync", 18, "text-tertiary-container shrink-0")}
-           <div class="flex-1 min-w-0 font-body text-body">
+           <div class="flex-1 min-w-[220px] font-body text-body">
              <div class="font-bold text-tertiary-container mb-0.5">Zo service recorded; verify status</div>
              <div class="text-on-surface-variant break-words">RDS has service <code class="font-code text-code break-all">${escapeHtml(serviceInfo?.service_id || "unknown")}</code>, but it is not marked live. URL: <a id="deploy-url-link" href="${escapeHtml(serviceInfo?.url || row.preview || "")}" target="_blank" class="font-code text-code text-tertiary-container hover:underline break-all">${escapeHtml(serviceInfo?.url || row.preview || "")}</a></div>
            </div>
@@ -5595,7 +5595,7 @@ app.get("/b/:id", async (c) => {
     : previewIsLocalOnly
       ? `<div id="deploy-banner" class="rds-deploy-banner ${row.localPreviewRunning ? "bg-surface-container-high/40 border-outline-variant" : "bg-error/10 border-error/30"} border rounded-DEFAULT p-3 flex items-center gap-3 flex-wrap">
            ${icon(row.localPreviewRunning ? "computer" : "power_settings_new", 18, `${row.localPreviewRunning ? "text-on-surface-variant" : "text-error"} shrink-0`)}
-           <div class="flex-1 min-w-0 font-body text-body">
+           <div class="flex-1 min-w-[220px] font-body text-body">
              <div class="font-bold ${row.localPreviewRunning ? "text-on-surface" : "text-error"} mb-0.5">${row.localPreviewRunning ? "Local preview only" : "Local preview stopped"}</div>
              <div class="text-on-surface-variant break-words">${row.localPreviewRunning ? `Running locally at <code class="font-code text-code break-all">${escapeHtml(row.preview || "")}</code>. This is not hosted on Zo and should not consume a service slot.` : `The old local preview URL is no longer active. RDS will not offer an Open button until the local process is running again or the build is redeployed to Zo.`}</div>
            </div>
@@ -5607,7 +5607,7 @@ app.get("/b/:id", async (c) => {
     : pendingPreview
       ? `<div id="deploy-banner" class="rds-deploy-banner bg-tertiary-container/10 border border-tertiary-container/40 rounded-DEFAULT p-3 flex items-center gap-3 flex-wrap">
            ${icon("pending", 18, "text-tertiary-container shrink-0")}
-           <div class="flex-1 min-w-0 font-body text-body">
+           <div class="flex-1 min-w-[220px] font-body text-body">
              <div class="font-bold text-tertiary-container mb-0.5">Pending Zo registration</div>
              <div class="text-on-surface-variant break-words">RDS finished local deploy, but the public service registration has not completed yet. Sentinel: <code class="font-code text-code break-all">${escapeHtml(row.preview || "")}</code></div>
            </div>
@@ -5638,7 +5638,7 @@ app.get("/b/:id", async (c) => {
   const reviewBanner = row.reviewStatus === "pending"
     ? `<div data-dismissible-alert="review-${escapeHtml(id)}-pending" class="rds-review-banner ${evidenceBlocksApproval ? "bg-error/10 border-error/30" : "bg-secondary-container/30 border-secondary/30"} border rounded-DEFAULT p-3 flex items-center gap-3 flex-wrap">
          ${icon(evidenceBlocksApproval ? "block" : "rate_review", 18, `${evidenceBlocksApproval ? "text-error" : "text-secondary"} shrink-0`)}
-         <div class="flex-1 min-w-0 font-body text-body">
+         <div class="flex-1 min-w-[220px] font-body text-body">
            <div class="font-bold ${evidenceBlocksApproval ? "text-error" : "text-secondary"} mb-0.5">${evidenceBlocksApproval ? "Pending review, but approval is blocked" : "Pending operator review"}</div>
            <div class="text-on-surface-variant">${evidenceBlocksApproval ? "Evidence says this build still has blocking issues. Continue the RDS Goal loop to re-read the PRD, repair blockers, and rerun QA/readiness before approval." : "Pipeline finished. Review the live app and Playwright artefacts, then use the Approve or Reject action in the header."}</div>
          </div>
@@ -5699,7 +5699,7 @@ app.get("/b/:id", async (c) => {
   const iterationBanner = iterationState.running
     ? `<div class="rds-status-banner bg-primary-container/10 border border-primary-container/35 rounded-DEFAULT p-3 flex items-center gap-3 flex-wrap">
          <span class="material-symbols-outlined text-primary-container animate-spin" style="font-size:18px;animation-duration:1.2s">progress_activity</span>
-         <div class="flex-1 min-w-0 font-body text-body">
+         <div class="flex-1 min-w-[220px] font-body text-body">
            <div class="font-bold text-primary-container">Iteration running: ${escapeHtml(iterationState.phase || "working")}</div>
            <div class="text-on-surface-variant">RDS is applying the requested change, then checks, QA, and redeploy. Last iteration event ${escapeHtml(iterationState.updatedAt ? relativeTime(new Date(iterationState.updatedAt).getTime()) : "just now")}.</div>
          </div>
@@ -11368,7 +11368,7 @@ function detailScript(initialRunning: boolean): string {
       if (!banner) return;
       var html =
         '<span class="material-symbols-outlined text-[18px] text-primary-container shrink-0">rocket_launch</span>' +
-        '<div class="flex-1 min-w-0 font-body text-body">' +
+        '<div class="flex-1 min-w-[220px] font-body text-body">' +
           '<div class="font-bold text-primary-container mb-0.5">Live preview</div>' +
           '<div class="text-on-surface-variant break-all">Deployed at <a id="deploy-url-link" href="' + url + '" target="_blank" class="font-code text-code text-primary-container hover:underline">' + url + '</a></div>' +
         '</div>' +
@@ -12635,7 +12635,7 @@ function chatScript(): string {
       var turns = sortChatTurns(session.turns || []);
       if (!turns.length) {
         var greet = session.build_id
-          ? "Hey — what can I help you with on build " + session.build_id + "?"
+          ? "Hey — what can I help you with on " + (session.title || session.build_id) + "?"
           : "Hey, what can I do for you?";
         log.innerHTML = '<div class="text-on-surface-variant italic font-table text-table p-3">' + escapeChatHtml(greet) + '</div>';
       } else {
