@@ -14,7 +14,7 @@ typography), see `docs/DESIGN.md`. For what the pipeline writes to disk, see
 
 | Route | Nav label | What it's for |
 |---|---|---|
-| `/` | Hub | Landing overview: build engine status, PRD inbox dropzone, watchdog toggle, Zo hosting slots, needs-review queue, recent builds, critical alerts, live activity. |
+| `/` | Hub | A status strip (build engine, watchdog toggle, Zo hosting, PRD inbox), then **Needs you**: failures, stopped or stuck runners, unreadable builds, and reviews waiting on you, each with its reason and Dismiss/Open. Recent builds and live activity follow. |
 | `/builds` | Builds | Full build inventory: sortable/filterable table (status, stack, mode, hosting, ID), mobile card layout, per-row review/cost/last-activity. |
 | `/new` | New Build | PRD-first intake: paste or attach a brief, run analysis (`/new/analyze`), review the recommended stack/skills plan, then launch. |
 | `/b/:id` | (from Builds) | Build detail: status command center, approve/reject, chat box, blockers and evidence summary, live terminal, stage timeline, tabs for files/QA/goal/agents/raw state. |

@@ -21,7 +21,7 @@
   <a href="https://discord.gg/xwHfUD2bxW"><img alt="Join the community on Discord" src="https://img.shields.io/badge/Discord-Join%20the%20community-5865F2?logo=discord&amp;logoColor=white"></a>
 </p>
 
-![The RDS Hub showing the build engine, PRD inbox, review queue, and recent builds](docs/assets/rds-hub.png)
+![The RDS Hub: a status strip, a Needs you list with a failed build and a pending review, and recent builds](docs/assets/rds-hub.png)
 
 > [!IMPORTANT]
 > **RDS is early, single-operator software.** It is built for one trusted person
@@ -156,7 +156,7 @@ design rules live in [docs/DESIGN.md](docs/DESIGN.md).
 
 | Page | What it is for |
 | --- | --- |
-| **Hub** | Engine status, PRD inbox, review queue, alerts, recent builds |
+| **Hub** | What needs you (failures, stopped runners, reviews), system status, recent builds |
 | **Builds** | Every build with filters for state, stack, mode, and hosting |
 | **Build page** | Status, preview, logs, QA evidence, files, diff, and actions |
 | **Chat** | Build-scoped requests that turn into confirmed actions |
