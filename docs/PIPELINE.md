@@ -326,7 +326,7 @@ helper calls where that upstream tooling requires Claude Code.
 
 The dashboard Settings page controls defaults for future builds only. It now
 surfaces builder defaults, active model field, local Claude/Codex CLI health,
-V1 stack/skill registry status, runtime/auth paths, theme, and vendored
+V1 stack/skill registry status, runtime/auth paths, and vendored
 component inventory in one operator view.
 
 Provider-specific model controls are mutually exclusive in dashboard forms. If

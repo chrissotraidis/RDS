@@ -238,6 +238,8 @@ interface RdsSettings {
   inferenceProvider: "claude" | "codex";
   claudeModel: string;
   codexModel: string;
+  // Kept so older settings files still parse. The console is dark-only by
+  // design (docs/DESIGN.md); no page reads this value.
   theme: "dark" | "light" | "system";
 }
 
@@ -8228,15 +8230,7 @@ app.get("/settings", (c) => {
             </label>
           </div>
 
-          <div class="pt-gutter border-t border-outline-variant flex flex-col md:flex-row md:items-end gap-gutter md:justify-between">
-            <label class="flex flex-col gap-1 w-full md:max-w-[260px]">
-              <span class="font-ribbon text-ribbon text-on-surface-variant">Theme</span>
-              <select name="theme" class="bg-surface-container-lowest border border-outline-variant rounded-DEFAULT px-2 py-2 font-code text-code text-on-surface focus:border-primary-container focus:outline-none">
-                <option value="dark" ${settings.theme === "dark" ? "selected" : ""}>Dark</option>
-                <option value="light" ${settings.theme === "light" ? "selected" : ""}>Light</option>
-                <option value="system" ${settings.theme === "system" ? "selected" : ""}>System</option>
-              </select>
-            </label>
+          <div class="pt-gutter border-t border-outline-variant flex flex-col md:flex-row md:items-end gap-gutter md:justify-end">
             <button type="submit" class="rds-action-primary w-full md:w-auto">${icon("save", 14)}<span>Save settings</span></button>
           </div>
         </section>
