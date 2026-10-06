@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# bin/rds-vps-smoke — prove this server can publish a build end to end.
+#
+# Publishes a tiny built-in app (fixtures/vps-hello) through the same path a
+# real build uses (bin/rds-deploy --target=vps), checks the public HTTPS URL
+# and the deploy fingerprint, then takes it offline again.
+#
+# Usage:  bin/rds-vps-smoke [--keep]
+#   --keep   leave the smoke app published so you can open it yourself.
+#
+# Run it as the RDS user after bin/rds-vps-setup. Exit 0 means a real build
+# would be published the same way. The smoke build id starts with rds-smoke-,
+# so it stays out of the dashboard's build lists.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck disable=SC1091
+source "$ROOT/bin/lib/common.sh"
+# shellcheck disable=SC1091
+source "$ROOT/bin/lib/logging.sh"
+
+KEEP=0
+for arg in "$@"; do
+  case "$arg" in
+    --keep) KEEP=1 ;;
+    -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
+    *) echo "FATAL: unknown argument: $arg" >&2; exit 2 ;;
+  esac
+done
+
+[[ -n "${RDS_PUBLIC_DOMAIN:-}" ]] || { echo "FATAL: set RDS_PUBLIC_DOMAIN in .env first (see docs/RUNNING_ON_A_VPS.md)" >&2; exit 1; }
+command -v bun >/dev/null 2>&1 || [[ -x "$HOME/.bun/bin/bun" ]] || { echo "FATAL: bun is not installed for $(id -un)" >&2; exit 1; }
+export PATH="$HOME/.bun/bin:$PATH"
+
+ID="rds-smoke-vps-$(date -u +%Y%m%d-%H%M%S)"
+BUILD_DIR="$RDS_BUILDS_DIR/$ID"
+APP="$BUILD_DIR/app"
+mkdir -p "$APP"
+cp "$ROOT/fixtures/vps-hello/server.ts" "$APP/server.ts"
+PORT="$(next_free_port)"
+printf 'HOST_PORT=%s\n' "$PORT" > "$APP/.env"
+python3 - "$BUILD_DIR/state.json" "$ID" "$APP" <<'PY'
+import json, sys, datetime
+out, build_id, app = sys.argv[1:]
+now = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+json.dump({"build_id": build_id, "display_name": "VPS smoke test", "stack": "game-engine",
+           "mode": "green", "status": "done", "stage": "deploy", "app_dest": app,
+           "started_at": now, "updated_at": now}, open(out, "w"), indent=2)
+PY
+
+fail() { echo "FAIL: $*" >&2; [[ "$KEEP" == "1" ]] || "$ROOT/bin/rds-vps-deregister" --build-id="$ID" >/dev/null 2>&1 || true; exit 1; }
+
+echo "== publishing $ID on port $PORT"
+"$ROOT/bin/rds-deploy" --build-id="$ID" --app-dir="$APP" --target=vps > "$BUILD_DIR/smoke-deploy.log" 2>&1 \
+  || { tail -n 25 "$BUILD_DIR/smoke-deploy.log" >&2; fail "rds-deploy failed (full log: $BUILD_DIR/smoke-deploy.log)"; }
+URL="$(tr -d '[:space:]' < "$BUILD_DIR/preview-url.txt")"
+[[ -n "$URL" ]] || fail "no preview URL was written"
+
+echo "== checking $URL"
+body="$(curl -sS -k --max-time 15 "$URL/" || true)"
+[[ "$body" == *"RDS VPS smoke OK"* ]] || fail "public URL did not serve the smoke app: $URL"
+[[ "$body" == *"runtime=vps"* ]] || fail "app did not start with the VPS runtime env"
+fp="$(jq -r '.status // "missing"' "$BUILD_DIR/service-runtime.json" 2>/dev/null || echo missing)"
+[[ "$fp" == "pass" ]] || fail "deploy fingerprint check: $fp (see $BUILD_DIR/service-runtime.json)"
+svc="$(jq -r '.service_id // ""' "$BUILD_DIR/service.json")"
+echo "   served by $svc, fingerprint pass"
+
+if [[ "$KEEP" == "1" ]]; then
+  echo "PASS: published at $URL (left running; take it offline with bin/rds-vps-deregister --build-id=$ID)"
+  exit 0
+fi
+
+echo "== taking it offline"
+"$ROOT/bin/rds-vps-deregister" --build-id="$ID" >/dev/null || fail "rds-vps-deregister failed"
+code="$(curl -s -k -o /dev/null -w '%{http_code}' --max-time 10 "$URL/" || true)"
+[[ "$code" != "200" ]] || fail "site still answers after take-offline"
+echo "PASS: this server publishes builds at https://<build>.$RDS_PUBLIC_DOMAIN and takes them offline cleanly."

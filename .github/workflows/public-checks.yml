@@ -106,3 +106,69 @@ jobs:
             ${{ runner.temp }}/rds-data/builds/_selftest
             ${{ runner.temp }}/rds-data/dashboard.log
           if-no-files-found: ignore
+  vps-publish:
+    # Real systemd + Caddy on a fresh Ubuntu VM: bin/rds-vps-setup, the
+    # dashboard over HTTPS, then bin/rds-vps-smoke publishes and removes a build.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install Caddy and tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq debian-keyring debian-archive-keyring apt-transport-https curl gnupg jq
+          curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+          curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | sudo tee /etc/apt/sources.list.d/caddy-stable.list >/dev/null
+          sudo apt-get update -qq && sudo apt-get install -y -qq caddy
+          # CI has no coding-agent login; the setup check only needs a CLI on PATH.
+          printf '#!/bin/sh\necho "codex-cli ci-stub"\n' | sudo tee /usr/local/bin/codex >/dev/null && sudo chmod +x /usr/local/bin/codex
+
+      - name: Configure RDS
+        run: |
+          mkdir -p "$HOME/rds-data"/{builds,inbox,chat,state}
+          cat > .env <<ENV
+          RDS_BUILDS_DIR=$HOME/rds-data/builds
+          RDS_INBOX_DIR=$HOME/rds-data/inbox
+          RDS_EVENTS_PATH=$HOME/rds-data/events.jsonl
+          RDS_DASHBOARD_CHAT_DIR=$HOME/rds-data/chat
+          RDS_DASHBOARD_STATE_DIR=$HOME/rds-data/state
+          RDS_DASHBOARD_PASSWORD=ci-vps-pass
+          RDS_DASHBOARD_TOKEN=ci-vps-token
+          RDS_PUBLIC_DOMAIN=apps.localhost
+          RDS_DASHBOARD_HOST=rds.localhost
+          RDS_MANAGE_POSTGRES=0
+          RDS_WATCHDOG_AUTOSTART=0
+          ENV
+          (cd dashboard && bun install --frozen-lockfile || bun install)
+
+      - name: Run rds-vps-setup
+        run: sudo ./bin/rds-vps-setup --user="$(id -un)"
+
+      - name: Dashboard answers over HTTPS with auth
+        run: |
+          for _ in $(seq 1 30); do
+            curl -sk -o /dev/null -w '%{http_code}' https://rds.localhost/healthz | grep -q 200 && break
+            sleep 2
+          done
+          test "$(curl -sk -o /dev/null -w '%{http_code}' https://rds.localhost/)" = 401
+          test "$(curl -sk -u rds:ci-vps-pass -o /dev/null -w '%{http_code}' https://rds.localhost/)" = 200
+          # Trust Caddy's local CA so the deploy-fingerprint check can verify TLS.
+          sudo cp /var/lib/caddy/.local/share/caddy/pki/authorities/local/root.crt /usr/local/share/ca-certificates/caddy-local.crt
+          sudo update-ca-certificates >/dev/null
+
+      - name: Publish and take offline a build (rds-vps-smoke)
+        run: ./bin/rds-vps-smoke
+
+      - name: Diagnostics
+        if: failure()
+        run: |
+          sudo journalctl -u rds-dashboard -u caddy --no-pager | tail -80
+          ls -la /etc/caddy/rds.d || true
+          tail -n 60 "$HOME"/rds-data/builds/*/logs/service.log 2>/dev/null || true
+          tail -n 60 "$HOME"/rds-data/builds/*/smoke-deploy.log 2>/dev/null || true
