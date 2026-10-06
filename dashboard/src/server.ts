@@ -4236,7 +4236,7 @@ app.get("/static/:name", (c) => {
   try { body = readFileSync(path); } catch { return c.text("not found", 404); }
   c.header("Content-Type", mime[ext ?? ""] ?? "text/plain");
   c.header("Cache-Control", "public, max-age=86400");
-  return c.body(body);
+  return c.body(new Uint8Array(body));
 });
 
 app.get("/favicon.ico", (c) => {
@@ -4245,7 +4245,7 @@ app.get("/favicon.ico", (c) => {
   try { body = readFileSync(path); } catch { return c.text("not found", 404); }
   c.header("Content-Type", "image/x-icon");
   c.header("Cache-Control", "public, max-age=604800");
-  return c.body(body);
+  return c.body(new Uint8Array(body));
 });
 
 app.get("/site.webmanifest", (c) => c.json({

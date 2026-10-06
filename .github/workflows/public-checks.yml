@@ -33,5 +33,9 @@ jobs:
         working-directory: dashboard
         run: bun install --frozen-lockfile || bun install
 
+      - name: Type-check dashboard
+        working-directory: dashboard
+        run: bun run typecheck
+
       - name: Bundle dashboard server
         run: bun build dashboard/src/server.ts --outdir /tmp/rds-dashboard-build-check
