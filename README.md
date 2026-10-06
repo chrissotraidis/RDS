@@ -82,7 +82,7 @@ account. The full walkthrough, including Postgres and Ruby for Rails builds, is
    sudo ./bin/rds-vps-setup --user=rds
    ```
 
-5. **Open `https://rds.example.com`**, sign in, and start a build from **New Build**.
+5. **Check it.** As `rds`, `./bin/rds-vps-smoke` publishes a tiny app, verifies its HTTPS URL, and takes it offline. Then open `https://rds.example.com`, sign in, and start a build from **New Build**.
 
 Running on a Zo computer instead? Leave `RDS_PUBLIC_DOMAIN` empty, set
 `RDS_ZO_OWNER`, and follow [docs/RUNNING_ON_ZO.md](docs/RUNNING_ON_ZO.md).
@@ -272,6 +272,7 @@ place to ask.
 ./bootstrap/verify.sh --fresh-clone   # source-only check, before install
 ./bootstrap/verify.sh                 # installed host
 ./bin/rds-selftest                    # dashboard smoke test (Playwright)
+./bin/rds-vps-smoke                   # on a VPS: publish and remove a test app
 ./bin/rds-quality-fixtures --keep-going
 ./bin/rds-autonomy-fixture
 ```

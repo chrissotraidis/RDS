@@ -128,6 +128,17 @@ cd /home/rds/RDS
 4. installs and starts `rds-dashboard.service`;
 5. lets `rds` reload Caddy and keeps `rds`'s per-build services running after logout and reboot (`loginctl enable-linger`).
 
+Confirm that publishing works before your first real build. As `rds`:
+
+```bash
+cd ~/RDS && ./bin/rds-vps-smoke
+```
+
+It publishes a tiny app at `https://rds-smoke-vps-<hash>.apps.example.com`, checks
+the certificate, the page, and the deploy fingerprint, then takes it offline.
+`PASS` means real builds will publish the same way. Add `--keep` to leave it up
+and open it in a browser.
+
 Open `https://rds.example.com`, sign in as `rds` with your dashboard password,
 and start a build from **New Build**.
 
@@ -211,7 +222,11 @@ Set `RDS_VPS_PROXY=none` and route `*.<domain>` yourself: each build's
 
 ## Verification status
 
-This path was verified end to end on Debian 13 with systemd as PID 1, Caddy
+CI runs this path on every pull request: a fresh Ubuntu VM installs Caddy,
+runs `rds-vps-setup`, checks the dashboard over HTTPS with auth, and runs
+`rds-vps-smoke` (the `vps-publish` job in `.github/workflows/public-checks.yml`).
+
+It was also verified by hand end to end on Debian 13 with systemd as PID 1, Caddy
 2.11, and Bun: `rds-vps-setup`, the dashboard over HTTPS with auth, publishing
 a build as a systemd user unit behind Caddy, the deploy-fingerprint check,
 **Take offline** and **Publish** from the dashboard, and a full reboot with the
