@@ -353,7 +353,7 @@ const STACK_PRESENTATION: Record<string, { label: string; shortLabel: string; su
     label: "Mobile app",
     shortLabel: "Mobile app",
     subtitle: "Expo / React Native",
-    bestFor: "Best for iOS/Android apps with a Zo web preview and Expo/EAS upgrade path.",
+    bestFor: "Best for iOS/Android apps with a hosted web preview and Expo/EAS upgrade path.",
   },
   "game-asset-pipeline": {
     label: "Game asset pipeline",
@@ -484,6 +484,7 @@ const STACK_SOURCE_LINKS: Record<string, ReferenceLink[]> = {
 };
 
 interface BuildServiceInfo {
+  provider?: "zo" | "vps";
   service_id?: string;
   label?: string;
   url?: string;
@@ -513,7 +514,18 @@ interface BuildInputDoc {
   mtimeMs?: number;
 }
 
-const ALLOWED_DEPLOY_TARGETS = new Set(["zo", "none", "teardown"]);
+const ALLOWED_DEPLOY_TARGETS = new Set(["vps", "zo", "none", "teardown"]);
+// Where "publish" goes on this install. Mirrors bin/lib/common.sh: an explicit
+// RDS_DEFAULT_DEPLOY_TARGET wins, otherwise a public domain means this VPS.
+const DEFAULT_DEPLOY_TARGET: "vps" | "zo" =
+  process.env.RDS_DEFAULT_DEPLOY_TARGET === "vps" || process.env.RDS_DEFAULT_DEPLOY_TARGET === "zo"
+    ? process.env.RDS_DEFAULT_DEPLOY_TARGET
+    : process.env.RDS_PUBLIC_DOMAIN ? "vps" : "zo";
+function resolveDeployTarget(requested?: string): string {
+  // "host" and the legacy "zo" button both mean "publish wherever this install publishes".
+  if (!requested || requested === "host" || requested === "zo") return DEFAULT_DEPLOY_TARGET;
+  return requested;
+}
 
 interface RdsEvent {
   ts: string;
@@ -1384,7 +1396,7 @@ function renderStackReferenceCard(stack: StackOption, compact = false): string {
       ${compact ? "" : `
         <div>
           <div class="font-ribbon text-ribbon text-on-surface-variant mb-1">Why RDS trusts this stack</div>
-          <p class="font-table text-table text-on-surface-variant mb-2">The stack has a declared RDS contract, a doctor/smoke path, a Zo preview model, and curated framework references.</p>
+          <p class="font-table text-table text-on-surface-variant mb-2">The stack has a declared RDS contract, a doctor/smoke path, a hosted preview model, and curated framework references.</p>
           ${renderReferenceLinks(stack.sourceLinks)}
         </div>
       `}
@@ -1714,7 +1726,16 @@ function readBuildRow(id: string): BuildRow {
   }
   if (stateUnreadable) derivedStatus = "state_unreadable";
   const serviceInfo = readServiceInfo(id);
-  const preview = state.preview_url || undefined;
+  // state.json carries the preview URL when the build pipeline deployed. A
+  // standalone bin/rds-deploy (CLI redeploy) only writes service.json and
+  // preview-url.txt, so fall back to those rather than showing a live service
+  // with no way to open it.
+  let previewFile = "";
+  try { previewFile = readFileSync(join(dir, "preview-url.txt"), "utf8").trim(); } catch { /* none */ }
+  const preview = state.preview_url
+    || (serviceInfo?.status === "live" && serviceInfo.url ? serviceInfo.url : "")
+    || previewFile
+    || undefined;
   const appDest = state.app_dest || resolveAppDest(dir);
   const appType = normalizeAppType(state.app_type || inferAppTypeForBuild(id, state));
   const hasZoService = !!serviceInfo?.service_id && serviceInfo.status !== "deregistered";
@@ -2077,11 +2098,11 @@ function fallbackBuildBrief(id: string, state: StateJson, row: BuildRow): BuildB
   ].filter(Boolean).join(" · ");
   const trigger = state.repo_url || state.prd_source || state.trigger || "";
   const hostingPoint = row.liveOnZo
-    ? `Hosted on Zo: ${readServiceInfo(id)?.url || row.preview || "service URL recorded"}`
+    ? `Hosted at ${readServiceInfo(id)?.url || row.preview || "service URL recorded"}`
     : row.hasZoService
-      ? `Zo service recorded: ${readServiceInfo(id)?.service_id || "unknown service id"} (${row.serviceStatus || "unknown"})`
+      ? `Hosted service recorded: ${readServiceInfo(id)?.service_id || "unknown service id"} (${row.serviceStatus || "unknown"})`
       : row.serviceStatus === "deregistered"
-        ? "Zo service deleted; not consuming a hosted-service slot."
+        ? "Taken offline; not using a hosting slot."
         : row.localPreviewRunning
           ? `Local preview running: ${row.preview || "URL not recorded"}`
           : row.preview
@@ -3633,9 +3654,9 @@ function classifyBuildChatAction(session: ChatSession, message: string): ChatAct
     return {
       kind: "delete-service",
       build_id: buildId,
-      label: "Delete Zo service",
-      confirm_label: "Delete Zo service",
-      description: "Deletes only the recorded hosted Zo service for this build, then clears the preview URL after deletion is verified. Project files remain."
+      label: "Take offline",
+      confirm_label: "Take offline",
+      description: "Stops only the hosted service for this build, then clears the preview URL after deletion is verified. Project files remain."
     };
   }
 
@@ -3654,7 +3675,7 @@ function classifyBuildChatAction(session: ChatSession, message: string): ChatAct
     return {
       kind: "redeploy",
       build_id: buildId,
-      label: "Redeploy to Zo",
+      label: "Redeploy",
       confirm_label: "Redeploy",
       description: "Re-runs deploy from the generated app directory and updates the preview if it succeeds."
     };
@@ -3702,12 +3723,12 @@ function appendChatActionProposal(session: ChatSession, message: string, action:
     : action.kind === "qa"
       ? `I can start a fresh Playwright QA pass for this build.`
       : action.kind === "redeploy"
-        ? `I can redeploy this build to Zo from the generated app directory.`
+        ? `I can redeploy this build from the generated app directory.`
         : action.kind === "approve"
           ? `I can mark this build approved after your review.`
           : action.kind === "agent-start"
             ? `I can start a persistent ${action.provider === "codex" ? "Codex" : "Claude Code"} worker in an isolated git worktree from this chat. RDS will record the tmux session, logs, branch, and diff; nothing merges or pushes automatically.`
-            : `I can delete this build's recorded Zo service and clear the preview URL after deletion is verified.`;
+            : `I can take this build offline and clear the preview URL after deletion is verified.`;
   const rdsTurn: ChatTurn = { id: randomUUID().slice(0, 12), role: "rds", text, ts: now + 1, seq: seq + 1, status: "complete", action };
   session.turns.push(userTurn, rdsTurn);
   session.updated_at = now + 1;
@@ -3976,7 +3997,7 @@ function startChatAction(action: ChatAction, opts: { sessionId?: string; turnId?
     if (!existsSync(cmd)) return { ok: false, status: 500, error: "bin/rds-deploy missing" };
     const runPath = createActionRun(action, opts);
     const runRel = `builds/${id}/actions/${basename(runPath)}`;
-    const child = spawn(cmd, [`--build-id=${id}`, `--app-dir=${appDir}`, "--target=zo"], {
+    const child = spawn(cmd, [`--build-id=${id}`, `--app-dir=${appDir}`, `--target=${DEFAULT_DEPLOY_TARGET}`], {
       cwd: RDS_ROOT, stdio: "ignore", detached: true,
       env: { ...process.env, RDS_NOTIFY_DISABLED: "1", RDS_ACTION_RUN_FILE: runPath, RDS_ZO_REUSE_EXISTING: "1" }
     });
@@ -4054,7 +4075,7 @@ function startChatAction(action: ChatAction, opts: { sessionId?: string; turnId?
 
   if (action.kind === "delete-service") {
     const info = readServiceInfo(id);
-    if (!info?.service_id) return { ok: false, status: 409, error: "No recorded Zo service for this build." };
+    if (!info?.service_id) return { ok: false, status: 409, error: "No hosted service is recorded for this build." };
     const runPath = createActionRun(action, opts);
     const runRel = `builds/${id}/actions/${basename(runPath)}`;
     if (info.status === "deregistered") {
@@ -4068,9 +4089,9 @@ function startChatAction(action: ChatAction, opts: { sessionId?: string; turnId?
       });
       return { ok: true, hint: "service was already marked deregistered", action_run: runRel };
     }
-    const cmd = join(RDS_ROOT, "bin", "rds-zo-deregister");
-    if (!existsSync(cmd)) return { ok: false, status: 500, error: "bin/rds-zo-deregister missing" };
-    const child = spawn(cmd, [`--service-id=${info.service_id}`, `--build-id=${id}`], {
+    const cmd = join(RDS_ROOT, "bin", info.provider === "vps" ? "rds-vps-deregister" : "rds-zo-deregister");
+    if (!existsSync(cmd)) return { ok: false, status: 500, error: `${basename(cmd)} missing` };
+    const child = spawn(cmd, info.provider === "vps" ? [`--build-id=${id}`] : [`--service-id=${info.service_id}`, `--build-id=${id}`], {
       cwd: RDS_ROOT, stdio: ["ignore", "pipe", "pipe"], detached: true,
       env: { ...process.env, RDS_NOTIFY_DISABLED: "1", RDS_ACTION_RUN_FILE: runPath }
     });
@@ -4092,7 +4113,7 @@ function startChatAction(action: ChatAction, opts: { sessionId?: string; turnId?
         phase: "complete",
         exit_code: code ?? 1,
         preview_url: "",
-        error: ok ? undefined : (stderr.trim() || stdout.trim() || "Zo service deletion failed").slice(0, 1000),
+        error: ok ? undefined : (stderr.trim() || stdout.trim() || "Taking the site offline failed").slice(0, 1000),
       });
     });
     child.unref();
@@ -4471,7 +4492,7 @@ app.get("/", async (c) => {
           <span id="watchdog-stat" class="hidden"></span>
         </div>
         <a href="/builds?hosting=hosted" class="rds-strip-cell">
-          <span class="rds-strip-label">Zo hosting</span>
+          <span class="rds-strip-label">Hosting</span>
           <span class="rds-strip-value">${hostedBuilds.length} ${hostedBuilds.length === 1 ? "service" : "services"}</span>
         </a>
         <a href="/new" class="rds-strip-cell rds-strip-drop">
@@ -4616,7 +4637,7 @@ app.get("/builds", async (c) => {
           ${hostingPill(b, { quietWhenUnhosted: true })}
           ${b.running ? `<button type="button" data-stop="1" onclick="pauseBuild(${jsArg(b.id)})" class="ml-1 inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-tertiary-container/40 bg-tertiary-container/10 text-tertiary-container hover:bg-tertiary-container/20" title="Pause this build and resume later">${icon("pause", 13)}<span>Pause</span></button>` : ""}
           ${b.paused ? `<button type="button" data-stop="1" onclick="resumeBuild(${jsArg(b.id)})" class="ml-1 inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-primary-container/40 bg-primary-container/10 text-primary-container hover:bg-primary-container/20" title="Resume this paused build">${icon("play_arrow", 13)}<span>Resume</span></button>` : ""}
-          ${b.hasZoService ? `<button type="button" data-stop="1" onclick="deleteHostedBuild(${jsArg(b.id)})" class="ml-1 inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-error/30 bg-error/10 text-error hover:bg-error/20" title="Delete Zo service and free the slot">${icon("delete", 13)}<span>Delete service</span></button>` : ""}
+          ${b.hasZoService ? `<button type="button" data-stop="1" onclick="deleteHostedBuild(${jsArg(b.id)})" class="ml-1 inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-error/30 bg-error/10 text-error hover:bg-error/20" title="Take this site offline and free its hosting slot">${icon("delete", 13)}<span>Take offline</span></button>` : ""}
         </div>
       </td>
       <td class="py-2.5 px-4 text-on-surface whitespace-nowrap">${escapeHtml(b.stage ? displayTokenLabel(b.stage) : "—")}</td>
@@ -4628,7 +4649,7 @@ app.get("/builds", async (c) => {
       <td class="py-2.5 px-4 text-right opacity-0 group-hover:opacity-100 transition-opacity">
         ${b.running ? `<button type="button" data-stop="1" onclick="pauseBuild(${jsArg(b.id)})" class="mr-2 text-tertiary-container hover:text-[#ffd8c2]" title="Pause build" aria-label="Pause build">${icon("pause", 16)}</button>` : ""}
         ${b.paused ? `<button type="button" data-stop="1" onclick="resumeBuild(${jsArg(b.id)})" class="mr-2 text-primary-container hover:text-[#8beebb]" title="Resume build" aria-label="Resume build">${icon("play_arrow", 16)}</button>` : ""}
-        ${b.hasZoService ? `<button type="button" data-stop="1" onclick="deleteHostedBuild(${jsArg(b.id)})" class="mr-2 text-error hover:text-[#ffd3cf]" title="Delete Zo service" aria-label="Delete Zo service">${icon("delete", 16)}</button>` : ""}
+        ${b.hasZoService ? `<button type="button" data-stop="1" onclick="deleteHostedBuild(${jsArg(b.id)})" class="mr-2 text-error hover:text-[#ffd3cf]" title="Take offline" aria-label="Take offline">${icon("delete", 16)}</button>` : ""}
         <a href="/b/${escapeHtml(b.id)}" data-stop="1" class="text-on-surface-variant hover:text-on-surface" title="Open build" aria-label="Open build">${icon("arrow_forward", 16)}</a>
       </td>
     </tr>`;
@@ -4751,7 +4772,7 @@ app.get("/builds", async (c) => {
         </select>
         <select name="hosting" onchange="this.form.submit()" class="${selectCls}" aria-label="Filter by hosting">
           <option value="">Any hosting</option>
-          <option value="hosted" ${wantHosting === "hosted" ? "selected" : ""}>Hosted on Zo (${counts.hosted})</option>
+          <option value="hosted" ${wantHosting === "hosted" ? "selected" : ""}>Hosted (${counts.hosted})</option>
           <option value="unhosted" ${wantHosting === "unhosted" ? "selected" : ""}>Not hosted (${counts.unhosted})</option>
           <option value="local" ${wantHosting === "local" ? "selected" : ""}>Local preview (${counts.local})</option>
         </select>
@@ -4802,8 +4823,8 @@ app.get("/builds", async (c) => {
         }
       }
       async function deleteHostedBuild(id) {
-        var ok = await rdsConfirm('Delete the hosted Zo service for build "' + id + '"? This frees the Zo service slot. Project files remain, and the build can be redeployed later.', {
-          title: 'Delete Zo service?', danger: true, okLabel: 'Delete service'
+        var ok = await rdsConfirm('Take build "' + id + '" offline? This stops its hosted service and frees the slot. Project files remain, and the build can be published again later.', {
+          title: 'Take site offline?', danger: true, okLabel: 'Take offline'
         });
         if (!ok) return;
         var res = await fetch('/b/' + encodeURIComponent(id) + '/service/deregister', {
@@ -4812,7 +4833,7 @@ app.get("/builds", async (c) => {
         });
         var text = await res.text();
         if (res.ok) {
-          rdsToast('Zo service deleted for ' + id + '.', 'info');
+          rdsToast('Took ' + id + ' offline.', 'info');
           setTimeout(function(){ location.reload(); }, 700);
         } else {
           rdsToast('Delete failed: ' + res.status + ' ' + text.slice(0, 160), 'error');
@@ -5127,10 +5148,10 @@ app.get("/new", (c) => {
             <h2 class="font-h2 text-h2 text-on-surface">Launch target</h2>
             <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
             <label class="block">
-              <span class="block font-ribbon text-ribbon text-on-surface-variant uppercase tracking-wide mb-1">Deploy</span>
+              <span class="block font-ribbon text-ribbon text-on-surface-variant uppercase tracking-wide mb-1">When it passes</span>
               <select name="deploy_target" class="w-full bg-[#101412] border border-outline-variant rounded h-9 px-2 text-on-surface font-code text-[12.5px] focus:border-primary-container focus:ring-0 focus:outline-none">
-                <option value="zo">zo</option>
-                <option value="none">none</option>
+                <option value="host">Publish ${DEFAULT_DEPLOY_TARGET === "vps" ? "on this server" : "on Zo"}</option>
+                <option value="none">Keep local only</option>
               </select>
             </label>
           </div>
@@ -5285,7 +5306,7 @@ app.post("/new", async (c) => {
   const mode    = body.mode === "brown" ? "brown" : "green";
   const trigger = (body.trigger || "").trim();
   let appDest   = (body.app_dest || "").trim();
-  const deploy  = body.deploy_target === "none" ? "none" : "zo";
+  const deploy  = body.deploy_target === "none" ? "none" : DEFAULT_DEPLOY_TARGET;
   const repo    = (body.repo || "").trim();
   const prd     = (body.prd || "").trim();
   const branch  = (body.branch || "").trim();
@@ -5517,25 +5538,25 @@ app.get("/b/:id", async (c) => {
     ? `<div id="deploy-banner" class="rds-deploy-banner bg-primary-container/10 border border-primary-container/40 rounded-DEFAULT p-3 flex items-center gap-3 flex-wrap">
          ${icon("cloud_done", 18, "text-primary-container shrink-0")}
          <div class="flex-1 min-w-[220px] font-body text-body">
-           <div class="font-bold text-primary-container mb-0.5">Live on Zo</div>
+           <div class="font-bold text-primary-container mb-0.5">Live</div>
            <div class="text-on-surface-variant break-words">Hosted service URL: <a id="deploy-url-link" href="${escapeHtml(serviceInfo?.url || row.preview || "")}" target="_blank" class="font-code text-code text-primary-container hover:underline break-all">${escapeHtml(serviceInfo?.url || row.preview || "")}</a></div>
          </div>
          <div class="rds-deploy-actions flex gap-2 shrink-0">
            <a href="${escapeHtml(serviceInfo?.url || row.preview || "")}" target="_blank" class="px-3 py-1.5 bg-primary-container hover:bg-surface-tint text-on-primary-container rounded-DEFAULT font-ribbon text-ribbon font-bold transition-colors flex items-center gap-1">${icon("open_in_new", 14)}<span>Open</span></a>
            <button type="button" onclick="navigator.clipboard.writeText(${jsArg(serviceInfo?.url || row.preview || "")}).then(function(){rdsToast('URL copied.','info');})" class="px-3 py-1.5 border border-outline-variant bg-surface hover:bg-surface-bright text-on-surface rounded-DEFAULT font-ribbon text-ribbon transition-colors flex items-center gap-1">${icon("content_copy", 14)}<span>Copy</span></button>
-           ${serviceInfo?.service_id ? `<button type="button" onclick="deregisterService()" class="js-delete-service-action px-3 py-1.5 border border-error/40 bg-error/10 hover:bg-error/20 text-error rounded-DEFAULT font-ribbon text-ribbon transition-colors flex items-center gap-1">${icon("delete", 14)}<span>Delete Zo service</span></button>` : ""}
+           ${serviceInfo?.service_id ? `<button type="button" onclick="deregisterService()" class="js-delete-service-action px-3 py-1.5 border border-error/40 bg-error/10 hover:bg-error/20 text-error rounded-DEFAULT font-ribbon text-ribbon transition-colors flex items-center gap-1">${icon("delete", 14)}<span>Take offline</span></button>` : ""}
          </div>
        </div>`
     : row.hasZoService
       ? `<div id="deploy-banner" class="rds-deploy-banner bg-tertiary-container/10 border border-tertiary-container/40 rounded-DEFAULT p-3 flex items-center gap-3 flex-wrap">
            ${icon("cloud_sync", 18, "text-tertiary-container shrink-0")}
            <div class="flex-1 min-w-[220px] font-body text-body">
-             <div class="font-bold text-tertiary-container mb-0.5">Zo service recorded; verify status</div>
+             <div class="font-bold text-tertiary-container mb-0.5">Hosted service recorded; verify status</div>
              <div class="text-on-surface-variant break-words">RDS has service <code class="font-code text-code break-all">${escapeHtml(serviceInfo?.service_id || "unknown")}</code>, but it is not marked live. URL: <a id="deploy-url-link" href="${escapeHtml(serviceInfo?.url || row.preview || "")}" target="_blank" class="font-code text-code text-tertiary-container hover:underline break-all">${escapeHtml(serviceInfo?.url || row.preview || "")}</a></div>
            </div>
            <div class="rds-deploy-actions flex gap-2 shrink-0">
-             <button type="button" onclick="deploy('zo')" class="px-3 py-1.5 bg-tertiary-container hover:bg-tertiary-container/80 text-on-tertiary-container rounded-DEFAULT font-ribbon text-ribbon font-bold transition-colors flex items-center gap-1">${icon("sync", 14)}<span>Redeploy</span></button>
-             ${serviceInfo?.service_id ? `<button type="button" onclick="deregisterService()" class="js-delete-service-action px-3 py-1.5 border border-error/40 bg-error/10 hover:bg-error/20 text-error rounded-DEFAULT font-ribbon text-ribbon transition-colors flex items-center gap-1">${icon("delete", 14)}<span>Delete Zo service</span></button>` : ""}
+             <button type="button" onclick="deploy('host')" class="px-3 py-1.5 bg-tertiary-container hover:bg-tertiary-container/80 text-on-tertiary-container rounded-DEFAULT font-ribbon text-ribbon font-bold transition-colors flex items-center gap-1">${icon("sync", 14)}<span>Redeploy</span></button>
+             ${serviceInfo?.service_id ? `<button type="button" onclick="deregisterService()" class="js-delete-service-action px-3 py-1.5 border border-error/40 bg-error/10 hover:bg-error/20 text-error rounded-DEFAULT font-ribbon text-ribbon transition-colors flex items-center gap-1">${icon("delete", 14)}<span>Take offline</span></button>` : ""}
            </div>
          </div>`
     : previewIsLocalOnly
@@ -5543,11 +5564,11 @@ app.get("/b/:id", async (c) => {
            ${icon(row.localPreviewRunning ? "computer" : "power_settings_new", 18, `${row.localPreviewRunning ? "text-on-surface-variant" : "text-error"} shrink-0`)}
            <div class="flex-1 min-w-[220px] font-body text-body">
              <div class="font-bold ${row.localPreviewRunning ? "text-on-surface" : "text-error"} mb-0.5">${row.localPreviewRunning ? "Local preview only" : "Local preview stopped"}</div>
-             <div class="text-on-surface-variant break-words">${row.localPreviewRunning ? `Running locally at <code class="font-code text-code break-all">${escapeHtml(row.preview || "")}</code>. This is not hosted on Zo and should not consume a service slot.` : `The old local preview URL is no longer active. RDS will not offer an Open button until the local process is running again or the build is redeployed to Zo.`}</div>
+             <div class="text-on-surface-variant break-words">${row.localPreviewRunning ? `Running locally at <code class="font-code text-code break-all">${escapeHtml(row.preview || "")}</code>. It is not publicly hosted and does not use a hosting slot.` : `The old local preview URL is no longer active. RDS will not offer an Open button until the local process is running again or the build is published again.`}</div>
            </div>
            <div class="rds-deploy-actions flex gap-2 shrink-0">
              ${row.localPreviewRunning ? `<a href="${escapeHtml(row.preview || "")}" target="_blank" class="px-3 py-1.5 border border-outline-variant bg-surface hover:bg-surface-bright text-on-surface rounded-DEFAULT font-ribbon text-ribbon transition-colors flex items-center gap-1">${icon("open_in_new", 14)}<span>Open local</span></a><button type="button" onclick="deploy('teardown')" class="px-3 py-1.5 border border-outline-variant bg-surface hover:bg-surface-bright text-on-surface rounded-DEFAULT font-ribbon text-ribbon transition-colors flex items-center gap-1">${icon("power_settings_new", 14)}<span>Stop local preview</span></button>` : `<button type="button" disabled class="px-3 py-1.5 border border-outline-variant bg-surface text-on-surface-variant rounded-DEFAULT font-ribbon text-ribbon opacity-50 cursor-not-allowed flex items-center gap-1">${icon("open_in_new_off", 14)}<span>Preview stopped</span></button>`}
-             <button type="button" onclick="deploy('zo')" class="px-3 py-1.5 bg-primary-container hover:bg-surface-tint text-on-primary-container rounded-DEFAULT font-ribbon text-ribbon font-bold transition-colors flex items-center gap-1">${icon("rocket_launch", 14)}<span>Host on Zo</span></button>
+             <button type="button" onclick="deploy('host')" class="px-3 py-1.5 bg-primary-container hover:bg-surface-tint text-on-primary-container rounded-DEFAULT font-ribbon text-ribbon font-bold transition-colors flex items-center gap-1">${icon("rocket_launch", 14)}<span>Publish</span></button>
            </div>
          </div>`
     : pendingPreview
@@ -5558,7 +5579,7 @@ app.get("/b/:id", async (c) => {
              <div class="text-on-surface-variant break-words">RDS finished local deploy, but the public service registration has not completed yet. Sentinel: <code class="font-code text-code break-all">${escapeHtml(row.preview || "")}</code></div>
            </div>
            <div class="rds-deploy-actions flex gap-2 shrink-0">
-             <button type="button" onclick="deploy('zo')" class="px-3 py-1.5 bg-tertiary-container hover:bg-tertiary-container/80 text-on-tertiary-container rounded-DEFAULT font-ribbon text-ribbon font-bold transition-colors flex items-center gap-1">${icon("sync", 14)}<span>Retry deploy</span></button>
+             <button type="button" onclick="deploy('host')" class="px-3 py-1.5 bg-tertiary-container hover:bg-tertiary-container/80 text-on-tertiary-container rounded-DEFAULT font-ribbon text-ribbon font-bold transition-colors flex items-center gap-1">${icon("sync", 14)}<span>Retry deploy</span></button>
            </div>
          </div>`
     : (row.status !== "failed" && row.reviewStatus !== "rejected")
@@ -6047,7 +6068,7 @@ app.get("/b/:id", async (c) => {
                 : row.preview
                   ? `<div class="bg-error/10 border border-error/30 rounded-DEFAULT p-3 text-on-surface-variant font-body text-body">
                        <div class="font-bold text-error mb-1">Preview is stopped.</div>
-                       <div class="break-words">Recorded URL <code class="font-code text-code break-all">${escapeHtml(row.preview || "")}</code> is not clickable because RDS cannot find a running local process or active Zo service for this build.</div>
+                       <div class="break-words">Recorded URL <code class="font-code text-code break-all">${escapeHtml(row.preview || "")}</code> is not clickable because RDS cannot find a running local process or an active hosted service for this build.</div>
                      </div>`
               : `<p class="text-on-surface-variant font-body text-body italic">No preview URL on this build yet. The deploy stage publishes one to <code class="font-code text-code">state.json.preview_url</code>.</p>`}
           </section>
@@ -7220,7 +7241,7 @@ app.post("/b/:id/deploy", async (c) => {
   appendAudit({ route: "POST /b/:id/deploy", build_id: id, outcome: "ok", ip: callerIp(c), ua: callerUa(c) });
 
   const body = (await c.req.json().catch(() => ({}))) as { target?: string; app_dir?: string };
-  const target = body.target ?? "zo";
+  const target = resolveDeployTarget(body.target);
   if (!ALLOWED_DEPLOY_TARGETS.has(target)) {
     return c.text(`target must be one of ${[...ALLOWED_DEPLOY_TARGETS].join(", ")}`, 400);
   }
@@ -7261,15 +7282,16 @@ app.post("/b/:id/service/deregister", async (c) => {
   const dir = join(BUILDS_DIR, id);
   if (!existsSync(dir)) return c.text("not found", 404);
   const info = readServiceInfo(id);
-  if (!info?.service_id) return c.json({ ok: false, error: "No recorded Zo service for this build." }, 409);
+  if (!info?.service_id) return c.json({ ok: false, error: "No hosted service is recorded for this build." }, 409);
   if (info.status === "deregistered") {
     appendAudit({ route: "POST /b/:id/service/deregister", build_id: id, outcome: "ok", ip: callerIp(c), ua: callerUa(c), note: `service_id=${info.service_id} already_deregistered` });
     return c.json({ ok: true, service_id: info.service_id, status: "already_deregistered" });
   }
 
-  const cmd = join(RDS_ROOT, "bin", "rds-zo-deregister");
-  if (!existsSync(cmd)) return c.text("bin/rds-zo-deregister missing", 500);
-  const child = spawn(cmd, [`--service-id=${info.service_id}`, `--build-id=${id}`], { cwd: RDS_ROOT, stdio: ["ignore", "pipe", "pipe"] });
+  const cmd = join(RDS_ROOT, "bin", info.provider === "vps" ? "rds-vps-deregister" : "rds-zo-deregister");
+  if (!existsSync(cmd)) return c.text(`bin/${basename(cmd)} missing`, 500);
+  const deregArgs = info.provider === "vps" ? [`--build-id=${id}`] : [`--service-id=${info.service_id}`, `--build-id=${id}`];
+  const child = spawn(cmd, deregArgs, { cwd: RDS_ROOT, stdio: ["ignore", "pipe", "pipe"] });
   let stdout = "", stderr = "";
   child.stdout.on("data", (d) => (stdout += d.toString()));
   child.stderr.on("data", (d) => (stderr += d.toString()));
@@ -7461,10 +7483,10 @@ app.post("/chat/sessions/:id/actions", async (c) => {
     : turn.action.kind === "qa"
       ? "Started Playwright QA. Watch the Playwright tab and event stream for the result."
       : turn.action.kind === "redeploy"
-        ? "Started Zo redeploy. Watch the event stream and preview URL for the result."
+        ? "Started redeploy. Watch the event stream and preview URL for the result."
         : turn.action.kind === "approve"
           ? "Started approval. Watch review status for the result."
-          : "Started Zo service deletion. The preview URL will clear only after deletion is verified.";
+          : "Started taking the site offline. The preview URL clears once that is verified.";
   appendChatSystemTurn(s.id, `${followup}${result.action_run ? `\nAction run: ${result.action_run}` : ""}${result.hint ? `\n${result.hint}` : ""}`);
   return c.json(result);
 });
@@ -7721,7 +7743,7 @@ app.post("/upload-prd", async (c) => {
   if (!appDest.startsWith("/")) {
     return c.json({ ok: false, error: "app_dest must be an absolute path", path }, 400);
   }
-  const deploy = body.deploy_target === "none" ? "none" : "zo";
+  const deploy = body.deploy_target === "none" ? "none" : DEFAULT_DEPLOY_TARGET;
   const stack = (body.stack || "rails").replace(/[^a-z0-9_-]/gi, "") || "rails";
   if (!readyStackIds().has(stack)) return c.json({ ok: false, error: `stack '${stack}' is not end-to-end enabled`, path }, 400);
   const settings = readSettings();
@@ -7765,6 +7787,7 @@ app.get("/docs", (c) => {
   ];
   const docSections = [
     ["Docs index", "docs/README.md", "Map of all RDS documentation."],
+    ["Running on a VPS", "docs/RUNNING_ON_A_VPS.md", "Your own server: DNS, Caddy, systemd, the dashboard service, and how builds get published."],
     ["Running on Zo", "docs/RUNNING_ON_ZO.md", "Host model plus full setup checklist: environment, Postgres, smoke build, dashboard service, updating."],
     ["Architecture", "docs/ARCHITECTURE.md", "Pipeline shape, dashboard/service model, runtime data layout, state model, and ownership boundaries."],
     ["Autonomy", "docs/AUTONOMY.md", "Goal Mode evidence-driven repair loop and operator-controlled Agent Sessions."],
@@ -8607,7 +8630,7 @@ app.get("/audit", (c) => {
       [/^POST \/b\/:id\/playwright\/run/, "Ran QA crawl"],
       [/^POST \/b\/:id\/refresh-cost/, "Refreshed cost"],
       [/^POST \/b\/:id\/upload-prd/, "Uploaded PRD"],
-      [/^POST \/b\/:id\/service\/deregister/, "Deleted Zo service"],
+      [/^POST \/b\/:id\/service\/deregister/, "Took site offline"],
       [/^POST \/builds\/refresh/, "Refreshed build index"],
       [/^POST \/watchdog/, "Toggled watchdog"],
       [/^POST \/settings/, "Saved settings"],
@@ -8930,18 +8953,18 @@ function tagPill(text: string, variant: "default" | "live" | "offline" = "defaul
 }
 
 function hostingPill(b: BuildRow, opts: { quietWhenUnhosted?: boolean } = {}): string {
-  if (b.liveOnZo) return tagPill("Zo live", "live");
-  if (b.hasZoService) return tagPill("Zo check");
-  if (b.serviceStatus === "deregistered") return tagPill("Zo offline", "offline");
+  if (b.liveOnZo) return tagPill("Live", "live");
+  if (b.hasZoService) return tagPill("Unverified");
+  if (b.serviceStatus === "deregistered") return tagPill("Offline", "offline");
   if (b.localPreviewRunning) return tagPill("local running");
   // Absence is the normal case; lists say nothing rather than repeat it.
   return opts.quietWhenUnhosted ? "" : tagPill("not hosted");
 }
 
 function hostingLabel(b: BuildRow): string {
-  if (b.liveOnZo) return "Live on Zo";
-  if (b.hasZoService) return "Zo service recorded; verify status";
-  if (b.serviceStatus === "deregistered") return "Zo service deleted";
+  if (b.liveOnZo) return "Live";
+  if (b.hasZoService) return "Hosted service recorded; verify status";
+  if (b.serviceStatus === "deregistered") return "Taken offline";
   if (b.localPreviewRunning) return "Local preview running only";
   return "Not hosted";
 }
@@ -9162,7 +9185,7 @@ function sidenav(active: NavKey): string {
     const badge = it.key === "chat"
       ? `<span id="rds-chat-nav-badge" class="hidden ml-auto inline-flex items-center justify-center min-w-[1.25rem] h-5 px-1.5 rounded-full bg-error text-on-error font-ribbon text-[10px] font-bold"></span>`
       : it.key === "builds" && hostedCount > 0
-        ? `<span class="ml-auto inline-flex items-center justify-center min-w-[1.25rem] h-5 px-1.5 rounded-full bg-primary-container/15 text-primary-container border border-primary-container/30 font-ribbon text-[10px] font-bold" title="${hostedCount} recorded Zo service${hostedCount === 1 ? "" : "s"}">${hostedCount}</span>`
+        ? `<span class="ml-auto inline-flex items-center justify-center min-w-[1.25rem] h-5 px-1.5 rounded-full bg-primary-container/15 text-primary-container border border-primary-container/30 font-ribbon text-[10px] font-bold" title="${hostedCount} hosted service${hostedCount === 1 ? "" : "s"}">${hostedCount}</span>`
       : "";
     return `<a href="${it.href}" class="rds-nav-item ${cls} px-3 py-2 flex items-center gap-3 font-ribbon text-ribbon transition-colors">
       ${icon(it.icon, 18)}<span>${it.label}</span>${badge}
@@ -10025,7 +10048,7 @@ function renderBuildCommandCenter(opts: {
     : "";
   const livePanel = canOpenPreview
     ? `<div class="rds-command-live">
-        <div class="rds-command-label">${row.hasZoService ? "Live on Zo" : "Preview"}</div>
+        <div class="rds-command-label">${row.hasZoService ? "Live" : "Preview"}</div>
         <div class="rds-command-live-row">
           ${icon(row.hasZoService ? "cloud_done" : "computer", 16)}
           <a href="${escapeHtml(previewUrl)}" target="_blank" title="${escapeHtml(previewUrl)}">${escapeHtml(previewUrl)}</a>
@@ -11970,12 +11993,12 @@ function detailScript(initialRunning: boolean): string {
     }
     async function deploy(target) {
       var msg = target === 'teardown'
-        ? 'Stop the local preview process for build "' + id + '"? This does not delete any Zo-hosted service. For a hosted build, use Delete Zo service instead.'
-        : 'Re-run rds-deploy --target=' + target + ' for build "' + id + '"?';
+        ? 'Stop the local preview process for build "' + id + '"? This does not stop a hosted service. For a hosted build, use Take offline instead.'
+        : 'Publish build "' + id + '" again? RDS redeploys the current app and checks the public URL before marking it live.';
       var ok = await rdsConfirm(msg, {
-        title: target === 'teardown' ? 'Stop local preview?' : 'Redeploy?',
+        title: target === 'teardown' ? 'Stop local preview?' : 'Publish again?',
         danger: target === 'teardown',
-        okLabel: target === 'teardown' ? 'Stop local preview' : 'Redeploy'
+        okLabel: target === 'teardown' ? 'Stop local preview' : 'Publish'
       });
       if (!ok) return;
       var res = await fetch('/b/' + encodeURIComponent(id) + '/deploy', {
@@ -12001,26 +12024,26 @@ function detailScript(initialRunning: boolean): string {
         btn.disabled = busy;
         btn.setAttribute('aria-busy', busy ? 'true' : 'false');
         btn.innerHTML = busy
-          ? '<span class="flex items-center gap-1"><span class="material-symbols-outlined animate-spin" style="font-size:14px;animation-duration:1.2s">progress_activity</span><span>Deleting Zo service…</span></span>'
-          : '<span class="flex items-center gap-1"><span class="material-symbols-outlined" style="font-size:14px">delete</span><span>Delete Zo service</span></span>';
+          ? '<span class="flex items-center gap-1"><span class="material-symbols-outlined animate-spin" style="font-size:14px;animation-duration:1.2s">progress_activity</span><span>Taking offline…</span></span>'
+          : '<span class="flex items-center gap-1"><span class="material-symbols-outlined" style="font-size:14px">delete</span><span>Take offline</span></span>';
       });
       document.querySelectorAll('[onclick^="deploy("]').forEach(function (btn) {
         if (busy) btn.setAttribute('disabled', 'disabled');
         else btn.removeAttribute('disabled');
       });
       var out = document.getElementById('cmd-result');
-      if (out && busy) out.textContent = 'Deleting Zo service and verifying it is absent from the Zo service registry…';
+      if (out && busy) out.textContent = 'Taking the site offline and verifying it is gone…';
     }
     async function deregisterService() {
       if (deregisterInFlight) return;
-      var ok = await rdsConfirm('Delete the hosted Zo service for build "' + id + '"? This removes public hosting and clears the preview URL in RDS. Project files stay in Projects/, and Redeploy can register hosting again.', {
-        title: 'Delete Zo service?',
+      var ok = await rdsConfirm('Take build "' + id + '" offline? This removes public hosting and clears the preview URL in RDS. Project files stay in Projects/, and Redeploy can publish it again.', {
+        title: 'Take site offline?',
         danger: true,
         okLabel: 'Delete service'
       });
       if (!ok) return;
       setDeregisterBusy(true);
-      rdsToast('Deleting Zo service…', 'info');
+      rdsToast('Taking offline…', 'info');
       try {
         var res = await fetch('/b/' + encodeURIComponent(id) + '/service/deregister', {
           method: 'POST',
@@ -12028,12 +12051,12 @@ function detailScript(initialRunning: boolean): string {
         });
         var text = await res.text();
         document.getElementById('cmd-result').textContent = res.status + ' ' + text;
-        if (res.ok) { rdsToast('Zo service deleted. Refreshing state…', 'info'); setTimeout(function(){ location.reload(); }, 700); }
-        else { setDeregisterBusy(false); rdsToast('Delete Zo service failed: ' + res.status, 'error'); }
+        if (res.ok) { rdsToast('Site taken offline. Refreshing state…', 'info'); setTimeout(function(){ location.reload(); }, 700); }
+        else { setDeregisterBusy(false); rdsToast('Take offline failed: ' + res.status, 'error'); }
       } catch (e) {
         setDeregisterBusy(false);
-        document.getElementById('cmd-result').textContent = 'Delete Zo service failed: ' + (e && e.message ? e.message : e);
-        rdsToast('Delete Zo service failed.', 'error');
+        document.getElementById('cmd-result').textContent = 'Take offline failed: ' + (e && e.message ? e.message : e);
+        rdsToast('Take offline failed.', 'error');
       }
     }
     async function loadStageLog(name) {
@@ -12073,7 +12096,7 @@ function detailScript(initialRunning: boolean): string {
     }
     async function reject() {
       var understood = await rdsConfirm(
-        'Reject marks this build as not approved and records your reason. It does not delete the generated app, the live Zo service, logs, evidence, or goal state. You can still continue RDS Goal or run an iteration afterward.',
+        'Reject marks this build as not approved and records your reason. It does not delete the generated app, the live hosted service, logs, evidence, or goal state. You can still continue RDS Goal or run an iteration afterward.',
         { title: 'What rejection does', okLabel: 'Continue', warn: true }
       );
       if (!understood) return;

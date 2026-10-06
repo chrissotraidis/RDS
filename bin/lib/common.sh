@@ -31,15 +31,30 @@ case ":$PATH:" in
   *) export PATH="/bin:$PATH" ;;
 esac
 
-# Load defaults then .env (if present). .env wins.
+# Load defaults, then .env (if present). Precedence: .env > process
+# environment > config/defaults.env. Defaults only fill variables that are not
+# already set, so values passed in by the dashboard or a service manager are
+# not silently reset.
 if [[ -f "$RDS_ROOT/config/defaults.env" ]]; then
-  # shellcheck disable=SC1091
-  set -a; source "$RDS_ROOT/config/defaults.env"; set +a
+  while IFS= read -r _rds_line || [[ -n "$_rds_line" ]]; do
+    [[ "$_rds_line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || continue
+    _rds_key="${_rds_line%%=*}"
+    [[ -n "${!_rds_key+x}" ]] && continue
+    export "$_rds_line"
+  done < "$RDS_ROOT/config/defaults.env"
+  unset _rds_line _rds_key
 fi
 if [[ -f "$RDS_ROOT/.env" ]]; then
   # shellcheck disable=SC1091
   set -a; source "$RDS_ROOT/.env"; set +a
 fi
+
+# Where finished builds are published. An explicit RDS_DEFAULT_DEPLOY_TARGET
+# wins; otherwise a configured public domain means "host on this VPS".
+if [[ -z "${RDS_DEFAULT_DEPLOY_TARGET:-}" ]]; then
+  if [[ -n "${RDS_PUBLIC_DOMAIN:-}" ]]; then RDS_DEFAULT_DEPLOY_TARGET=vps; else RDS_DEFAULT_DEPLOY_TARGET=zo; fi
+fi
+export RDS_DEFAULT_DEPLOY_TARGET
 
 # Runtime data roots. Defaults preserve the historical single-directory
 # checkout, while env overrides let operators keep mutable state outside the

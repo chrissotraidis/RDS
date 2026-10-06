@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# bin/rds-vps-deregister — stop a VPS-hosted RDS build and remove its public site.
+#
+# Usage: bin/rds-vps-deregister --build-id=<id>
+# Reads builds/<id>/service.json written by bin/rds-vps-register. Safe to re-run.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck disable=SC1091
+source "$ROOT/bin/lib/common.sh"
+# shellcheck disable=SC1091
+source "$ROOT/bin/lib/logging.sh"
+
+# systemctl --user needs the user's runtime dir; services and sudo -u do not set it.
+if [[ "$(id -u)" != "0" && -z "${XDG_RUNTIME_DIR:-}" && -d "/run/user/$(id -u)" ]]; then
+  export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+  export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+fi
+
+BUILD_ID="$(parse_flag --build-id "$@" || echo "")"
+[[ -n "$BUILD_ID" ]] || { echo "FATAL: --build-id is required" >&2; exit 1; }
+BUILD_DIR="$RDS_BUILDS_DIR/$BUILD_ID"
+INFO="$BUILD_DIR/service.json"
+[[ -f "$INFO" ]] || { echo '{"ok":true,"status":"already_absent"}'; exit 0; }
+
+field() { jq -r --arg k "$1" '.[$k] // empty' "$INFO"; }
+SERVICE_ID="$(field service_id)"
+SITE_FILE="$(field site_file)"
+
+case "$SERVICE_ID" in
+  systemd:*)
+    unit="${SERVICE_ID#systemd:}"
+    if [[ "$(id -u)" == "0" ]]; then sc=(systemctl); unit_dir=/etc/systemd/system; else sc=(systemctl --user); unit_dir="$HOME/.config/systemd/user"; fi
+    "${sc[@]}" disable --now "$unit.service" >/dev/null 2>&1 || true
+    rm -f "$unit_dir/$unit.service"
+    "${sc[@]}" daemon-reload || true
+    ;;
+  process:*)
+    pid="${SERVICE_ID#process:}"
+    if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+      kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+      for _ in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
+      kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+    fi
+    rm -f "$BUILD_DIR/service.pid"
+    ;;
+esac
+
+if [[ -n "$SITE_FILE" && -f "$SITE_FILE" ]]; then
+  rm -f "$SITE_FILE"
+  if [[ -n "${RDS_CADDY_RELOAD_CMD:-}" ]]; then
+    bash -c "$RDS_CADDY_RELOAD_CMD" || true
+  elif command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet caddy 2>/dev/null; then
+    if [[ "$(id -u)" == "0" ]]; then systemctl reload caddy || true; else sudo -n systemctl reload caddy || true; fi
+  else
+    caddy reload --config "${RDS_CADDYFILE:-/etc/caddy/Caddyfile}" --adapter caddyfile || true
+  fi
+fi
+
+tmp="$(mktemp)"
+jq '.status = "deregistered" | .updated_at = (now | todate)' "$INFO" > "$tmp" && mv "$tmp" "$INFO"
+printf '\n' > "$BUILD_DIR/preview-url.txt"
+log "vps service removed for $BUILD_ID ($SERVICE_ID)"
+printf '{"ok":true,"service_id":"%s","status":"deleted"}\n' "$SERVICE_ID"

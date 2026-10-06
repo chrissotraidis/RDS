@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# bin/rds-vps-setup — one-time server setup so RDS can publish builds on this VPS.
+#
+# Run as root on Ubuntu/Debian after cloning RDS and filling in .env:
+#
+#   sudo ./bin/rds-vps-setup --user=rds            # do it
+#   sudo ./bin/rds-vps-setup --user=rds --dry-run  # show what would change
+#
+# What it does (idempotent):
+#   1. Checks for Caddy, systemd, Bun, and a coding-agent CLI.
+#   2. Creates /etc/caddy/rds.d (owned by the RDS user) and adds
+#      "import /etc/caddy/rds.d/*.caddy" to /etc/caddy/Caddyfile.
+#   3. Publishes the dashboard at https://$RDS_DASHBOARD_HOST
+#      (default rds.$RDS_PUBLIC_DOMAIN) -> 127.0.0.1:$PORT (default 4000).
+#   4. Installs /etc/systemd/system/rds-dashboard.service running
+#      bin/rds-service-entrypoint as the RDS user, and starts it.
+#   5. Lets the RDS user reload Caddy (sudoers rule) and keep its per-build
+#      systemd user services running after logout (loginctl enable-linger).
+#
+# Prerequisites: DNS A records for *.$RDS_PUBLIC_DOMAIN and the dashboard host
+# pointing at this server, ports 80 and 443 open, and Caddy installed
+# (https://caddyserver.com/docs/install#debian-ubuntu-raspbian).
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+RDS_USER=""
+DRY_RUN=0
+for arg in "$@"; do
+  case "$arg" in
+    --user=*) RDS_USER="${arg#*=}" ;;
+    --dry-run) DRY_RUN=1 ;;
+    -h|--help) sed -n '2,24p' "$0"; exit 0 ;;
+    *) echo "FATAL: unknown argument: $arg" >&2; exit 2 ;;
+  esac
+done
+
+if [[ -f "$ROOT/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "$ROOT/.env"
+  set +a
+fi
+
+say()  { printf '  %s\n' "$*"; }
+step() { printf '\n== %s\n' "$*"; }
+run()  { if [[ "$DRY_RUN" == "1" ]]; then printf '  [dry-run] %s\n' "$*"; else "$@"; fi; }
+write_file() { # write_file <path> <mode> <content>
+  if [[ "$DRY_RUN" == "1" ]]; then
+    printf '  [dry-run] write %s:\n' "$1"; printf '%s\n' "$3" | sed 's/^/      | /'
+  else
+    printf '%s\n' "$3" > "$1"; chmod "$2" "$1"
+  fi
+}
+
+RDS_USER="${RDS_USER:-${SUDO_USER:-$(stat -c %U "$ROOT" 2>/dev/null || id -un)}}"
+DOMAIN="${RDS_PUBLIC_DOMAIN:-}"
+DASH_HOST="${RDS_DASHBOARD_HOST:-${DOMAIN:+rds.$DOMAIN}}"
+DASH_PORT="${PORT:-4000}"
+SITES_DIR="${RDS_CADDY_SITES_DIR:-/etc/caddy/rds.d}"
+CADDYFILE="${RDS_CADDYFILE:-/etc/caddy/Caddyfile}"
+
+step "Checks"
+fail=0
+[[ "$(id -u)" == "0" || "$DRY_RUN" == "1" ]] || { say "run as root (sudo)"; fail=1; }
+[[ -n "$DOMAIN" ]] && say "public domain: *.$DOMAIN" || { say "MISSING: RDS_PUBLIC_DOMAIN in .env (for example apps.example.com)"; fail=1; }
+[[ -n "$DASH_HOST" ]] && say "dashboard host: $DASH_HOST"
+[[ -n "${RDS_DASHBOARD_PASSWORD:-}" && -n "${RDS_DASHBOARD_TOKEN:-}" ]] && say "dashboard credentials: set" || { say "MISSING: RDS_DASHBOARD_PASSWORD and RDS_DASHBOARD_TOKEN in .env (the dashboard refuses remote access without them)"; fail=1; }
+id "$RDS_USER" >/dev/null 2>&1 && say "RDS user: $RDS_USER" || { say "MISSING: user $RDS_USER (create it with: adduser --disabled-password $RDS_USER)"; fail=1; }
+command -v caddy >/dev/null 2>&1 && say "caddy: $(caddy version 2>/dev/null | cut -d' ' -f1)" || { say "MISSING: caddy (https://caddyserver.com/docs/install#debian-ubuntu-raspbian)"; fail=1; }
+[[ -d /run/systemd/system ]] && say "systemd: present" || { say "MISSING: systemd (RDS keeps apps running with systemd on a VPS)"; fail=1; }
+BUN_PATH="$(sudo -u "$RDS_USER" -H bash -lc 'command -v bun' 2>/dev/null || true)"
+[[ -z "$BUN_PATH" && -x "/home/$RDS_USER/.bun/bin/bun" ]] && BUN_PATH="/home/$RDS_USER/.bun/bin/bun"
+[[ -n "$BUN_PATH" ]] && say "bun: $BUN_PATH" || { say "MISSING: bun for $RDS_USER (curl -fsSL https://bun.sh/install | bash)"; fail=1; }
+if sudo -u "$RDS_USER" -H bash -lc 'command -v claude || command -v codex' >/dev/null 2>&1; then say "coding agent: found"; else say "MISSING: claude or codex for $RDS_USER (install and sign in as that user)"; fail=1; fi
+if [[ "$fail" == "1" && "$DRY_RUN" == "0" ]]; then
+  echo; echo "Fix the items above, then re-run." >&2; exit 1
+fi
+
+step "Caddy"
+run mkdir -p "$SITES_DIR"
+run chown "$RDS_USER" "$SITES_DIR"
+if ! grep -qsF "import $SITES_DIR/*.caddy" "$CADDYFILE"; then
+  if [[ "$DRY_RUN" == "1" ]]; then say "[dry-run] append 'import $SITES_DIR/*.caddy' to $CADDYFILE"
+  else printf '\n# RDS: dashboard and published builds\nimport %s/*.caddy\n' "$SITES_DIR" >> "$CADDYFILE"; fi
+else
+  say "$CADDYFILE already imports $SITES_DIR"
+fi
+write_file "$SITES_DIR/00-dashboard.caddy" 0644 "# RDS dashboard (managed by bin/rds-vps-setup)
+$DASH_HOST {
+	encode gzip
+	reverse_proxy 127.0.0.1:$DASH_PORT
+}"
+run chown "$RDS_USER" "$SITES_DIR/00-dashboard.caddy"
+write_file /etc/sudoers.d/rds-caddy 0440 "$RDS_USER ALL=(root) NOPASSWD: /usr/bin/systemctl reload caddy, /bin/systemctl reload caddy"
+run caddy validate --config "$CADDYFILE" --adapter caddyfile
+run systemctl reload caddy
+
+step "Dashboard service"
+write_file /etc/systemd/system/rds-dashboard.service 0644 "[Unit]
+Description=RDS dashboard and watchdog
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$RDS_USER
+WorkingDirectory=$ROOT
+Environment=BUN_BIN=$BUN_PATH
+Environment=PORT=$DASH_PORT
+ExecStart=$ROOT/bin/rds-service-entrypoint
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target"
+run loginctl enable-linger "$RDS_USER"
+run systemctl daemon-reload
+run systemctl enable --now rds-dashboard.service
+
+step "Done"
+say "Dashboard: https://$DASH_HOST  (sign in as ${RDS_DASHBOARD_USER:-rds} with the password from .env)"
+say "Builds publish to https://<build>.$DOMAIN once they pass QA."
+say "Check status: systemctl status rds-dashboard; ls $SITES_DIR"

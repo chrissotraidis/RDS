@@ -95,11 +95,11 @@ async function main() {
   await check("hub surfaces hosted live builds before stale recent builds", async () => {
     await page!.goto(BASE, { waitUntil: "domcontentloaded" });
     const body = await page!.locator("body").innerText();
-    if (!/zo hosting/i.test(body) || !body.includes("Zo live")) return;
+    if (!/hosting/i.test(body) || !/\bLive\b/.test(body)) return;
     const recentText = await page!.locator("text=Recent Builds").locator("xpath=ancestor::div[contains(@class,'bg-surface-container')]").innerText();
-    if (!recentText.includes("Zo live")) throw new Error("Recent Builds did not include the live hosted build");
+    if (!/\bLive\b/.test(recentText)) throw new Error("Recent Builds did not include the live hosted build");
     const firstRecent = await page!.locator("text=Recent Builds").locator("xpath=ancestor::div[contains(@class,'bg-surface-container')]").locator(`a[href^="/b/"]`).first().innerText();
-    if (!firstRecent.includes("Zo live")) throw new Error(`first recent build is not the live hosted build: ${firstRecent}`);
+    if (!/\bLive\b/.test(firstRecent)) throw new Error(`first recent build is not the live hosted build: ${firstRecent}`);
   });
 
   await check("dashboard token storage can be cleared", async () => {

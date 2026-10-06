@@ -2,10 +2,17 @@
 # bin/rds-deploy — finalizes a build for public preview.
 #
 # Usage:
-#   ./bin/rds-deploy --build-id=<id> --app-dir=<abs-path> [--target=zo|none|teardown]
+#   ./bin/rds-deploy --build-id=<id> --app-dir=<abs-path> [--target=vps|zo|none|teardown]
+#
+# The default target is RDS_DEFAULT_DEPLOY_TARGET when set; otherwise vps when
+# RDS_PUBLIC_DOMAIN is set, otherwise zo.
 #
 # Targets:
-#   zo       (default) — leave the native app server running, register a
+#   vps                — run the app under systemd (or a background process)
+#                        on this server and publish it through Caddy at
+#                        https://<label>.<RDS_PUBLIC_DOMAIN>. See
+#                        bin/rds-vps-register and docs/RUNNING_ON_A_VPS.md.
+#   zo                 — leave the native app server running, register a
 #                        durable public Zo HTTP service, and write the real
 #                        *.zocomputer.io URL to preview-url.txt. Set
 #                        RDS_ZO_AUTO_REGISTER=0 to write the legacy pending
@@ -15,8 +22,7 @@
 #   teardown           — Stop the running app server (via tmp/pids/server.pid)
 #                        and write an empty preview URL.
 #
-# fly is no longer supported — RDS runs on Zo and only deploys to Zo.
-# Docker is not available on Zo (gVisor sandbox); RDS runs Rails natively.
+# Apps run natively (no Docker) on both targets.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -26,7 +32,13 @@ source "$ROOT/bin/lib/common.sh"
 source "$ROOT/bin/lib/logging.sh"
 
 BUILD_ID="$(parse_flag --build-id "$@")"
-TARGET="$(parse_flag --target "$@" || echo "${RDS_DEFAULT_DEPLOY_TARGET:-zo}")"
+default_deploy_target() {
+  if [[ -n "${RDS_DEFAULT_DEPLOY_TARGET:-}" ]]; then echo "$RDS_DEFAULT_DEPLOY_TARGET"
+  elif [[ -n "${RDS_PUBLIC_DOMAIN:-}" ]]; then echo vps
+  else echo zo
+  fi
+}
+TARGET="$(parse_flag --target "$@" || default_deploy_target)"
 APP_DIR="$(parse_flag --app-dir "$@" || echo "")"
 
 [[ -n "$BUILD_ID" ]] || { echo "FATAL: --build-id is required" >&2; exit 1; }
@@ -138,7 +150,7 @@ stop_local_preview() {
   local pid
   pid="$(cat "$pidfile" 2>/dev/null || true)"
   if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
-    log "stopping local preview pid=$pid before durable Zo service bind"
+    log "stopping local preview pid=$pid before durable service bind"
     kill -- "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
     sleep 1
   fi
@@ -387,7 +399,33 @@ print(f"https://{label}-{zo_owner}.zocomputer.io")
 PY
 }
 
+run_with_timeout() {
+  local secs="$1"; shift
+  if command -v timeout >/dev/null 2>&1; then timeout "$secs" "$@"
+  elif command -v gtimeout >/dev/null 2>&1; then gtimeout "$secs" "$@"
+  else "$@"
+  fi
+}
+
 case "$TARGET" in
+  vps)
+    [[ -n "$PORT" ]] || { echo "FATAL: no HOST_PORT in $APP_DIR/.env" >&2; exit 1; }
+    prepare_deploy_snapshot
+    ensure_vite_allows_zo_hosts "$DEPLOY_DIR"
+    stop_local_preview
+    write_deploy_fingerprint "$DEPLOY_DIR"
+    write_runtime_marker "$DEPLOY_DIR"
+    register_cmd="$ROOT/bin/rds-vps-register"
+    [[ -x "$register_cmd" ]] || { echo "FATAL: $register_cmd missing or not executable" >&2; exit 1; }
+    if ! URL="$(run_with_timeout "${RDS_VPS_REGISTER_TIMEOUT_SEC:-420}" "$register_cmd" --build-id="$BUILD_ID" --app-dir="$DEPLOY_DIR" --port="$PORT" --stack="$STACK")"; then
+      echo "FATAL: VPS hosting failed for $BUILD_ID; see $BUILD_DIR/logs/service.log" >&2
+      exit 1
+    fi
+    SERVED_DIR="$DEPLOY_DIR"
+    log "vps target — serving $URL"
+    wait_for_public_url "$URL"
+    ;;
+
   zo)
     [[ -n "$PORT" ]] || { echo "FATAL: no HOST_PORT in $APP_DIR/.env" >&2; exit 1; }
     prepare_deploy_snapshot
@@ -448,7 +486,7 @@ case "$TARGET" in
     ;;
 
   *)
-    echo "FATAL: unknown --target=$TARGET (expected zo|none|teardown)" >&2
+    echo "FATAL: unknown --target=$TARGET (expected vps|zo|none|teardown)" >&2
     exit 1
     ;;
 esac

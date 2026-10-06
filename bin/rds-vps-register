@@ -1,0 +1,287 @@
+#!/usr/bin/env bash
+# bin/rds-vps-register — host an RDS build on this VPS behind Caddy.
+#
+# The VPS counterpart of bin/rds-zo-register. It keeps the app running under a
+# process supervisor, publishes it at https://<label>.<RDS_PUBLIC_DOMAIN> through
+# a Caddy site file, waits for the app to answer locally, writes service.json,
+# and prints the public URL. bin/rds-deploy --target=vps calls it and then
+# verifies the public URL and deploy fingerprint, exactly as for Zo.
+#
+# Usage:
+#   bin/rds-vps-register --build-id=<id> --app-dir=<abs> --port=<n> [--stack=<id>] [--label=<l>] [--out=<path>]
+#
+# Environment:
+#   RDS_PUBLIC_DOMAIN      required. Wildcard DNS *.<domain> must point at this host.
+#   RDS_PUBLIC_SCHEME      https (default) or http.
+#   RDS_PUBLIC_PORT        optional port suffix for the public URL (testing, non-443 proxies).
+#   RDS_VPS_SUPERVISOR     auto (default) | systemd | process.
+#                          auto = systemd when /run/systemd/system exists, else process.
+#                          process mode does not survive a reboot; use it for local testing.
+#   RDS_VPS_PROXY          caddy (default) | none (you route <label>.<domain> yourself).
+#   RDS_CADDY_SITES_DIR    where site files go (default /etc/caddy/rds.d). Your main
+#                          Caddyfile must contain:  import /etc/caddy/rds.d/*.caddy
+#   RDS_CADDY_RELOAD_CMD   override the reload command (default: systemctl reload caddy
+#                          when Caddy runs under systemd, else caddy reload --config $RDS_CADDYFILE).
+#   RDS_CADDYFILE          main Caddyfile for "caddy reload" (default /etc/caddy/Caddyfile).
+#   RDS_VPS_START_TIMEOUT_SEC  seconds to wait for the app to answer locally (default 180).
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck disable=SC1091
+source "$ROOT/bin/lib/common.sh"
+# shellcheck disable=SC1091
+source "$ROOT/bin/lib/logging.sh"
+
+# stdout carries exactly one line, the public URL (bin/rds-deploy captures it).
+# Everything else, including log lines and systemctl output, goes to stderr.
+exec 3>&1 1>&2
+
+# systemctl --user needs the user's runtime dir; services and sudo -u do not set it.
+if [[ "$(id -u)" != "0" && -z "${XDG_RUNTIME_DIR:-}" && -d "/run/user/$(id -u)" ]]; then
+  export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+  export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+fi
+
+BUILD_ID="$(parse_flag --build-id "$@" || echo "")"
+APP_DIR="$(parse_flag --app-dir "$@" || echo "")"
+PORT="$(parse_flag --port "$@" || echo "")"
+STACK="$(parse_flag --stack "$@" || echo "")"
+LABEL="$(parse_flag --label "$@" || echo "")"
+OUT="$(parse_flag --out "$@" || echo "")"
+
+[[ -n "$BUILD_ID" ]] || { echo "FATAL: --build-id is required" >&2; exit 1; }
+[[ -n "$APP_DIR"  ]] || { echo "FATAL: --app-dir is required" >&2; exit 1; }
+[[ "$PORT" =~ ^[0-9]+$ ]] || { echo "FATAL: --port must be numeric" >&2; exit 1; }
+[[ -d "$APP_DIR"  ]] || { echo "FATAL: app dir not found: $APP_DIR" >&2; exit 1; }
+APP_DIR="$(cd "$APP_DIR" && pwd)"
+
+DOMAIN="$(printf '%s' "${RDS_PUBLIC_DOMAIN:-}" | tr '[:upper:]' '[:lower:]' | sed -E 's#^https?://##; s#/.*$##; s/^\.+//')"
+[[ -n "$DOMAIN" ]] || { echo "FATAL: set RDS_PUBLIC_DOMAIN (for example apps.example.com, with wildcard DNS *.apps.example.com pointing at this server)" >&2; exit 1; }
+SCHEME="${RDS_PUBLIC_SCHEME:-https}"
+[[ "$SCHEME" == "https" || "$SCHEME" == "http" ]] || { echo "FATAL: RDS_PUBLIC_SCHEME must be https or http" >&2; exit 1; }
+PUBLIC_PORT_SUFFIX=""
+[[ -n "${RDS_PUBLIC_PORT:-}" ]] && PUBLIC_PORT_SUFFIX=":${RDS_PUBLIC_PORT}"
+
+BUILD_DIR="$RDS_BUILDS_DIR/$BUILD_ID"
+mkdir -p "$BUILD_DIR/logs"
+if [[ -z "$STACK" ]]; then
+  STACK="$(jq -r '.stack // "rails"' "$BUILD_DIR/state.json" 2>/dev/null || echo rails)"
+fi
+stack_validate "$STACK"
+
+if [[ -z "$LABEL" ]]; then
+  # Build ids end in -YYYYMMDD-HHMMSS; the short hash keeps labels unique.
+  slug="$(derive_slug "$(printf '%s' "$BUILD_ID" | sed -E 's/-[0-9]{8}-[0-9]{6}$//')")"
+  suffix="$(printf '%s' "$BUILD_ID" | (sha1sum 2>/dev/null || shasum) | cut -c1-6)"
+  LABEL="${slug:0:30}-${suffix}"
+fi
+LABEL="$(printf '%s' "$LABEL" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//; s/-+/-/g' | cut -c1-40)"
+[[ -n "$LABEL" ]] || LABEL="rds-build"
+HOST="${LABEL}.${DOMAIN}"
+URL="${SCHEME}://${HOST}${PUBLIC_PORT_SUFFIX}"
+SERVICE_INFO_PATH="${OUT:-$BUILD_DIR/service.json}"
+
+ENTRYPOINT="$(stack_field "$STACK" '.service_entrypoint // empty')"
+[[ -n "$ENTRYPOINT" && "$ENTRYPOINT" != "null" ]] || { echo "FATAL: stack '$STACK' has no service_entrypoint in its manifest" >&2; exit 1; }
+ENTRYPOINT="${ENTRYPOINT//%(ENV_PORT)s/$PORT}"
+
+# --- runtime env: the stack's service_env, adjusted for this host ------------
+ENV_FILE="$BUILD_DIR/service.env"
+python3 - "$(stack_manifest_path "$STACK")" "$ENV_FILE" "$HOST" "$DOMAIN" "$PORT" <<'PY'
+import json, os, sys
+manifest_path, out, host, domain, port = sys.argv[1:]
+env = dict(json.load(open(manifest_path)).get("service_env") or {})
+for key in list(env):
+    if key in ("RDS_RUNTIME", "VITE_RDS_RUNTIME"):
+        env[key] = "vps"
+extra = [h for h in str(env.get("APP_EXTRA_HOSTS", "")).split(",") if h.strip() and "zocomputer.io" not in h]
+extra.append("." + domain)
+env["APP_EXTRA_HOSTS"] = ",".join(extra)
+env["APP_PUBLIC_HOST"] = host
+env["PORT"] = port
+# Database: the Zo manifests connect over TCP as "postgres" with no password,
+# which stock Debian/Ubuntu Postgres rejects. On a VPS, connect the way the
+# build stage does (local socket as the OS user) unless RDS_DB_HOST says otherwise.
+if os.environ.get("RDS_DB_HOST"):
+    env["DB_HOST"] = os.environ["RDS_DB_HOST"]
+    env["DB_USERNAME"] = os.environ.get("RDS_DB_USERNAME", env.get("DB_USERNAME", "postgres"))
+    env["DB_PASSWORD"] = os.environ.get("RDS_DB_PASSWORD", "")
+else:
+    for key in ("DB_HOST", "DB_USERNAME", "DB_PASSWORD"):
+        env.pop(key, None)
+# systemd services start with a minimal PATH; carry the deploying user's PATH
+# plus the usual per-user tool dirs so bun, uv, node, and ruby shims resolve.
+home = os.path.expanduser("~")
+extra_dirs = [f"{home}/.bun/bin", f"{home}/.local/bin", f"{home}/.cargo/bin", "/usr/local/bin"]
+# Drop entries injected by the dashboard's own runtime (bun's temp shim dir and
+# node_modules/.bin), which are not meant for the published app.
+path_parts = [p for p in os.environ.get("PATH", "").split(":")
+              if p and "/node_modules/.bin" not in p and "/bun-node-" not in p]
+for d in extra_dirs:
+    if os.path.isdir(d) and d not in path_parts:
+        path_parts.append(d)
+env["PATH"] = ":".join(path_parts) or "/usr/local/bin:/usr/bin:/bin"
+with open(out, "w") as f:
+    for key, val in env.items():
+        val = str(val).replace("\n", " ")
+        f.write(f"{key}={val}\n")
+PY
+
+RUN_SCRIPT="$BUILD_DIR/service-run.sh"
+{
+  echo '#!/usr/bin/env bash'
+  echo "# Generated by bin/rds-vps-register for build $BUILD_ID. Re-run deploy to regenerate."
+  echo 'set -a'
+  printf '. %q\n' "$ENV_FILE"
+  echo 'set +a'
+  printf 'cd %q\n' "$APP_DIR"
+  printf 'exec %s\n' "$ENTRYPOINT"
+} > "$RUN_SCRIPT"
+chmod +x "$RUN_SCRIPT"
+SERVICE_LOG="$BUILD_DIR/logs/service.log"
+
+# --- supervisor ---------------------------------------------------------------
+SUPERVISOR="${RDS_VPS_SUPERVISOR:-auto}"
+if [[ "$SUPERVISOR" == "auto" ]]; then
+  if [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1; then SUPERVISOR="systemd"; else SUPERVISOR="process"; fi
+fi
+UNIT="rds-app-${LABEL}"
+SERVICE_ID=""
+
+start_systemd() {
+  local unit_dir wanted
+  local -a systemctl_cmd
+  if [[ "$(id -u)" == "0" ]]; then
+    unit_dir="/etc/systemd/system"; systemctl_cmd=(systemctl); wanted="multi-user.target"
+  else
+    unit_dir="$HOME/.config/systemd/user"; systemctl_cmd=(systemctl --user); wanted="default.target"
+    log "systemd user unit: run 'loginctl enable-linger $(id -un)' once so apps keep running after logout"
+  fi
+  mkdir -p "$unit_dir"
+  cat > "$unit_dir/$UNIT.service" <<UNITFILE
+[Unit]
+Description=RDS app $BUILD_ID ($HOST)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=$APP_DIR
+ExecStart=/usr/bin/env bash $RUN_SCRIPT
+Restart=always
+RestartSec=3
+StandardOutput=append:$SERVICE_LOG
+StandardError=append:$SERVICE_LOG
+
+[Install]
+WantedBy=$wanted
+UNITFILE
+  "${systemctl_cmd[@]}" daemon-reload
+  "${systemctl_cmd[@]}" enable "$UNIT.service" >/dev/null 2>&1 || true
+  "${systemctl_cmd[@]}" restart "$UNIT.service"
+  SERVICE_ID="systemd:$UNIT"
+}
+
+stop_process() {
+  local pidfile="$BUILD_DIR/service.pid" pid
+  [[ -f "$pidfile" ]] || return 0
+  pid="$(cat "$pidfile" 2>/dev/null || true)"
+  if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+    kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+    for _ in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
+    kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+  fi
+  rm -f "$pidfile"
+}
+
+start_process() {
+  stop_process
+  # New session so the whole app process group can be stopped later.
+  python3 - "$RUN_SCRIPT" "$SERVICE_LOG" "$BUILD_DIR/service.pid" <<'PY'
+import subprocess, sys
+script, log_path, pid_path = sys.argv[1:]
+log = open(log_path, "ab")
+proc = subprocess.Popen(["/usr/bin/env", "bash", script], stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+open(pid_path, "w").write(f"{proc.pid}\n")
+PY
+  SERVICE_ID="process:$(cat "$BUILD_DIR/service.pid")"
+  log "process supervisor: app started (pid $(cat "$BUILD_DIR/service.pid")); it will not restart after a reboot"
+}
+
+case "$SUPERVISOR" in
+  systemd) start_systemd ;;
+  process) start_process ;;
+  *) echo "FATAL: RDS_VPS_SUPERVISOR must be auto, systemd, or process" >&2; exit 1 ;;
+esac
+
+# --- reverse proxy --------------------------------------------------------------
+PROXY="${RDS_VPS_PROXY:-caddy}"
+SITE_FILE=""
+reload_caddy() {
+  if [[ -n "${RDS_CADDY_RELOAD_CMD:-}" ]]; then
+    bash -c "$RDS_CADDY_RELOAD_CMD"
+  elif command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet caddy 2>/dev/null; then
+    if [[ "$(id -u)" == "0" ]]; then systemctl reload caddy; else sudo -n systemctl reload caddy; fi
+  else
+    caddy reload --config "${RDS_CADDYFILE:-/etc/caddy/Caddyfile}" --adapter caddyfile
+  fi
+}
+if [[ "$PROXY" == "caddy" ]]; then
+  SITES_DIR="${RDS_CADDY_SITES_DIR:-/etc/caddy/rds.d}"
+  mkdir -p "$SITES_DIR"
+  SITE_FILE="$SITES_DIR/$LABEL.caddy"
+  site_addr="$HOST"
+  [[ "$SCHEME" == "http" ]] && site_addr="http://$HOST"
+  cat > "$SITE_FILE" <<SITE
+# Managed by RDS (build $BUILD_ID). Removed by bin/rds-vps-deregister.
+$site_addr {
+	encode gzip
+	reverse_proxy 127.0.0.1:$PORT
+}
+SITE
+  reload_caddy || { echo "FATAL: Caddy reload failed; see $SITE_FILE" >&2; exit 1; }
+  log "caddy site written: $SITE_FILE ($HOST -> 127.0.0.1:$PORT)"
+elif [[ "$PROXY" != "none" ]]; then
+  echo "FATAL: RDS_VPS_PROXY must be caddy or none" >&2; exit 1
+fi
+
+# --- wait for the app to answer locally ----------------------------------------
+timeout_s="${RDS_VPS_START_TIMEOUT_SEC:-180}"
+elapsed=0
+code=""
+while (( elapsed <= timeout_s )); do
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$PORT/" 2>/dev/null || true)"
+  [[ "$code" =~ ^[1-4][0-9][0-9]$ ]] && break
+  sleep 2; elapsed=$((elapsed + 2))
+done
+if ! [[ "$code" =~ ^[1-4][0-9][0-9]$ ]]; then
+  echo "FATAL: app did not answer on 127.0.0.1:$PORT within ${timeout_s}s (last HTTP ${code:-none}). Last log lines:" >&2
+  tail -n 30 "$SERVICE_LOG" >&2 2>/dev/null || true
+  exit 1
+fi
+log "app answering locally on port $PORT (HTTP $code)"
+
+python3 - "$SERVICE_INFO_PATH" "$BUILD_ID" "$SERVICE_ID" "$SUPERVISOR" "$LABEL" "$HOST" "$URL" "$PORT" "$APP_DIR" "$STACK" "$PROXY" "$SITE_FILE" <<'PY'
+import json, sys, datetime
+out, build_id, service_id, supervisor, label, host, url, port, app_dir, stack, proxy, site_file = sys.argv[1:]
+info = {
+    "provider": "vps",
+    "build_id": build_id,
+    "service_id": service_id,
+    "supervisor": supervisor,
+    "label": label,
+    "host": host,
+    "url": url,
+    "local_port": int(port),
+    "app_dir": app_dir,
+    "stack": stack,
+    "proxy": proxy,
+    "site_file": site_file,
+    "status": "live",
+    "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
+}
+with open(out, "w") as f:
+    json.dump(info, f, indent=2)
+    f.write("\n")
+PY
+echo "$URL" >&3

@@ -139,7 +139,7 @@ Minimum verification for Rails stack changes:
 ```
 
 For deploy-path changes, also redeploy an existing Rails build from the
-dashboard or with `bin/rds-deploy --build-id=<id> --target=zo`.
+dashboard or with `bin/rds-deploy --build-id=<id>` (it uses this install's default target).
 
 ## Subtree Import
 

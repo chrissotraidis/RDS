@@ -20,6 +20,7 @@ that drives RDS through chat.
 
 | Doc | Read it for |
 |---|---|
+| [RUNNING_ON_A_VPS.md](RUNNING_ON_A_VPS.md) | Your own server: DNS, Caddy, systemd, the dashboard service, and how builds get published. |
 | [RUNNING_ON_ZO.md](RUNNING_ON_ZO.md) | Host model and full setup checklist for Zo or a Zo-like VPS. |
 | [CHAT_CONTRACT.md](CHAT_CONTRACT.md) | Operator chat phrases and the exact actions they trigger. |
 | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) | Common failures, diagnosis commands, recovery paths. |
