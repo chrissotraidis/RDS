@@ -42,6 +42,8 @@ look more certain or more alive than the evidence:
 
 ## Principles
 
+0. **Dark only.** The console has one theme. There is no light or system
+   mode to keep in sync; do not add a theme control without designing it.
 1. **One material, one temperature.** Every surface comes from a single
    green-cast graphite ramp (`surface-container-lowest` → `surface-bright`).
    Never mix blue-gray darks with green darks. No ad-hoc hex values in markup —
