@@ -39,3 +39,70 @@ jobs:
 
       - name: Bundle dashboard server
         run: bun build dashboard/src/server.ts --outdir /tmp/rds-dashboard-build-check
+  dashboard-selftest:
+    runs-on: ubuntu-latest
+    env:
+      RDS_DASHBOARD_PASSWORD: ci-selftest
+      RDS_DASHBOARD_TOKEN: ci-selftest-token
+      RDS_DASHBOARD_URL: http://localhost:4000
+      PORT: "4000"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install system tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq jq mupdf-tools
+
+      - name: Install dashboard dependencies and Chromium
+        working-directory: dashboard
+        run: |
+          bun install --frozen-lockfile || bun install
+          bunx playwright install --with-deps chromium
+
+      - name: Point runtime data at a temp folder
+        run: |
+          RDS_DATA="$RUNNER_TEMP/rds-data"
+          {
+            echo "RDS_DATA=$RDS_DATA"
+            echo "RDS_ROOT=$GITHUB_WORKSPACE"
+            echo "RDS_BUILDS_DIR=$RDS_DATA/builds"
+            echo "RDS_INBOX_DIR=$RDS_DATA/inbox"
+            echo "RDS_EVENTS_PATH=$RDS_DATA/events.jsonl"
+            echo "RDS_DASHBOARD_CHAT_DIR=$RDS_DATA/chat"
+            echo "RDS_DASHBOARD_STATE_DIR=$RDS_DATA/state"
+          } >> "$GITHUB_ENV"
+          mkdir -p "$RDS_DATA"/{builds,inbox,chat,state}
+
+      - name: Seed selftest fixture builds
+        working-directory: dashboard
+        run: bun run tests/seed-selftest-fixtures.ts
+
+      - name: Start dashboard
+        working-directory: dashboard
+        run: |
+          nohup bun run src/server.ts > "$RDS_DATA/dashboard.log" 2>&1 &
+          for _ in $(seq 1 30); do
+            curl -sf http://localhost:4000/healthz >/dev/null && exit 0
+            sleep 1
+          done
+          cat "$RDS_DATA/dashboard.log"
+          exit 1
+
+      - name: Run dashboard selftest
+        working-directory: dashboard
+        run: bun run tests/selftest.ts
+
+      - name: Upload selftest artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dashboard-selftest
+          path: |
+            ${{ runner.temp }}/rds-data/builds/_selftest
+            ${{ runner.temp }}/rds-data/dashboard.log
+          if-no-files-found: ignore
