@@ -7,7 +7,7 @@
     "start": "bun run src/server.ts",
     "dev": "bun run --hot src/server.ts",
     "selftest": "bun run tests/selftest.ts",
-    "build:css": "tailwindcss -c tailwind.config.js -i src/tailwind.css -o public/tailwind.css --minify"
+    "build:css": "tailwindcss -c tailwind.config.cjs -i src/tailwind.css -o public/tailwind.css --minify"
   },
   "dependencies": {
     "hono": "^4.6.0"

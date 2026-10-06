@@ -1,223 +1,205 @@
 # RDS
 
-[![Public checks](https://github.com/chrissotraidis/RDS/actions/workflows/public-checks.yml/badge.svg)](https://github.com/chrissotraidis/RDS/actions/workflows/public-checks.yml)
+<p align="center">
+  <img alt="RDS, Remote Deployment System" src="docs/assets/rds-banner.png">
+</p>
 
-![RDS — Remote Deployment System](docs/assets/rds-banner.png)
+<p align="center">
+  <strong>A self-hosted build workshop that turns a brief, PRD, or existing repo into a running app, with the evidence to judge it.</strong><br>
+  RDS plans, builds, deploys a preview, runs browser QA and a taste review, repairs what it can, and then waits for your approval.
+</p>
 
-**Remote Deployment System** is a self-hosted build workshop for turning a
-brief, PRD, research note, or existing repository into a running app with
-evidence you can inspect.
+<p align="center">
+  <a href="https://github.com/chrissotraidis/RDS/actions/workflows/public-checks.yml"><img alt="Public checks" src="https://github.com/chrissotraidis/RDS/actions/workflows/public-checks.yml/badge.svg"></a>
+  <img alt="Self-hosted, single operator" src="https://img.shields.io/badge/self--hosted-single%20operator-0A84FF">
+  <img alt="Builders: Claude Code and Codex" src="https://img.shields.io/badge/builders-Claude%20Code%20%7C%20Codex-5E5CE6">
+  <img alt="Dashboard: Bun and Hono" src="https://img.shields.io/badge/dashboard-Bun%20%2B%20Hono-6AD7A3?logo=bun&amp;logoColor=white">
+  <img alt="Host: Linux VPS or Zo" src="https://img.shields.io/badge/host-Linux%20VPS%20%7C%20Zo-FF9F0A">
+  <img alt="Approval is always human" src="https://img.shields.io/badge/approval-human%20gated-30D158">
+  <img alt="Status: early" src="https://img.shields.io/badge/status-early-F0B869">
+  <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-lightgrey">
+  <a href="https://discord.gg/xwHfUD2bxW"><img alt="Join the community on Discord" src="https://img.shields.io/badge/Discord-Join%20the%20community-5865F2?logo=discord&amp;logoColor=white"></a>
+</p>
 
-RDS is built for a dedicated VPS or personal cloud computer: one trusted
-operator, one durable machine, persistent build state, public previews, and
-explicit human approval before anything is treated as done.
+![The RDS Hub showing the build engine, PRD inbox, review queue, and recent builds](docs/assets/rds-hub.png)
 
-It is not a SaaS CI product. It is closer to an AI-native workshop bench:
-drop in intent, let the system plan/build/test/deploy, then use the dashboard
-to inspect what happened and decide what should happen next.
+> [!IMPORTANT]
+> **RDS is early, single-operator software.** It is built for one trusted person
+> on one always-on machine (a Linux VPS, a Zo computer, or similar). It is not a
+> multi-user SaaS and not a stateless CI runner. Nothing merges, pushes, or gets
+> approved without you.
 
-## What RDS Does
+## Get started
 
-```mermaid
-flowchart LR
-  A[Prompt, PRD, research note, or repo] --> B[Intake]
-  B --> C[Spec and taste brief]
-  C --> D[Build plan]
-  D --> E[App implementation]
-  E --> F[Local run]
-  F --> G[Preview deploy]
-  G --> H[Browser QA]
-  H --> I[Taste review]
-  I --> J{Review-ready?}
-  J -- no --> K[Bounded repair loop]
-  K --> H
-  J -- yes --> L[Human approval]
+| You want to | Do this |
+| --- | --- |
+| **Look around the dashboard** on a Mac or Linux laptop | [Run the dashboard locally](#try-the-dashboard-locally). Needs only Bun; no models or server. |
+| **Run real builds** on a VPS or Zo computer | [Install RDS on a host](#install-on-a-host), then [start a build](#run-a-build). |
+| **Understand the pipeline first** | Read [How it works](#how-it-works) and [docs/PIPELINE.md](docs/PIPELINE.md). |
+| **Get help or report a bug** | Ask on [Discord](https://discord.gg/xwHfUD2bxW) or [open an issue](https://github.com/chrissotraidis/RDS/issues). |
+
+### Try the dashboard locally
+
+The dashboard runs anywhere Bun runs. A fresh clone starts in **setup mode**:
+it answers only on `localhost` and shows a banner until you set credentials.
+
+```bash
+git clone https://github.com/chrissotraidis/RDS.git
+cd RDS/dashboard
+bun install
+bun run dev
 ```
 
-RDS gives you a repeatable loop for agent-assisted app builds:
+Open <http://localhost:4000>. A build is just a folder with a `state.json`, so
+you can drop sample builds into `builds/` to see every state without running a
+model. [docs/DASHBOARD.md](docs/DASHBOARD.md) has realistic examples.
 
-```text
-input -> spec -> build plan -> implementation -> local run
-      -> preview deploy -> QA -> taste review -> repair loop -> approval
-```
+### Install on a host
 
-It keeps the receipts:
+You need a Linux machine with a persistent disk and:
 
-| Evidence | Where it shows up |
-|---|---|
-| Source input and generated spec | build folder, dashboard build detail |
-| Build plan and selected stack/skills | `state.json`, build plan, dashboard |
-| Terminal logs and model-worker output | per-stage logs and live terminal view |
-| Browser QA, screenshots, and verdicts | QA artifacts and dashboard tabs |
-| Preview URL and deploy metadata | `preview-url.txt`, service metadata |
-| Review, chat, and action history | dashboard state and chat records |
+- `git`, `curl`, `jq`, `rsync`, and `python3.12`
+- [Bun](https://bun.sh) for the dashboard
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and/or the [Codex CLI](https://github.com/openai/codex), installed and signed in
+- Ruby 4.0.1+, Bundler, and PostgreSQL 15 for Rails builds
+- Optional: the Arnold CLI for richer codebase context. Without it, Wiki reads
+  files directly and `verify.sh` reports Arnold as missing. Set
+  `ARNOLD_REMOTE` before `install.sh` to build it from source.
 
-A build is not just "the agent says it worked." A build has a folder of
-evidence and a dashboard surface for deciding whether it is actually good
-enough.
-
-## What You Can Build
-
-RDS supports two main paths.
-
-| Path | Start With | RDS Produces |
-|---|---|---|
-| Green-field | Research doc, PRD, uploaded source, or raw product prompt | A generated app plus build evidence |
-| Brown-field | Existing repository plus a PRD/change request | A modified repo/app plus build evidence |
-
-The strongest current path is Rails-backed web apps and browser experiences.
-Additional stack and skill definitions cover other app types, but the project
-is still early. See `docs/STACKS_AND_SKILLS.md` for the current catalog.
-
-## Mental Model
-
-```text
-RDS source checkout
-  code, prompts, stacks, fixtures, docs, vendored build components
-
-Runtime data root
-  builds, inbox uploads, events, dashboard chat, dashboard state
-
-Generated app destination
-  the app RDS is building or modifying
-
-Preview service
-  the public review URL for that generated app
-```
-
-The source checkout is designed to be public. Runtime data is not. A production
-install should keep mutable state outside the Git checkout so a public repo can
-stay clean while the live operator instance keeps its history.
-
-## Why RDS Exists
-
-AI coding tools are powerful, but long builds tend to fail in predictable ways:
-
-- they lose the original product intent;
-- they report success without enough evidence;
-- they overwrite useful failure state;
-- they mix generated app code, runtime logs, and operator notes together;
-- they need a human to keep asking "what happened?" after each failed run.
-
-RDS makes those failure modes visible and recoverable. It gives the agent a
-build protocol, keeps build state on disk, runs quality gates, and surfaces the
-result in a dashboard designed for review instead of blind trust.
-
-## How It Feels To Use
-
-1. Put a PRD/research note in `inbox/`, or pass a repo URL and PRD path.
-2. Start a build with `bin/rds-build` or `bin/rds-start`.
-3. Watch the dashboard as RDS creates build state, runs implementation, deploys
-   a preview, and gathers QA evidence.
-4. If the result is weak, use Goal Mode or dashboard chat to request bounded
-   repair/iteration.
-5. Approve, reject, pause, resume, or inspect the build from the shell or
-   dashboard.
-
-RDS can run loops and call Claude Code or Codex-backed workers, but approval
-remains an operator decision.
-
-## Dashboard
-
-The dashboard is the operator console.
-
-```text
-Dashboard
-├── Hub                  overview: engine status, PRD inbox, review queue, alerts
-├── Builds               full inventory with filters, sorting, and review state
-├── Build detail         logs, preview, QA evidence, review controls
-├── Chat                 build-scoped requests with confirmation cards
-├── Agents               Claude/Codex worker sessions and diffs
-├── Activity             append-only audit log of every write action
-├── Settings             auth, model, stack, skill, runtime knobs
-└── Documentation        local operating docs
-```
-
-See `docs/DASHBOARD.md` for the page-by-page map and a dashboard-only local
-development quickstart (works on macOS — you only need Bun, a `.env`, and a
-directory of build folders; no model workers or Linux host required).
-
-Security model:
-
-- RDS implements a built-in Basic Auth gate for all dashboard routes except
-  `/healthz`.
-- A fresh clone works without configuration: when no credentials are set, the
-  dashboard runs in **setup mode** — it serves direct `localhost` requests
-  only (with a visible banner) and refuses everything else with `503`, so an
-  unprotected control surface is never exposed beyond the loopback. Set
-  `RDS_DASHBOARD_PASSWORD` and `RDS_DASHBOARD_TOKEN` to secure it and enable
-  remote access.
-- Mutating routes also require `X-RDS-Token` matching `RDS_DASHBOARD_TOKEN`.
-- The dashboard is an operator console, not a multi-user permission system.
-- Public preview URLs are review artifacts, not hardened production deploys.
-
-## Maturity
-
-RDS is usable, but early.
-
-- **Single-operator:** designed for one trusted operator, not teams.
-- **Persistent-host first:** expects a Linux VPS, Zo Computer, or equivalent
-  always-on personal server.
-- **Local-stateful:** build data lives on disk and is meant to survive restarts.
-- **Agent-capable:** can use Claude Code and/or Codex when installed and
-  authenticated on the host.
-- **Human-gated:** approval, merge, push, and production decisions are explicit.
-- **Not multi-user auth:** the dashboard is not a SaaS permission system.
-
-If you want a stateless CI runner, this is the wrong shape. If you want a
-personal build machine that can keep working, preserve evidence, and expose
-reviewable state, this is the intended shape.
-
-## Requirements
-
-Core runtime:
-
-- Linux host with persistent disk;
-- `git`, `curl`, `jq`, `rsync`, `python3.12`;
-- Ruby 3.3+ and Bundler for Rails builds;
-- PostgreSQL 15 reachable locally for Rails-backed builds;
-- Bun for the dashboard;
-- Claude Code and/or Codex CLI for model-backed build/fix paths;
-- optional Arnold CLI for richer Wiki codebase context.
-
-If Arnold is missing, Wiki can fall back to direct file reading. Set
-`ARNOLD_REMOTE` before `./bootstrap/install.sh` only if you want RDS to build
-Arnold from source.
-
-Zo-hosted previews additionally require Zo service access and a configured
-owner/handle via `RDS_ZO_OWNER` or `ZO_OWNER`.
-
-Docker, Docker Compose, Fly.io, and systemd are not required.
-
-## Quickstart
+Docker, Fly.io, and systemd are not required.
 
 ```bash
 git clone https://github.com/chrissotraidis/RDS.git ~/rds
 cd ~/rds
 cp .env.example .env
-$EDITOR .env
+$EDITOR .env                 # paths, plus RDS_DASHBOARD_PASSWORD and RDS_DASHBOARD_TOKEN
 ./bootstrap/install.sh
 ./bootstrap/verify.sh
 ```
 
-For a source-only check before installation:
+Set `RDS_DASHBOARD_PASSWORD` and `RDS_DASHBOARD_TOKEN` before you expose the
+dashboard. Without them it refuses every request that is not from `localhost`.
+For Zo-hosted previews, also set `RDS_ZO_OWNER`; see
+[docs/RUNNING_ON_ZO.md](docs/RUNNING_ON_ZO.md).
+
+### Run a build
+
+Green-field, from a research note or PRD:
 
 ```bash
-./bootstrap/verify.sh --fresh-clone
+./bin/rds-start ./inbox/fixture-research.md \
+  --app-dest="$HOME/projects/fixture" \
+  --stack=rails-web --app-type=web-app
 ```
 
-Minimum local path config:
+Brown-field, changing an existing repository:
 
 ```bash
-RDS_HOME=/absolute/path/to/rds
-RDS_BUILDS_DIR=/absolute/path/to/rds/builds
-RDS_INBOX_DIR=/absolute/path/to/rds/inbox
-RDS_EVENTS_PATH=/absolute/path/to/rds/events.jsonl
-RDS_DASHBOARD_CHAT_DIR=/absolute/path/to/rds/dashboard/chat
-RDS_DASHBOARD_STATE_DIR=/absolute/path/to/rds/dashboard
+./bin/rds-start \
+  --repo=https://github.com/acme/foo.git --prd=./inbox/acme-prd.md \
+  --app-dest="$HOME/projects/acme-foo" --branch=main \
+  --stack=rails-web --app-type=dashboard
 ```
 
-Production-like installs should keep mutable state outside the source checkout:
+`rds-start` runs detached; use `./bin/rds-build` with the same arguments to
+run in the foreground. Then watch it in the dashboard, or from the shell with
+`./bin/rds-status <build-id>`. You can also start builds from the dashboard's
+**New Build** page, which analyzes your brief and recommends a stack and skills
+before anything runs.
+
+## How it works
+
+```mermaid
+flowchart LR
+  A[Brief, PRD, or repo] --> B[Spec and taste brief]
+  B --> C[Build plan]
+  C --> D[Implementation]
+  D --> E[Local run and preview deploy]
+  E --> F[Browser QA and taste review]
+  F --> G{Review-ready?}
+  G -- no --> H[Bounded repair loop]
+  H --> F
+  G -- yes --> I[Your approval]
+```
+
+Long agent builds tend to fail the same ways: they drift from the original
+intent, report success without proof, and overwrite the failure you needed to
+see. RDS keeps the intent, the build state, and the evidence on disk, so each
+build ends with a folder you can inspect rather than an agent saying it worked.
+
+| Evidence | Where you find it |
+| --- | --- |
+| Source input and generated spec | Build folder, **Source files** on the build page |
+| Build plan, stack, and skills | `state.json`, **Build context** |
+| Stage logs and live terminal output | `logs/`, **Live Log** and **Logs** tabs |
+| Browser QA, screenshots, and verdicts | QA artifacts, **Full QA evidence** |
+| Preview URL and deploy record | `preview-url.txt`, deploy banner |
+| Chat, actions, and approvals | Dashboard chat and the **Activity** audit log |
+
+When a build is weak, **Goal Mode** keeps going for you within limits. It
+refreshes the evidence, takes the smallest safe repair, and only escalates to
+an isolated Claude Code or Codex worker once the normal loop is spent:
+
+```bash
+./bin/rds-goal <build-id> --objective="Make this build review-ready" \
+  --max-cycles=12 --max-agent-reviews=2
+```
+
+It never merges, pushes, or approves. See [docs/AUTONOMY.md](docs/AUTONOMY.md).
+
+## The dashboard
+
+![A failed build in RDS: the status card names the failed stage, the error, and one next action](docs/assets/rds-build-failed.png)
+
+The dashboard is the operator console. Every screen answers three questions in
+the same order: **what state the build is in, why, and the one next action.**
+A failed build leads with the stage and the error line; a stopped runner leads
+with **Resume build**; a build waiting on you leads with **Approve**. The full
+design rules live in [docs/DESIGN.md](docs/DESIGN.md).
+
+| Page | What it is for |
+| --- | --- |
+| **Hub** | Engine status, PRD inbox, review queue, alerts, recent builds |
+| **Builds** | Every build with filters for state, stack, mode, and hosting |
+| **Build page** | Status, preview, logs, QA evidence, files, diff, and actions |
+| **Chat** | Build-scoped requests that turn into confirmed actions |
+| **Agents** | Claude Code and Codex worker sessions in isolated git worktrees |
+| **Activity** | Append-only audit log of every write action |
+| **Settings** | Builder defaults, stacks, skills, and runtime health |
+
+## Frequently asked questions
+
+<details>
+<summary><strong>What can RDS build today?</strong></summary>
+
+The strongest path is Rails-backed web apps and browser experiences. Stack
+definitions also cover Next.js, React, Astro, React Native, browser
+extensions, 3D web, game engines, Python AI services, and a game asset
+pipeline, with a catalog of skills (auth, payments, search, deploy
+targets, and more) that New Build selects from your brief. The catalog is
+broader than what has been exercised end to end, so treat non-Rails stacks as
+early. See [docs/STACKS_AND_SKILLS.md](docs/STACKS_AND_SKILLS.md).
+
+</details>
+
+<details>
+<summary><strong>Is it safe to put the dashboard on the internet?</strong></summary>
+
+Only with credentials set. RDS has its own Basic Auth gate on every route except
+`/healthz`, and every write also needs the `X-RDS-Token` header to match
+`RDS_DASHBOARD_TOKEN`. With no credentials it serves `localhost` only and
+returns `503` to everything else. It is still a single-operator console, not a
+permission system, and preview URLs are review artifacts rather than hardened
+production deploys.
+
+</details>
+
+<details>
+<summary><strong>Where does my data live, and what stays out of Git?</strong></summary>
+
+The repository is public source; your runtime data is not. Builds, inbox
+uploads, dashboard chat, events, settings, `.env`, logs, and generated apps are
+all ignored. On a real host, point them outside the checkout:
 
 ```bash
 RDS_BUILDS_DIR=/var/lib/rds/builds
@@ -227,172 +209,92 @@ RDS_DASHBOARD_CHAT_DIR=/var/lib/rds/dashboard-chat
 RDS_DASHBOARD_STATE_DIR=/var/lib/rds/dashboard-state
 ```
 
-See `docs/ARCHITECTURE.md` for the full runtime data model.
+Before publishing changes, `git ls-files builds inbox dashboard/chat` should
+list only placeholders, READMEs, and committed fixtures. The full model is in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-## Running A Build
+</details>
 
-Green-field build:
+<details>
+<summary><strong>Do I need both Claude Code and Codex?</strong></summary>
 
-```bash
-./bin/rds-build ./inbox/fixture-research.md \
-  --app-dest="$HOME/projects/fixture" \
-  --stack=rails-web \
-  --app-type=web-app
-```
+No. Either one is enough. You pick the default builder in **Settings**, and you
+can switch provider or pin a model per build before continuing a goal or
+iteration. Each build records the provider it started with.
 
-Brown-field build:
+</details>
 
-```bash
-./bin/rds-build \
-  --repo=https://github.com/acme/foo.git \
-  --prd=./inbox/acme-prd.md \
-  --app-dest="$HOME/projects/acme-foo" \
-  --branch=main \
-  --stack=rails-web \
-  --app-type=dashboard
-```
+<details>
+<summary><strong>Does RDS pull the latest Wiki, Scaffold, or Rails starter at build time?</strong></summary>
 
-Detached launcher:
+No. Builds use the versions vendored in `vendor/`. Upgrades are imported and
+verified on purpose; see [docs/COMPONENTS.md](docs/COMPONENTS.md).
 
-```bash
-./bin/rds-start ./inbox/fixture-research.md \
-  --app-dest="$HOME/projects/fixture" \
-  --stack=rails-web \
-  --app-type=web-app
-```
+</details>
 
-Status:
+<details>
+<summary><strong>A build failed or stalled. What now?</strong></summary>
 
-```bash
-./bin/rds-status
-./bin/rds-status <build-id>
-./bin/rds-status --slug=acme
-```
+Open the build. The status card names the stage, shows the error, and offers
+one action: **Spawn fixer** for a failure, **Resume build** when the runner
+stopped, or **Continue RDS Goal** when evidence blocks approval. The
+**Logs** tab has every stage log. [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)
+covers the common cases, and [Discord](https://discord.gg/xwHfUD2bxW) is the
+place to ask.
 
-## Goal Mode
+</details>
 
-Goal Mode is the bounded "keep going until this build is review-ready" loop:
+## Checks
 
 ```bash
-./bin/rds-goal <build-id> \
-  --objective="Make this build review-ready" \
-  --max-cycles=12 \
-  --max-agent-reviews=2
+./bootstrap/verify.sh --fresh-clone   # source-only check, before install
+./bootstrap/verify.sh                 # installed host
+./bin/rds-selftest                    # dashboard smoke test (Playwright)
+./bin/rds-quality-fixtures --keep-going
+./bin/rds-autonomy-fixture
 ```
 
-It refreshes evidence, chooses the smallest safe repair action, and escalates
-to isolated Claude/Codex worker review only after the normal repair loop is
-exhausted. It does not auto-merge, auto-push, or approve builds.
+Run the fixture suites before changing QA, taste review, skill defaults, or
+dashboard launch and review behavior. After changing dashboard markup or
+tokens, regenerate the stylesheet with `bun run build:css` in `dashboard/`.
 
-## Runtime Data Boundary
-
-The repository is meant to be public source. Your runtime data is not.
-
-Tracked source includes code, docs, fixtures, prompts, stack definitions, and
-vendored components. It does **not** include private build output, uploaded
-client material, dashboard chat, local settings, secrets, or generated apps.
-
-Ignored runtime data includes:
-
-- `builds/<id>/`;
-- `inbox/*.md` except committed fixtures;
-- `inbox/attachments/`;
-- `dashboard/chat/`;
-- dashboard runtime JSON/JSONL state;
-- `.env`, `.rds-installed`, local model config, and logs;
-- generated app directories.
-
-Before publishing changes:
-
-```bash
-git status --short
-git ls-files builds inbox dashboard/chat
-./bootstrap/verify.sh --fresh-clone
-./bootstrap/verify.sh
-```
-
-In a healthy public checkout, `builds/`, `inbox/`, and `dashboard/chat/` should
-show only placeholders, READMEs, and committed fixtures.
-
-## Repo Map
+## Repository map
 
 ```text
 rds/
-├── AGENT.md                  # operator/agent playbook
-├── README.md                 # public entry point
-├── bootstrap/                # install and verification helpers
-├── bin/                      # orchestration scripts
-├── builds/                   # ignored runtime build data, plus placeholders
-├── config/                   # host/deploy config notes
-├── dashboard/                # Bun/Hono dashboard
-├── docs/                     # architecture, operations, project docs
-├── fixtures/                 # analyzer/QA regression fixtures
-├── inbox/                    # ignored operator input data, plus fixtures
-├── lib/                      # QA/runtime support code
-├── patches/                  # vendored-component patch extension point
-├── prompts/                  # spec, taste, and build prompts
-├── skills/                   # RDS skill registry and built-ins
-├── stacks/                   # runtime/build/deploy profiles
-└── vendor/                   # vendored Wiki, Scaffold, Rails starter
+├── AGENT.md      operator and agent playbook
+├── bin/          orchestration scripts (rds-build, rds-goal, rds-status, ...)
+├── bootstrap/    install and verification
+├── dashboard/    Bun + Hono operator console
+├── docs/         architecture, pipeline, design, operations
+├── fixtures/     analyzer and QA regression fixtures
+├── lib/          QA and agent runtime support
+├── prompts/      spec, taste, and build prompts
+├── skills/       skill registry and built-in skills
+├── stacks/       runtime, build, and deploy profiles
+└── vendor/       vendored Wiki, Scaffold, and Rails starter
 ```
-
-## Vendored Components
-
-RDS does not fetch the latest upstream component code at build time. Builds use
-the component versions checked into this repository.
-
-Vendored areas:
-
-- `vendor/wiki/` - research/spec path;
-- `vendor/scaffold/` - implementation planner/executor;
-- `vendor/rails-starter/` - Rails green-field starter.
-
-Component import and upgrade rules live in `docs/COMPONENTS.md`.
-
-## Quality Checks
-
-Useful checks during development:
-
-```bash
-./bootstrap/verify.sh
-./bin/rds-autonomy-fixture
-./bin/rds-quality-fixtures --keep-going
-./bin/rds-agent-fixture --provider=codex
-```
-
-Dashboard selftest:
-
-```bash
-./bin/rds-selftest
-```
-
-Run the broader fixture suites before changing QA, taste review, skill
-defaults, quality-ledger rendering, or dashboard behavior that affects
-launch/review.
 
 ## Documentation
 
-The full index lives at `docs/README.md`.
+Start at [docs/README.md](docs/README.md). The most used pages:
 
 | Need | Read |
-|---|---|
-| Agent/operator protocol | `AGENT.md` |
-| Architecture and runtime data boundary | `docs/ARCHITECTURE.md` |
-| Pipeline behavior | `docs/PIPELINE.md` |
-| Zo setup and operations | `docs/RUNNING_ON_ZO.md` |
-| Component upgrade model | `docs/COMPONENTS.md` |
-| Stacks and skills | `docs/STACKS_AND_SKILLS.md` |
-| Goal Mode and Agent Sessions | `docs/AUTONOMY.md` |
-| Troubleshooting | `docs/TROUBLESHOOTING.md` |
-| Status, roadmap, contributing, security | `docs/PROJECT.md` |
+| --- | --- |
+| Agent and operator protocol | [AGENT.md](AGENT.md) |
+| Architecture and data boundary | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
+| Stage-by-stage pipeline | [docs/PIPELINE.md](docs/PIPELINE.md) |
+| Dashboard pages and local development | [docs/DASHBOARD.md](docs/DASHBOARD.md) |
+| Dashboard design rules | [docs/DESIGN.md](docs/DESIGN.md) |
+| Goal Mode and Agent Sessions | [docs/AUTONOMY.md](docs/AUTONOMY.md) |
+| Zo and VPS setup | [docs/RUNNING_ON_ZO.md](docs/RUNNING_ON_ZO.md) |
+| Troubleshooting | [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) |
+| Roadmap, contributing, security | [docs/PROJECT.md](docs/PROJECT.md) |
 
-## Release Posture
+## Community and license
 
-Before making a fork, mirror, or repository public, confirm:
+- **Discord:** [discord.gg/xwHfUD2bxW](https://discord.gg/xwHfUD2bxW), the same community as Chris's other projects. Questions, build reports, and ideas are welcome.
+- **Issues:** [github.com/chrissotraidis/RDS/issues](https://github.com/chrissotraidis/RDS/issues)
 
-- no secrets or host-specific `.env` values are tracked;
-- no private build directories or uploaded inputs are tracked;
-- dashboard runtime state lives outside the source checkout in production;
-- `./bootstrap/verify.sh --fresh-clone` passes;
-- `./bootstrap/verify.sh` passes on the installed host;
-- the dashboard selftest and relevant fixture suites pass.
+RDS is released under the [MIT License](LICENSE). Vendored components keep
+their own licenses; see [docs/COMPONENTS.md](docs/COMPONENTS.md).
