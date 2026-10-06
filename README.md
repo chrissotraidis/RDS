@@ -111,15 +111,12 @@ before anything runs.
 
 ```mermaid
 flowchart LR
-  A[Brief, PRD, or repo] --> B[Spec and taste brief]
-  B --> C[Build plan]
-  C --> D[Implementation]
-  D --> E[Local run and preview deploy]
-  E --> F[Browser QA and taste review]
-  F --> G{Review-ready?}
-  G -- no --> H[Bounded repair loop]
-  H --> F
-  G -- yes --> I[Your approval]
+  A["Brief, PRD,<br>or repo"] --> B["Spec and<br>build plan"]
+  B --> C["Build and<br>preview deploy"]
+  C --> D["Browser QA and<br>taste review"]
+  D -- ready --> E(["You approve"])
+  D -- not yet --> F["Bounded<br>repair loop"]
+  F --> D
 ```
 
 Long agent builds tend to fail the same ways: they drift from the original
