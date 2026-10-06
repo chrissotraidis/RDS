@@ -1184,7 +1184,7 @@ if (( NO_DEPLOY == 0 )); then
   echo "[rds-iterate] redeploying Zo service"
   current_phase="deploy"
   current_log="$deploy_log"
-  if "$ROOT/bin/rds-deploy" --build-id="$BUILD_ID" --app-dir="$app_dest" --target=zo > "$deploy_log" 2>&1; then
+  if "$ROOT/bin/rds-deploy" --build-id="$BUILD_ID" --app-dir="$app_dest" --target="$RDS_DEFAULT_DEPLOY_TARGET" > "$deploy_log" 2>&1; then
     deploy_rc=0
   else
     deploy_rc=$?

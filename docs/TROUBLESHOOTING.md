@@ -166,7 +166,7 @@ tail -n 120 builds/<id>/logs/deploy.log
 Then re-run deploy:
 
 ```bash
-./bin/rds-deploy --build-id=<id> --target=zo
+./bin/rds-deploy --build-id=<id> --target=zo   # or --target=vps on your own server
 ```
 
 **Zo API returns `HTTP 401: Token has expired`.**

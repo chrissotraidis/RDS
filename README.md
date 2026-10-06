@@ -5,8 +5,8 @@
 </p>
 
 <p align="center">
-  <strong>A self-hosted build workshop that turns a brief, PRD, or existing repo into a running app, with the evidence to judge it.</strong><br>
-  RDS plans, builds, deploys a preview, runs browser QA and a taste review, repairs what it can, and then waits for your approval.
+  <strong>Your own server that turns a brief, PRD, or existing repo into a live website, with the evidence to judge it.</strong><br>
+  RDS drives Claude Code or Codex to plan and build the app, runs browser QA and a taste review, repairs what it can, and publishes it at <code>https://&lt;build&gt;.your-domain</code> for your approval.
 </p>
 
 <p align="center">
@@ -34,7 +34,7 @@
 | You want to | Do this |
 | --- | --- |
 | **Look around the dashboard** on a Mac or Linux laptop | [Run the dashboard locally](#try-the-dashboard-locally). Needs only Bun; no models or server. |
-| **Run real builds** on a VPS or Zo computer | [Install RDS on a host](#install-on-a-host), then [start a build](#run-a-build). |
+| **Run it for real** on your own VPS | Follow [Install on a VPS](#install-on-a-vps) (about 20 minutes), then [start a build](#run-a-build). |
 | **Understand the pipeline first** | Read [How it works](#how-it-works) and [docs/PIPELINE.md](docs/PIPELINE.md). |
 | **Get help or report a bug** | Ask on [Discord](https://discord.gg/xwHfUD2bxW) or [open an issue](https://github.com/chrissotraidis/RDS/issues). |
 
@@ -54,33 +54,40 @@ Open <http://localhost:4000>. A build is just a folder with a `state.json`, so
 you can drop sample builds into `builds/` to see every state without running a
 model. [docs/DASHBOARD.md](docs/DASHBOARD.md) has realistic examples.
 
-### Install on a host
+### Install on a VPS
 
-You need a Linux machine with a persistent disk and:
+A VPS with a domain is the intended setup: RDS builds on the server and
+publishes each passing build at its own HTTPS address. You need an Ubuntu 24.04
+or Debian 12/13 server with systemd, a domain, and a Claude Code or Codex
+account. The full walkthrough, including Postgres and Ruby for Rails builds, is
+[docs/RUNNING_ON_A_VPS.md](docs/RUNNING_ON_A_VPS.md). In short:
 
-- `git`, `curl`, `jq`, `rsync`, and `python3.12`
-- [Bun](https://bun.sh) for the dashboard
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and/or the [Codex CLI](https://github.com/openai/codex), installed and signed in
-- Ruby 4.0.1+, Bundler, and PostgreSQL 15 for Rails builds
-- Optional: the Arnold CLI for richer codebase context. Without it, Wiki reads
-  files directly and `verify.sh` reports Arnold as missing. Set
-  `ARNOLD_REMOTE` before `install.sh` to build it from source.
+1. **DNS.** Point `*.apps.example.com` and `rds.example.com` at the server.
+2. **Packages (root).** Install Caddy, `git`, `curl`, `jq`, `rsync`, `python3`, and allow only ports 22, 80, and 443.
+3. **RDS (as an `rds` user).** Install Bun and Claude Code or Codex and sign in, then:
 
-Docker, Fly.io, and systemd are not required.
+   ```bash
+   git clone https://github.com/chrissotraidis/RDS.git ~/RDS && cd ~/RDS
+   cp .env.example .env && $EDITOR .env
+   ./bootstrap/install.sh && ./bootstrap/verify.sh
+   ```
 
-```bash
-git clone https://github.com/chrissotraidis/RDS.git ~/rds
-cd ~/rds
-cp .env.example .env
-$EDITOR .env                 # paths, plus RDS_DASHBOARD_PASSWORD and RDS_DASHBOARD_TOKEN
-./bootstrap/install.sh
-./bootstrap/verify.sh
-```
+   In `.env`, set the data paths, `RDS_DASHBOARD_PASSWORD`, `RDS_DASHBOARD_TOKEN`,
+   `RDS_PUBLIC_DOMAIN=apps.example.com`, and `RDS_DASHBOARD_HOST=rds.example.com`.
+4. **Wire it up (root).** This configures Caddy, installs the dashboard as a
+   systemd service, and lets RDS keep published apps running across reboots:
 
-Set `RDS_DASHBOARD_PASSWORD` and `RDS_DASHBOARD_TOKEN` before you expose the
-dashboard. Without them it refuses every request that is not from `localhost`.
-For Zo-hosted previews, also set `RDS_ZO_OWNER`; see
-[docs/RUNNING_ON_ZO.md](docs/RUNNING_ON_ZO.md).
+   ```bash
+   sudo ./bin/rds-vps-setup --user=rds --dry-run   # review
+   sudo ./bin/rds-vps-setup --user=rds
+   ```
+
+5. **Open `https://rds.example.com`**, sign in, and start a build from **New Build**.
+
+Running on a Zo computer instead? Leave `RDS_PUBLIC_DOMAIN` empty, set
+`RDS_ZO_OWNER`, and follow [docs/RUNNING_ON_ZO.md](docs/RUNNING_ON_ZO.md).
+The optional Arnold CLI adds richer codebase context; without it, `verify.sh`
+reports it as missing and Wiki reads files directly.
 
 ### Run a build
 
@@ -118,6 +125,11 @@ flowchart LR
   D -- not yet --> F["Bounded<br>repair loop"]
   F --> D
 ```
+
+When a build passes, RDS publishes it. On a VPS the app runs as a systemd
+service behind Caddy at `https://<build>.<your domain>`, and RDS checks that the
+public URL serves the exact snapshot it just built before calling it live.
+**Take offline** and **Publish** in the dashboard stop and restart it.
 
 Long agent builds tend to fail the same ways: they drift from the original
 intent, report success without proof, and overwrite the failure you needed to
@@ -213,6 +225,19 @@ list only placeholders, READMEs, and committed fixtures. The full model is in
 </details>
 
 <details>
+<summary><strong>How do published sites stay up, and how do I take one down?</strong></summary>
+
+Each published build is a systemd service (`rds-app-<label>`) for the RDS
+user, with `Restart=always` and lingering enabled, so it survives crashes,
+logouts, and reboots. Caddy routes `<label>.<your domain>` to it and handles
+certificates. **Take offline** on the build page (or
+`bin/rds-vps-deregister --build-id=<id>`) stops the service and removes the
+route; **Publish** puts it back. Apps run in development mode for fast review,
+so treat them as previews rather than production deployments.
+
+</details>
+
+<details>
 <summary><strong>Do I need both Claude Code and Codex?</strong></summary>
 
 No. Either one is enough. You pick the default builder in **Settings**, and you
@@ -284,7 +309,8 @@ Start at [docs/README.md](docs/README.md). The most used pages:
 | Dashboard pages and local development | [docs/DASHBOARD.md](docs/DASHBOARD.md) |
 | Dashboard design rules | [docs/DESIGN.md](docs/DESIGN.md) |
 | Goal Mode and Agent Sessions | [docs/AUTONOMY.md](docs/AUTONOMY.md) |
-| Zo and VPS setup | [docs/RUNNING_ON_ZO.md](docs/RUNNING_ON_ZO.md) |
+| VPS setup and publishing | [docs/RUNNING_ON_A_VPS.md](docs/RUNNING_ON_A_VPS.md) |
+| Zo setup | [docs/RUNNING_ON_ZO.md](docs/RUNNING_ON_ZO.md) |
 | Troubleshooting | [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) |
 | Roadmap, contributing, security | [docs/PROJECT.md](docs/PROJECT.md) |
 

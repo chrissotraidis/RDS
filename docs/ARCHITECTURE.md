@@ -115,7 +115,7 @@ research/input
   → stack init
   → Scaffold task harness
   → local run
-  → Zo deploy
+  → publish (VPS or Zo)
   → Playwright QA
   → taste review
   → bounded iteration if needed
@@ -132,7 +132,7 @@ repo + PRD
   → build plan
   → Scaffold task harness
   → local run
-  → Zo deploy
+  → publish (VPS or Zo)
   → Playwright QA
   → taste review
   → bounded iteration if needed
@@ -189,18 +189,23 @@ Logging principles:
 
 ## Deployment Model
 
-Zo runs inside gVisor. RDS does not use Docker or systemd.
-
-Generated apps boot natively on a local port selected from
+Generated apps run natively (no Docker) on a local port selected from
 `RDS_LOCAL_PORT_RANGE_START..RDS_LOCAL_PORT_RANGE_END`. `bin/rds-deploy` then
-registers a Zo HTTP service through `bin/rds-zo-register` and waits for the
-public URL to respond before QA continues.
+publishes the build and waits for the public URL, and for the deploy
+fingerprint it serves, before QA continues.
 
-Deploy targets:
+Deploy targets (the default is `vps` when `RDS_PUBLIC_DOMAIN` is set, else `zo`;
+`RDS_DEFAULT_DEPLOY_TARGET` overrides):
 
-- `zo` — default; durable public Zo service.
+- `vps` — this server. `bin/rds-vps-register` runs the app as a systemd user
+  unit and routes `<label>.$RDS_PUBLIC_DOMAIN` to it through a Caddy site file.
+  See `docs/RUNNING_ON_A_VPS.md`.
+- `zo` — a durable public Zo service registered through `bin/rds-zo-register`.
 - `none` — local-only preview for harness debugging.
 - `teardown` — stop the app preview process and clean preview metadata.
+
+Both hosted targets write `builds/<id>/service.json` (with a `provider` field),
+which the dashboard reads for status, **Take offline**, and **Publish**.
 
 `RDS_ZO_AUTO_REGISTER=0` restores the legacy pending-sentinel path for
 debugging only. Normal builds should end with a real `https://*.zocomputer.io`
@@ -208,10 +213,12 @@ URL.
 
 ## Dashboard Runtime
 
-The dashboard is a managed Zo HTTP service named `rds`. Its entrypoint
-is `bin/rds-service-entrypoint`, which:
+On a VPS the dashboard is the systemd service `rds-dashboard` installed by
+`bin/rds-vps-setup`; on Zo it is a managed HTTP service named `rds`. Either way
+its entrypoint is `bin/rds-service-entrypoint`, which:
 
-1. verifies or starts PostgreSQL 15;
+1. loads `.env`, then verifies or starts PostgreSQL (skip with
+   `RDS_MANAGE_POSTGRES=0`; a missing Postgres is a warning, not a crash);
 2. optionally starts the watchdog;
 3. claims port 4000 from a stale listener if needed;
 4. launches `dashboard/src/server.ts` with Bun.

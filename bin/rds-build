@@ -148,13 +148,13 @@ ensure_app_git_boundary() {
 
 # --- Validate --deploy-target -----------------------------------------------
 case "$DEPLOY_TARGET" in
-  zo|none|teardown) ;;
+  vps|zo|none|teardown) ;;
   fly)
-    echo "FATAL: --deploy-target=fly is not supported. RDS runs on Zo and only deploys to Zo." >&2
+    echo "FATAL: --deploy-target=fly is not supported. Use vps (your own server) or zo." >&2
     exit 1
     ;;
   *)
-    echo "FATAL: unknown --deploy-target='$DEPLOY_TARGET' (expected zo|none|teardown)" >&2
+    echo "FATAL: unknown --deploy-target='$DEPLOY_TARGET' (expected vps|zo|none|teardown)" >&2
     exit 1
     ;;
 esac

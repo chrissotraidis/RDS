@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# bootstrap/install.sh — one-shot setup for a fresh Zo VM.
+# bootstrap/install.sh — one-shot setup for a fresh VPS or Zo computer.
 # Idempotent: safe to re-run.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -38,15 +38,20 @@ if [[ "$MISSING" -ne 0 ]]; then
   exit 1
 fi
 
-# --- Step 2: Claude Code CLI ------------------------------------------------
-log "Step 2 — Claude Code CLI"
-if ! command -v claude >/dev/null 2>&1; then
-  log "  FATAL: Claude Code CLI ('claude') not found."
-  log "  On Zo this is expected to be pre-installed with subscription auth."
-  log "  Abort."
+# --- Step 2: coding-agent CLIs ---------------------------------------------
+# RDS needs at least one builder: Claude Code (claude) or Codex (codex).
+log "Step 2 — coding-agent CLIs"
+HAVE_CLAUDE=0; HAVE_CODEX=0
+if command -v claude >/dev/null 2>&1; then HAVE_CLAUDE=1; log "  claude: $(claude --version 2>/dev/null || echo unknown)"; else log "  claude: not installed"; fi
+if command -v codex >/dev/null 2>&1; then HAVE_CODEX=1; log "  codex: $(codex --version 2>/dev/null || echo unknown)"; else log "  codex: not installed"; fi
+if [[ "$HAVE_CLAUDE" == "0" && "$HAVE_CODEX" == "0" ]]; then
+  log "  FATAL: install and sign in to Claude Code (npm i -g @anthropic-ai/claude-code)"
+  log "  or Codex (npm i -g @openai/codex), then re-run."
   exit 1
 fi
-log "  claude: $(claude --version 2>/dev/null || echo unknown)"
+if [[ "$HAVE_CLAUDE" == "0" ]]; then
+  log "  Codex only: set RDS_INFERENCE_PROVIDER=codex in .env (Settings can also switch the default)."
+fi
 
 # --- Step 3: Arnold CLI -----------------------------------------------------
 log "Step 3 — Arnold CLI"
@@ -70,8 +75,8 @@ if [[ ! -f "$ROOT/vendor/wiki/.claude-plugin/plugin.json" ]]; then
   exit 1
 fi
 # Smoke test: ensure Claude accepts the plugin dir. Actual load happens at
-# build time via --plugin-dir in bin/rds-spec.
-if ! claude --plugin-dir "$ROOT/vendor/wiki" --version >/dev/null 2>&1; then
+# build time via --plugin-dir in bin/rds-spec. Codex-only hosts skip this.
+if [[ "$HAVE_CLAUDE" == "1" ]] && ! claude --plugin-dir "$ROOT/vendor/wiki" --version >/dev/null 2>&1; then
   log "  WARN: 'claude --plugin-dir vendor/wiki --version' failed."
   log "  This may mean your Claude CLI version does not support --plugin-dir."
   log "  See docs/TROUBLESHOOTING.md (Wiki plugin fails to load)."
@@ -138,3 +143,4 @@ stamp_file="$ROOT/.rds-installed"
 log "  wrote $stamp_file"
 
 log "Install complete. Next: ./bootstrap/verify.sh"
+log "Hosting builds on this server? See docs/RUNNING_ON_A_VPS.md and run bin/rds-vps-setup."
