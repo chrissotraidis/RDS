@@ -123,11 +123,17 @@ interface BuildRow {
   pid?: number;
   stuck?: boolean;
   lastActivityMs?: number;
+  // updated_at from state.json; a display/sort fallback for builds that never
+  // wrote a log. Not used for stuck detection or "last output" copy.
+  updatedMs?: number;
   reviewStatus?: string;
   costUsd?: number;
   costTokens?: number;
   buildPlan?: BuildPlanState;
   runnerMissing?: boolean;
+  // state.json exists but could not be parsed. Every derived field (stack,
+  // mode, stage, review) is then unknown and must not be shown as fact.
+  stateUnreadable?: boolean;
 }
 
 interface AgentSession {
@@ -1655,7 +1661,10 @@ async function listBuilds(limit = 30, opts: { includeDemo?: boolean } = {}): Pro
 
 function readBuildRow(id: string): BuildRow {
   const dir = join(BUILDS_DIR, id);
-  const state = safeReadJson<StateJson>(join(dir, "state.json")) || {};
+  const statePath = join(dir, "state.json");
+  const parsedState = safeReadJson<StateJson>(statePath);
+  const stateUnreadable = !parsedState && existsSync(statePath);
+  const state = parsedState || {};
   const pidf = readPidfile(join(dir, "run.pid"));
   let running = false;
   let pid: number | undefined;
@@ -1701,6 +1710,7 @@ function readBuildRow(id: string): BuildRow {
   if (!running && state.review?.status === "pending") {
     derivedStatus = "pending_review";
   }
+  if (stateUnreadable) derivedStatus = "state_unreadable";
   const serviceInfo = readServiceInfo(id);
   const preview = state.preview_url || undefined;
   const appDest = state.app_dest || resolveAppDest(dir);
@@ -1732,10 +1742,12 @@ function readBuildRow(id: string): BuildRow {
     stuck,
     runnerMissing,
     lastActivityMs,
+    updatedMs:      parseTimeMs(state.updated_at || undefined) || undefined,
     reviewStatus:   state.review?.status,
     costUsd:        state.cost?.total_usd,
     costTokens:     state.cost?.total_tokens,
-    buildPlan:      state.build_plan
+    buildPlan:      state.build_plan,
+    stateUnreadable
   };
 }
 
@@ -2108,7 +2120,7 @@ function buildAttentionRank(row: BuildRow): number {
 function buildAttentionSort(a: BuildRow, b: BuildRow): number {
   const rank = buildAttentionRank(a) - buildAttentionRank(b);
   if (rank !== 0) return rank;
-  return compareNumber(b.lastActivityMs, a.lastActivityMs) || compareText(a.displayName || a.id, b.displayName || b.id);
+  return compareNumber(rowActivityMs(b), rowActivityMs(a)) || compareText(a.displayName || a.id, b.displayName || b.id);
 }
 
 function parseAiBuildBrief(text: string, fallback: BuildBriefState): BuildBriefState {
@@ -2673,6 +2685,14 @@ function tailFile(path: string, maxBytes = 64 * 1024): string {
   return "...[truncated]...\n" + text.slice(-maxBytes);
 }
 
+// A value passed as an argument inside an inline handler (onclick="fn(...)").
+// The browser HTML-decodes the attribute before running it, so escapeHtml
+// alone lets a quote in a build id break out of '...'. JSON-encode first,
+// then HTML-escape: the handler always receives one string literal.
+function jsArg(value: unknown): string {
+  return escapeHtml(JSON.stringify(String(value ?? "")));
+}
+
 function escapeHtml(value: unknown): string {
   return String(value ?? "")
     .replace(/&/g, "&amp;")
@@ -2779,13 +2799,13 @@ function renderAgentSessionsPanel(buildId: string, state: StateJson): string {
       ${changed.length ? `<div class="flex flex-wrap gap-1">${changed.map((f) => `<span class="font-code text-[10px] border border-outline-variant rounded px-1.5 py-0.5 text-on-surface-variant">${escapeHtml(f)}</span>`).join("")}</div>` : `<div class="font-table text-table text-on-surface-variant italic">No working-tree changes reported yet.</div>`}
       ${logTail ? `<pre class="bg-[#070908] border border-outline-variant rounded p-2 font-code text-[11px] text-on-surface-variant max-h-40 overflow-auto custom-scrollbar whitespace-pre-wrap">${escapeHtml(logTail)}</pre>` : ""}
       <div class="flex flex-wrap gap-2 font-ribbon text-ribbon">
-        <button type="button" onclick="agentSessionAction('${escapeHtml(s.id)}','status')" class="px-2 py-1 border border-outline-variant rounded text-on-surface hover:border-primary-container">Refresh</button>
-        <button type="button" onclick="agentSessionAction('${escapeHtml(s.id)}','diff')" class="px-2 py-1 border border-outline-variant rounded text-on-surface hover:border-primary-container">View diff</button>
-        <button type="button" onclick="agentSessionAction('${escapeHtml(s.id)}','stop')" class="px-2 py-1 border border-outline-variant rounded text-on-surface hover:border-primary-container">Stop</button>
-        <button type="button" onclick="agentSessionReview('${escapeHtml(s.id)}','${s.provider === "codex" ? "claude-code" : "codex"}')" class="px-2 py-1 border border-outline-variant rounded text-on-surface hover:border-primary-container">Review with ${s.provider === "codex" ? "Claude" : "Codex"}</button>
-        <button type="button" onclick="agentSessionHandoff('${escapeHtml(s.id)}','${s.provider === "codex" ? "claude-code" : "codex"}')" class="px-2 py-1 border border-outline-variant rounded text-on-surface hover:border-primary-container">Handoff</button>
-        <button type="button" onclick="agentSessionAction('${escapeHtml(s.id)}','merge')" class="px-2 py-1 border border-secondary/40 rounded text-secondary hover:bg-secondary-container/10">Merge local</button>
-        <button type="button" onclick="agentSessionAction('${escapeHtml(s.id)}','discard')" class="px-2 py-1 border border-error/40 rounded text-error hover:bg-error/10">Discard</button>
+        <button type="button" onclick="agentSessionAction(${jsArg(s.id)},'status')" class="px-2 py-1 border border-outline-variant rounded text-on-surface hover:border-primary-container">Refresh</button>
+        <button type="button" onclick="agentSessionAction(${jsArg(s.id)},'diff')" class="px-2 py-1 border border-outline-variant rounded text-on-surface hover:border-primary-container">View diff</button>
+        <button type="button" onclick="agentSessionAction(${jsArg(s.id)},'stop')" class="px-2 py-1 border border-outline-variant rounded text-on-surface hover:border-primary-container">Stop</button>
+        <button type="button" onclick="agentSessionReview(${jsArg(s.id)},'${s.provider === "codex" ? "claude-code" : "codex"}')" class="px-2 py-1 border border-outline-variant rounded text-on-surface hover:border-primary-container">Review with ${s.provider === "codex" ? "Claude" : "Codex"}</button>
+        <button type="button" onclick="agentSessionHandoff(${jsArg(s.id)},'${s.provider === "codex" ? "claude-code" : "codex"}')" class="px-2 py-1 border border-outline-variant rounded text-on-surface hover:border-primary-container">Handoff</button>
+        <button type="button" onclick="agentSessionAction(${jsArg(s.id)},'merge')" class="px-2 py-1 border border-secondary/40 rounded text-secondary hover:bg-secondary-container/10">Merge local</button>
+        <button type="button" onclick="agentSessionAction(${jsArg(s.id)},'discard')" class="px-2 py-1 border border-error/40 rounded text-error hover:bg-error/10">Discard</button>
       </div>
     </article>`;
   }).join("");
@@ -2837,6 +2857,12 @@ function formatDuration(ms: number | undefined): string {
   return `${h}h ${rm}m`;
 }
 
+// Newest known activity for list displays: log/event output first, then the
+// state file's own updated_at for builds that never produced output.
+function rowActivityMs(b: BuildRow): number {
+  return b.lastActivityMs || b.updatedMs || 0;
+}
+
 function parseTimeMs(value: unknown): number {
   if (typeof value !== "string" || !value.trim()) return 0;
   const ms = Date.parse(value);
@@ -2862,14 +2888,16 @@ function computeBuildTiming(state: StateJson, row: BuildRow, events: RdsEvent[])
   const startSource: BuildTiming["source"] = state.started_at ? "state" : startEvent?.ts ? "events" : row.startedAt ? "pidfile" : "unknown";
   const startedAt = state.started_at || startEvent?.ts || row.startedAt;
   const terminalEvent = latestLifecycleEvent(events, new Set(["build_completed", "build_failed", "build_pending_review"]));
-  const endedAt = row.running ? undefined : terminalEvent?.ts;
+  // A stopped build with no terminal event (runner died, events trimmed) still
+  // has a last known state write; use it rather than reporting no duration.
+  const endedAt = row.running ? undefined : (terminalEvent?.ts || state.updated_at || undefined);
   const startedMs = parseTimeMs(startedAt);
   const endedMs = parseTimeMs(endedAt);
   const durationMs = startedMs ? Math.max(0, (endedMs || (row.running ? Date.now() : 0)) - startedMs) : undefined;
   const label = durationMs != null ? formatDuration(durationMs) : "not started";
   const statusText = row.running ? "Running" : terminalEvent?.event === "build_failed" ? "Failed" : terminalEvent?.event === "build_pending_review" ? "Awaiting review" : terminalEvent?.event === "build_completed" ? "Completed" : "Last known";
   const hintParts = [
-    `${statusText} elapsed time from pipeline start${endedAt ? ` to ${terminalEvent?.event.replace(/^build_/, "")}` : ""}.`,
+    `${statusText} elapsed time from pipeline start${terminalEvent && endedAt ? ` to ${terminalEvent.event.replace(/^build_/, "")}` : endedAt ? " to the last state update" : ""}.`,
     startedAt ? `Started ${startedAt}.` : "No build start timestamp found.",
     endedAt ? `Ended ${endedAt}.` : row.running ? "Updates live while the runner is active." : "No terminal lifecycle event found yet.",
     `Source: ${startSource}.`,
@@ -2970,9 +2998,13 @@ function computeActiveRunTiming(row: BuildRow, goal: RdsGoalState | null, iterat
 function relativeTime(ms: number): string {
   if (!ms) return "never";
   const ago = Date.now() - ms;
+  // A timestamp slightly in the future (clock skew between hosts) is "now",
+  // never "-300s ago".
+  if (ago < 5_000) return "just now";
   if (ago < 60_000) return `${Math.round(ago / 1000)}s ago`;
   if (ago < 3_600_000) return `${Math.round(ago / 60_000)}m ago`;
-  return `${Math.round(ago / 3_600_000)}h ago`;
+  if (ago < 48 * 3_600_000) return `${Math.round(ago / 3_600_000)}h ago`;
+  return `${Math.round(ago / 86_400_000)}d ago`;
 }
 
 function compareText(a: unknown, b: unknown): number {
@@ -4167,9 +4199,11 @@ function refusalPage(title: string, bodyHtml: string, extraHtml = ""): string {
 // Injected above the closing body tag on every HTML response while running
 // without credentials. Amber = attention, per the design language.
 const SETUP_MODE_BANNER = `<div id="rds-setup-banner" style="position:fixed;left:0;right:0;bottom:0;z-index:9999;pointer-events:none;background:#241c10;border-top:1px solid rgba(240,184,105,.4);color:#ffd9a0;font:12.5px/1.5 Inter,system-ui,sans-serif;padding:7px 16px;text-align:center;">
-  <strong style="font-weight:650;">Setup mode</strong> — no dashboard credentials configured; serving to localhost only.
+  <style>@media (max-width:640px){#rds-setup-banner .rds-setup-long{display:none}}@media (min-width:641px){#rds-setup-banner .rds-setup-short{display:none}}</style>
+  <span class="rds-setup-short"><strong style="font-weight:650;">Setup mode</strong>: localhost only until credentials are set in <code style="font-family:'JetBrains Mono',ui-monospace,monospace;color:#f0b869;">.env</code>.</span>
+  <span class="rds-setup-long"><strong style="font-weight:650;">Setup mode</strong>: no dashboard credentials configured, so RDS serves localhost only.
   Set <code style="font-family:'JetBrains Mono',ui-monospace,monospace;color:#f0b869;">RDS_DASHBOARD_PASSWORD</code> and
-  <code style="font-family:'JetBrains Mono',ui-monospace,monospace;color:#f0b869;">RDS_DASHBOARD_TOKEN</code> in <code style="font-family:'JetBrains Mono',ui-monospace,monospace;color:#f0b869;">.env</code> to secure and enable remote access.
+  <code style="font-family:'JetBrains Mono',ui-monospace,monospace;color:#f0b869;">RDS_DASHBOARD_TOKEN</code> in <code style="font-family:'JetBrains Mono',ui-monospace,monospace;color:#f0b869;">.env</code> to secure it and enable remote access.</span>
 </div>
 <script>(function(){
   var b = document.getElementById('rds-setup-banner');
@@ -4298,9 +4332,24 @@ app.get("/", async (c) => {
 
   const recentRows = recent.map((b) => {
     const title = b.displayName || compactBuildId(b.id);
-    const age = b.lastActivityMs ? relativeTime(b.lastActivityMs) : "—";
+    const age = rowActivityMs(b) ? relativeTime(rowActivityMs(b)) : "—";
     const stage = b.stage ? displayTokenLabel(b.stage) : "No stage";
-    const review = b.reviewStatus ? displayTokenLabel(b.reviewStatus) : displayTokenLabel(b.status || "unknown");
+    const kind = statusKind(b);
+    const reviewRaw = b.stateUnreadable ? "State unreadable"
+      : b.reviewStatus === "pending" ? "Pending review"
+      : b.reviewStatus === "approved" ? "Approved"
+      : b.reviewStatus === "rejected" ? "Rejected"
+      : kind === "running" ? "Running"
+      : kind === "stuck" ? (b.runnerMissing || b.status === "stalled" ? "Runner stopped" : "Stuck")
+      : kind === "failed" ? "Failed"
+      : kind === "paused" ? "Paused"
+      : kind === "done" ? "Done"
+      : b.status ? humanStatus(b.status) : "";
+    const reviewTone = b.stateUnreadable || kind === "failed" || b.reviewStatus === "rejected" ? "is-bad"
+      : kind === "stuck" || kind === "paused" || b.reviewStatus === "pending" ? "is-warn"
+      : kind === "running" ? "is-live" : "";
+    // Approved builds sit at the "approved" stage; saying it twice is noise.
+    const review = reviewRaw && reviewRaw.toLowerCase() !== stage.toLowerCase() ? reviewRaw : "";
     const modeParts = [b.stack ? stackDisplayLabel(b.stack) : "", b.mode ? modeDisplayLabel(b.mode) : ""].filter(Boolean).join(" · ");
     return `
     <a href="/b/${escapeHtml(b.id)}" class="rds-recent-build-row group">
@@ -4314,9 +4363,9 @@ app.get("/", async (c) => {
       <span class="rds-recent-build-id">${escapeHtml(compactBuildId(b.id))}</span>
       <span class="rds-recent-build-bottom">
         <span class="rds-recent-build-stage">${escapeHtml(stage)}</span>
-        <span class="rds-recent-build-review">${escapeHtml(review)}</span>
+        ${review ? `<span class="rds-recent-build-review ${reviewTone}">${escapeHtml(review)}</span>` : ""}
         ${modeParts ? `<span class="rds-recent-build-mode">${escapeHtml(modeParts)}</span>` : ""}
-        <span class="rds-recent-build-host">${hostingPill(b)}</span>
+        ${hostingPill(b, { quietWhenUnhosted: true }) ? `<span class="rds-recent-build-host">${hostingPill(b, { quietWhenUnhosted: true })}</span>` : ""}
       </span>
     </a>`;
   }).join("");
@@ -4325,8 +4374,8 @@ app.get("/", async (c) => {
     <a href="/b/${escapeHtml(b.id)}" class="flex items-center gap-2 py-2 border-b border-[#242b28]/50 last:border-b-0">
       ${statusDot(b)}
       <span class="font-body text-[12px] text-on-surface truncate min-w-0 flex-1" title="${escapeHtml(b.id)}">${escapeHtml(b.displayName || compactBuildId(b.id))}</span>
-      <span class="shrink-0">${hostingPill(b)}</span>
-      <span class="shrink-0 font-table text-[11px] text-on-surface-variant">${b.lastActivityMs ? escapeHtml(relativeTime(b.lastActivityMs)) : "-"}</span>
+      <span class="shrink-0">${hostingPill(b, { quietWhenUnhosted: true })}</span>
+      <span class="shrink-0 font-table text-[11px] text-on-surface-variant">${rowActivityMs(b) ? escapeHtml(relativeTime(rowActivityMs(b))) : "—"}</span>
     </a>`).join("");
 
   const pendingItems = pending.length
@@ -4334,9 +4383,9 @@ app.get("/", async (c) => {
       <div data-review-card="${escapeHtml(b.id)}" class="bg-[#101412] panel-border p-2 rounded flex justify-between items-center gap-2 group hover:bg-[#1b211e] transition-colors">
         <a href="/b/${escapeHtml(b.id)}" class="min-w-0 flex-1">
           <div class="font-body text-body text-on-surface truncate" title="${escapeHtml(b.id)}">${escapeHtml(b.displayName || compactBuildId(b.id))}</div>
-          <div class="font-table text-table text-on-surface-variant truncate">${escapeHtml([b.stack, b.mode, b.provider].filter(Boolean).join(" · ") || "—")}</div>
+          <div class="font-table text-table text-on-surface-variant truncate">${escapeHtml([b.stack ? stackDisplayLabel(b.stack) : "", b.mode ? modeDisplayLabel(b.mode) : "", b.provider ? builderDisplayLabel(b.provider) : ""].filter(Boolean).join(" · ") || "—")}</div>
         </a>
-        <button type="button" onclick="dismissReview('${escapeHtml(b.id)}')" class="shrink-0 font-ribbon text-ribbon text-on-surface bg-[#1b211e] px-2 py-1 rounded hover:bg-[#242b28] transition-colors border border-[#242b28]" title="Hide this build from the Needs Review queue">Dismiss</button>
+        <button type="button" onclick="dismissReview(${jsArg(b.id)})" class="shrink-0 font-ribbon text-ribbon text-on-surface bg-[#1b211e] px-2 py-1 rounded hover:bg-[#242b28] transition-colors border border-[#242b28]" title="Hide this build from the Needs Review queue">Dismiss</button>
       </div>`).join("")
     : `<div class="text-on-surface-variant font-table text-table italic">Nothing waiting on review.</div>`;
 
@@ -4373,9 +4422,9 @@ app.get("/", async (c) => {
           </div>
           <span class="font-ribbon text-ribbon text-error shrink-0">Failed${lastFailed.lastActivityMs ? ` · ${escapeHtml(relativeTime(lastFailed.lastActivityMs))}` : ""}</span>
         </div>
-        <div class="font-table text-table text-on-surface-variant truncate">failed at ${escapeHtml(lastFailed.stage ?? "unknown")} stage</div>
+        <div class="font-table text-table text-on-surface-variant truncate">${lastFailed.stage ? `Failed at ${escapeHtml(displayTokenLabel(lastFailed.stage))}` : "Failed before a stage was recorded"}</div>
         <div class="mt-1 flex justify-end gap-2">
-          <button type="button" onclick="dismissAlert('${escapeHtml(lastFailed.id)}')" class="font-ribbon text-ribbon text-on-surface bg-[#1b211e] px-2 py-1 rounded hover:bg-[#242b28] transition-colors border border-[#242b28]">Dismiss</button>
+          <button type="button" onclick="dismissAlert(${jsArg(lastFailed.id)})" class="font-ribbon text-ribbon text-on-surface bg-[#1b211e] px-2 py-1 rounded hover:bg-[#242b28] transition-colors border border-[#242b28]">Dismiss</button>
           <a href="/b/${escapeHtml(lastFailed.id)}" class="font-ribbon text-ribbon text-on-surface bg-[#1b211e] px-2 py-1 rounded hover:bg-[#242b28] transition-colors border border-[#242b28]">View build</a>
         </div>
       </div>`
@@ -4470,7 +4519,7 @@ app.get("/", async (c) => {
         </div>
 
         <!-- Hosted Services -->
-        <div class="rds-hub-card bg-surface-container panel-border rounded-DEFAULT flex flex-col p-unit lg:min-h-[200px]">
+        <div class="rds-hub-card bg-surface-container panel-border rounded-DEFAULT flex flex-col p-unit lg:min-h-[200px] lg:self-start">
           <div class="flex justify-between items-center mb-unit border-b border-[#242b28] pb-unit">
             <h2 class="font-h2 text-h2 text-on-surface flex items-center gap-2">
               ${icon("cloud_done", 16, "text-primary-container")}<span>Zo Hosting</span>
@@ -4490,7 +4539,7 @@ app.get("/", async (c) => {
         </div>
 
         <!-- Needs Review -->
-        <div class="rds-hub-card bg-surface-container panel-border rounded-DEFAULT flex flex-col p-unit ${pending.length ? "lg:min-h-[200px]" : "rds-compact-empty"}">
+        <div class="rds-hub-card bg-surface-container panel-border rounded-DEFAULT flex flex-col p-unit lg:self-start ${pending.length ? "lg:min-h-[200px]" : "rds-compact-empty"}">
           <div class="flex justify-between items-center mb-unit border-b border-[#242b28] pb-unit">
             <h2 class="font-h2 text-h2 text-on-surface flex items-center gap-2">
               ${icon("pending_actions", 16, "text-error")}<span>Needs Review</span>
@@ -4606,9 +4655,9 @@ app.get("/builds", async (c) => {
       sort === "status" ? compareText(statusKind(a), statusKind(b)) :
       sort === "review" ? compareText(a.reviewStatus, b.reviewStatus) :
       sort === "cost"   ? compareNumber(a.costUsd, b.costUsd) :
-      sort === "last"   ? compareNumber(a.lastActivityMs, b.lastActivityMs) :
+      sort === "last"   ? compareNumber(rowActivityMs(a), rowActivityMs(b)) :
       sort === "tags"   ? compareText(tagsFor(a), tagsFor(b)) :
-                           compareNumber(a.lastActivityMs, b.lastActivityMs);
+                           compareNumber(rowActivityMs(a), rowActivityMs(b));
     return cmp === 0 ? compareText(a.id, b.id) : cmp * direction;
   });
 
@@ -4638,28 +4687,27 @@ app.get("/builds", async (c) => {
     return `<tr class="row-clickable hover:bg-[#1b211e] transition-colors group cursor-pointer ${rowBg}" tabindex="0" aria-label="Open build ${escapeHtml(b.displayName || b.slug || b.id)}" data-href="/b/${escapeHtml(b.id)}" data-search="${escapeHtml((b.id + " " + (b.slug ?? "") + " " + (b.displayName ?? "") + " " + (b.stage ?? "")).toLowerCase())}">
       <td class="py-2.5 px-4">${statusDot(b)}</td>
       <td class="py-2.5 px-4 text-on-surface">
-        <div class="flex flex-col gap-0.5 min-w-[200px]">
-          <span class="font-body text-body truncate" title="${escapeHtml(b.id)}">${escapeHtml(b.displayName || b.slug || compactBuildId(b.id))}</span>
+        <div class="flex flex-col gap-0.5 min-w-[200px] max-w-[26rem]">
+          <span class="font-body text-body truncate" title="${escapeHtml(b.displayName || b.id)}">${escapeHtml(b.displayName || b.slug || compactBuildId(b.id))}</span>
           <span class="font-code text-[10px] leading-4 text-on-surface-variant truncate">${escapeHtml(b.id)}</span>
         </div>
-        <div class="mt-1 flex items-center gap-2 font-ribbon text-ribbon">
-          ${hostingPill(b)}
-          <span class="text-on-surface-variant">${escapeHtml(hostingLabel(b))}</span>
-          ${b.running ? `<button type="button" data-stop="1" onclick="pauseBuild('${escapeHtml(b.id)}')" class="ml-1 inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-tertiary-container/40 bg-tertiary-container/10 text-tertiary-container hover:bg-tertiary-container/20" title="Pause this build and resume later">${icon("pause", 13)}<span>Pause</span></button>` : ""}
-          ${b.paused ? `<button type="button" data-stop="1" onclick="resumeBuild('${escapeHtml(b.id)}')" class="ml-1 inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-primary-container/40 bg-primary-container/10 text-primary-container hover:bg-primary-container/20" title="Resume this paused build">${icon("play_arrow", 13)}<span>Resume</span></button>` : ""}
-          ${b.hasZoService ? `<button type="button" data-stop="1" onclick="deleteHostedBuild('${escapeHtml(b.id)}')" class="ml-1 inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-error/30 bg-error/10 text-error hover:bg-error/20" title="Delete Zo service and free the slot">${icon("delete", 13)}<span>Delete service</span></button>` : ""}
+        <div class="mt-1 flex items-center gap-2 font-ribbon text-ribbon empty:hidden">
+          ${hostingPill(b, { quietWhenUnhosted: true })}
+          ${b.running ? `<button type="button" data-stop="1" onclick="pauseBuild(${jsArg(b.id)})" class="ml-1 inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-tertiary-container/40 bg-tertiary-container/10 text-tertiary-container hover:bg-tertiary-container/20" title="Pause this build and resume later">${icon("pause", 13)}<span>Pause</span></button>` : ""}
+          ${b.paused ? `<button type="button" data-stop="1" onclick="resumeBuild(${jsArg(b.id)})" class="ml-1 inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-primary-container/40 bg-primary-container/10 text-primary-container hover:bg-primary-container/20" title="Resume this paused build">${icon("play_arrow", 13)}<span>Resume</span></button>` : ""}
+          ${b.hasZoService ? `<button type="button" data-stop="1" onclick="deleteHostedBuild(${jsArg(b.id)})" class="ml-1 inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-error/30 bg-error/10 text-error hover:bg-error/20" title="Delete Zo service and free the slot">${icon("delete", 13)}<span>Delete service</span></button>` : ""}
         </div>
       </td>
-      <td class="py-2.5 px-4 text-on-surface whitespace-nowrap">${escapeHtml(b.stage ?? "—")}</td>
+      <td class="py-2.5 px-4 text-on-surface whitespace-nowrap">${escapeHtml(b.stage ? displayTokenLabel(b.stage) : "—")}</td>
       <td class="py-2.5 px-4 whitespace-nowrap">${statusBadge(b)}</td>
       <td class="py-2.5 px-4 whitespace-nowrap hidden xl:table-cell">${reviewBadge(b) || `<span class="text-on-surface-variant">—</span>`}</td>
       <td class="py-2.5 px-4 text-right font-code text-code text-on-surface whitespace-nowrap hidden lg:table-cell">${escapeHtml(cost)}</td>
-      <td class="py-2.5 px-4 text-on-surface-variant text-[11px] whitespace-nowrap hidden lg:table-cell">${b.lastActivityMs ? escapeHtml(relativeTime(b.lastActivityMs)) : "—"}</td>
+      <td class="py-2.5 px-4 text-on-surface-variant text-[11px] whitespace-nowrap hidden lg:table-cell">${rowActivityMs(b) ? escapeHtml(relativeTime(rowActivityMs(b))) : "—"}</td>
       <td class="py-2.5 px-4 hidden 2xl:table-cell"><div class="flex flex-wrap gap-1">${tags}</div></td>
       <td class="py-2.5 px-4 text-right opacity-0 group-hover:opacity-100 transition-opacity">
-        ${b.running ? `<button type="button" data-stop="1" onclick="pauseBuild('${escapeHtml(b.id)}')" class="mr-2 text-tertiary-container hover:text-[#ffd8c2]" title="Pause build" aria-label="Pause build">${icon("pause", 16)}</button>` : ""}
-        ${b.paused ? `<button type="button" data-stop="1" onclick="resumeBuild('${escapeHtml(b.id)}')" class="mr-2 text-primary-container hover:text-[#8beebb]" title="Resume build" aria-label="Resume build">${icon("play_arrow", 16)}</button>` : ""}
-        ${b.hasZoService ? `<button type="button" data-stop="1" onclick="deleteHostedBuild('${escapeHtml(b.id)}')" class="mr-2 text-error hover:text-[#ffd3cf]" title="Delete Zo service" aria-label="Delete Zo service">${icon("delete", 16)}</button>` : ""}
+        ${b.running ? `<button type="button" data-stop="1" onclick="pauseBuild(${jsArg(b.id)})" class="mr-2 text-tertiary-container hover:text-[#ffd8c2]" title="Pause build" aria-label="Pause build">${icon("pause", 16)}</button>` : ""}
+        ${b.paused ? `<button type="button" data-stop="1" onclick="resumeBuild(${jsArg(b.id)})" class="mr-2 text-primary-container hover:text-[#8beebb]" title="Resume build" aria-label="Resume build">${icon("play_arrow", 16)}</button>` : ""}
+        ${b.hasZoService ? `<button type="button" data-stop="1" onclick="deleteHostedBuild(${jsArg(b.id)})" class="mr-2 text-error hover:text-[#ffd3cf]" title="Delete Zo service" aria-label="Delete Zo service">${icon("delete", 16)}</button>` : ""}
         <a href="/b/${escapeHtml(b.id)}" data-stop="1" class="text-on-surface-variant hover:text-on-surface" title="Open build" aria-label="Open build">${icon("arrow_forward", 16)}</a>
       </td>
     </tr>`;
@@ -4674,9 +4722,9 @@ app.get("/builds", async (c) => {
     const cost = b.costUsd != null ? `$${b.costUsd.toFixed(2)}` : "—";
     const title = b.displayName || b.slug || compactBuildId(b.id);
     const meta = [
-      b.stack || "rails",
-      b.mode || "green",
-      b.provider || "claude",
+      b.stack ? stackDisplayLabel(b.stack) : "",
+      b.mode ? modeDisplayLabel(b.mode) : "",
+      b.provider ? builderDisplayLabel(b.provider) : "",
     ].filter(Boolean).join(" · ");
     return `<div onclick="if (!event.target.closest('[data-stop]')) location.href='/b/${escapeHtml(b.id)}'" data-search="${escapeHtml((b.id + " " + (b.slug ?? "") + " " + (b.displayName ?? "") + " " + (b.stage ?? "")).toLowerCase())}" class="rds-build-mobile-card block border ${cardBg} rounded-DEFAULT p-3 cursor-pointer">
       <div class="flex items-start gap-3">
@@ -4692,7 +4740,7 @@ app.get("/builds", async (c) => {
           <div class="rds-mobile-build-card-stats mt-2 grid grid-cols-[0.9fr_1.35fr_0.85fr] gap-2 font-table text-table">
             <div>
               <div class="text-outline uppercase text-[10px]">Stage</div>
-              <div class="text-on-surface truncate">${escapeHtml(b.stage ?? "—")}</div>
+              <div class="text-on-surface truncate">${escapeHtml(b.stage ? displayTokenLabel(b.stage) : "—")}</div>
             </div>
             <div>
               <div class="text-outline uppercase text-[10px]">Review</div>
@@ -4705,14 +4753,14 @@ app.get("/builds", async (c) => {
           </div>
           <div class="mt-2 flex items-center gap-2 font-ribbon text-ribbon text-on-surface-variant">
             <span class="rds-mobile-card-meta truncate">${escapeHtml(meta)}</span>
-            <span class="shrink-0">${b.lastActivityMs ? escapeHtml(relativeTime(b.lastActivityMs)) : "—"}</span>
+            <span class="shrink-0">${rowActivityMs(b) ? escapeHtml(relativeTime(rowActivityMs(b))) : "—"}</span>
           </div>
           <div class="mt-2 flex items-center gap-2">
             ${b.hasZoService ? `<span class="inline-flex">${hostingPill(b)}</span>` : ""}
             <a data-stop="1" href="/b/${escapeHtml(b.id)}" class="ml-auto px-2 py-1 border border-outline-variant bg-surface-container text-on-surface rounded font-ribbon text-ribbon">Open</a>
-            ${b.running ? `<button data-stop="1" type="button" onclick="pauseBuild('${escapeHtml(b.id)}')" class="px-2 py-1 border border-tertiary-container/40 bg-tertiary-container/10 text-tertiary-container rounded font-ribbon text-ribbon">${icon("pause", 13)} Pause</button>` : ""}
-            ${b.paused ? `<button data-stop="1" type="button" onclick="resumeBuild('${escapeHtml(b.id)}')" class="px-2 py-1 border border-primary-container/40 bg-primary-container/10 text-primary-container rounded font-ribbon text-ribbon">${icon("play_arrow", 13)} Resume</button>` : ""}
-            ${b.hasZoService ? `<details data-stop="1" class="relative"><summary class="list-none px-2 py-1 border border-outline-variant bg-surface-container text-on-surface rounded font-ribbon text-ribbon cursor-pointer">More</summary><div class="absolute right-0 mt-1 z-20 bg-surface border border-outline-variant rounded shadow-lg p-1 w-40"><button type="button" onclick="deleteHostedBuild('${escapeHtml(b.id)}')" class="w-full px-2 py-1.5 text-left text-error hover:bg-error/10 rounded font-ribbon text-ribbon">${icon("delete", 13)}<span> Delete service</span></button></div></details>` : ""}
+            ${b.running ? `<button data-stop="1" type="button" onclick="pauseBuild(${jsArg(b.id)})" class="px-2 py-1 border border-tertiary-container/40 bg-tertiary-container/10 text-tertiary-container rounded font-ribbon text-ribbon">${icon("pause", 13)} Pause</button>` : ""}
+            ${b.paused ? `<button data-stop="1" type="button" onclick="resumeBuild(${jsArg(b.id)})" class="px-2 py-1 border border-primary-container/40 bg-primary-container/10 text-primary-container rounded font-ribbon text-ribbon">${icon("play_arrow", 13)} Resume</button>` : ""}
+            ${b.hasZoService ? `<details data-stop="1" class="relative"><summary class="list-none px-2 py-1 border border-outline-variant bg-surface-container text-on-surface rounded font-ribbon text-ribbon cursor-pointer">More</summary><div class="absolute right-0 mt-1 z-20 bg-surface border border-outline-variant rounded shadow-lg p-1 w-40"><button type="button" onclick="deleteHostedBuild(${jsArg(b.id)})" class="w-full px-2 py-1.5 text-left text-error hover:bg-error/10 rounded font-ribbon text-ribbon">${icon("delete", 13)}<span> Delete service</span></button></div></details>` : ""}
           </div>
         </div>
       </div>
@@ -4989,7 +5037,6 @@ app.get("/new", (c) => {
         <div class="flex items-center gap-3 flex-wrap">
           <a href="/settings/stacks" class="font-ribbon text-ribbon text-on-surface-variant hover:text-on-surface whitespace-nowrap">Stack guide</a>
           <a href="/settings/skills" class="font-ribbon text-ribbon text-on-surface-variant hover:text-on-surface whitespace-nowrap">Skills guide</a>
-          <a href="/builds" class="font-ribbon text-ribbon text-on-surface-variant hover:text-on-surface whitespace-nowrap">← back to builds</a>
         </div>
       </div>
 
@@ -5531,41 +5578,17 @@ app.get("/b/:id", async (c) => {
            <div class="text-on-surface-variant">No activity for ${formatDuration(Date.now() - lastActivityMs)}. Build is still running (pid ${row.pid}) but nothing has been written.</div>
            ${autofixHint}
          </div>
-         ${spawnFixerBtn("warn")}
        </div>` : "";
 
-  const runnerMissingBanner = row.runnerMissing
-    ? `<div class="rds-status-banner bg-tertiary-container/10 border border-tertiary-container/30 rounded-DEFAULT p-3 flex items-start gap-3">
-         ${icon("warning", 18, "text-tertiary-container shrink-0 mt-0.5")}
-         <div class="flex-1 font-body text-body">
-           <div class="font-bold text-tertiary-container mb-0.5">Runner stopped at ${escapeHtml(displayTokenLabel(row.stage ?? "?"))}</div>
-           <div class="text-on-surface-variant">RDS still has this stage marked running, but no build process is attached. The correct next step is to resume the build from this stage.</div>
-           <div class="text-on-surface-variant text-ribbon mt-1">The previous fixer only diagnosed the stall; it did not continue the pipeline.</div>
-         </div>
-         <div class="flex gap-2 flex-wrap justify-end">
-           <button onclick="cmd('resume')" class="px-3 py-1.5 bg-primary-container hover:bg-surface-tint text-on-primary-container rounded-DEFAULT font-ribbon text-ribbon font-bold transition-colors shrink-0">Resume build</button>
-           ${spawnFixerBtn("warn")}
-         </div>
-       </div>` : "";
 
-  const failedBanner = row.status === "failed"
-    ? `<div class="rds-status-banner bg-error/10 border border-error/30 rounded-DEFAULT p-3 flex items-start gap-3">
-         ${icon("error", 18, "text-error shrink-0 mt-0.5")}
-         <div class="flex-1 font-body text-body">
-           <div class="font-bold text-error mb-0.5">Failed at ${escapeHtml(displayTokenLabel(row.stage ?? "?"))}</div>
-           <div class="text-on-surface-variant break-words">${escapeHtml(summarizeFailureReason(id, state.error ?? undefined))}</div>
-           <div class="text-on-surface-variant text-ribbon mt-1">Next step: Spawn fixer to launch the selected builder to diagnose and patch this build, or open the per-stage logs (Logs tab).</div>
-         </div>
-         ${spawnFixerBtn("error")}
-       </div>` : "";
 
-  const idleBanner = (!row.running && !row.runnerMissing && !terminalState && row.status !== "failed" && row.reviewStatus !== "pending" && !row.preview)
+  const idleBanner = (!row.running && !row.runnerMissing && !row.stateUnreadable && !terminalState && row.status !== "failed" && row.reviewStatus !== "pending" && !row.preview)
     ? `<div class="rds-status-banner bg-surface-container-high/40 border border-outline-variant rounded-DEFAULT p-3 flex items-start gap-3">
          ${icon("info", 18, "text-outline shrink-0 mt-0.5")}
          <div class="flex-1 font-body text-body">
            <div class="font-bold text-on-surface mb-0.5">Build is idle</div>
-           <div class="text-on-surface-variant break-words">This build isn't currently running. Stage <code class="font-code text-code text-primary-container">${escapeHtml(row.stage ?? "?")}</code> · status <code class="font-code text-code">${escapeHtml(row.status ?? "?")}</code>.</div>
-           <div class="text-on-surface-variant text-ribbon mt-1">If you expected output, check the per-stage logs in the Terminal tab. To retry from here, use Spawn fixer.</div>
+           <div class="text-on-surface-variant break-words">${row.stage ? `This build isn't running. Last recorded stage: <strong class="text-on-surface">${escapeHtml(displayTokenLabel(row.stage))}</strong>${row.status ? ` (${escapeHtml(humanStatus(row.status).toLowerCase())})` : ""}.` : "This build isn't running and has no recorded stage yet."}</div>
+           <div class="text-on-surface-variant text-ribbon mt-1">If you expected output, check the per-stage logs in the Logs tab.</div>
          </div>
        </div>` : "";
 
@@ -5578,7 +5601,7 @@ app.get("/b/:id", async (c) => {
          </div>
          <div class="rds-deploy-actions flex gap-2 shrink-0">
            <a href="${escapeHtml(serviceInfo?.url || row.preview || "")}" target="_blank" class="px-3 py-1.5 bg-primary-container hover:bg-surface-tint text-on-primary-container rounded-DEFAULT font-ribbon text-ribbon font-bold transition-colors flex items-center gap-1">${icon("open_in_new", 14)}<span>Open</span></a>
-           <button type="button" onclick="navigator.clipboard.writeText('${escapeHtml(serviceInfo?.url || row.preview || "")}').then(function(){rdsToast('URL copied.','info');})" class="px-3 py-1.5 border border-outline-variant bg-surface hover:bg-surface-bright text-on-surface rounded-DEFAULT font-ribbon text-ribbon transition-colors flex items-center gap-1">${icon("content_copy", 14)}<span>Copy</span></button>
+           <button type="button" onclick="navigator.clipboard.writeText(${jsArg(serviceInfo?.url || row.preview || "")}).then(function(){rdsToast('URL copied.','info');})" class="px-3 py-1.5 border border-outline-variant bg-surface hover:bg-surface-bright text-on-surface rounded-DEFAULT font-ribbon text-ribbon transition-colors flex items-center gap-1">${icon("content_copy", 14)}<span>Copy</span></button>
            ${serviceInfo?.service_id ? `<button type="button" onclick="deregisterService()" class="js-delete-service-action px-3 py-1.5 border border-error/40 bg-error/10 hover:bg-error/20 text-error rounded-DEFAULT font-ribbon text-ribbon transition-colors flex items-center gap-1">${icon("delete", 14)}<span>Delete Zo service</span></button>` : ""}
          </div>
        </div>`
@@ -5659,7 +5682,7 @@ app.get("/b/:id", async (c) => {
   const costPill = row.costUsd != null
     ? `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-DEFAULT font-code text-[11px] bg-surface-container border border-outline-variant text-on-surface" title="$${row.costUsd.toFixed(4)}${row.costTokens ? ` · ${row.costTokens.toLocaleString()} tokens` : ""}">${icon("attach_money", 12, "text-primary-container")}<span>${row.costUsd.toFixed(2)}${row.costTokens ? ` · ${row.costTokens.toLocaleString()} tok` : ""}</span></span>`
     : `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-DEFAULT font-code text-[11px] bg-surface-container border border-outline-variant text-outline" title="POST /b/:id/refresh-cost to compute">${icon("attach_money", 12, "text-outline")}<span>no cost yet</span></span>`;
-  const elapsedPill = `<span id="build-elapsed-pill" data-build-elapsed-pill data-start-ms="${buildTiming.startedAt ? parseTimeMs(buildTiming.startedAt) : ""}" data-end-ms="${buildTiming.endedAt ? parseTimeMs(buildTiming.endedAt) : ""}" data-running="${buildTiming.running ? "1" : "0"}" class="rds-elapsed-pill inline-flex items-center gap-1.5 px-2.5 py-1 rounded-DEFAULT font-code text-[11px] bg-primary-container/10 border border-primary-container/35 text-primary-container" title="${escapeHtml(buildTiming.hint)}">${icon(buildTiming.running ? "timer" : "timer_off", 13, buildTiming.running ? "animate-pulse" : "")}<span class="text-primary-container/75">Elapsed</span><strong data-build-elapsed-label>${escapeHtml(buildTiming.label)}</strong></span>`;
+  const elapsedPill = `<span id="build-elapsed-pill" data-build-elapsed-pill data-start-ms="${buildTiming.startedAt ? parseTimeMs(buildTiming.startedAt) : ""}" data-end-ms="${buildTiming.endedAt ? parseTimeMs(buildTiming.endedAt) : ""}" data-running="${buildTiming.running ? "1" : "0"}" class="rds-elapsed-pill inline-flex items-center gap-1.5 px-2.5 py-1 rounded-DEFAULT font-code text-[11px] ${buildTiming.running ? "bg-primary-container/10 border border-primary-container/35 text-primary-container" : "bg-surface-container border border-outline-variant text-on-surface-variant"}" title="${escapeHtml(buildTiming.hint)}">${icon(buildTiming.running ? "timer" : "timer_off", 13, buildTiming.running ? "animate-pulse" : "")}<span class="${buildTiming.running ? "text-primary-container/75" : "text-outline"}">Elapsed</span><strong data-build-elapsed-label>${escapeHtml(buildTiming.label)}</strong></span>`;
   const activeRunLabel = activeRunTiming.running
     ? "Active run"
     : activeRunTiming.kind === "stale_goal"
@@ -5683,10 +5706,10 @@ app.get("/b/:id", async (c) => {
           : (row.status || "done");
   const stageLabel = displayTokenLabel(activeStage);
   const identityChips = [
-    { icon: "layers", label: "Stack", value: stackDisplayLabel(row.stack ?? "rails") },
-    { icon: "category", label: "Type", value: appTypeLabel(row.appType) },
-    { icon: "call_split", label: "Mode", value: modeDisplayLabel(row.mode) },
-    { icon: "smart_toy", label: "Builder", value: builderDisplayLabel(row.provider ?? "claude") },
+    { icon: "layers", label: "Stack", value: row.stateUnreadable ? "Unknown" : stackDisplayLabel(row.stack ?? "rails") },
+    { icon: "category", label: "Type", value: row.stateUnreadable ? "Unknown" : appTypeLabel(row.appType) },
+    { icon: "call_split", label: "Mode", value: row.stateUnreadable ? "Unknown" : modeDisplayLabel(row.mode) },
+    { icon: "smart_toy", label: "Builder", value: row.stateUnreadable ? "Unknown" : builderDisplayLabel(row.provider ?? "claude") },
   ];
   const activeStageStatus = activeStage && state.stages && typeof state.stages === "object"
     ? state.stages[activeStage]?.status
@@ -5758,6 +5781,7 @@ app.get("/b/:id", async (c) => {
   const engineProvider: "claude" | "codex" = state.inference?.provider === "codex" ? "codex" : "claude";
   const commandCenter = renderBuildCommandCenter({
     id,
+    failureReason: row.status === "failed" ? summarizeFailureReason(id, state.error ?? undefined) : undefined,
     row,
     evidenceLedger,
     qualityLedger,
@@ -5862,7 +5886,7 @@ app.get("/b/:id", async (c) => {
             <div class="rds-build-title-row flex items-center gap-3 flex-wrap">
               <a href="/builds" class="text-on-surface-variant hover:text-on-surface font-ribbon text-ribbon flex items-center gap-1">${icon("arrow_back", 14)}<span>Builds</span></a>
               <span class="text-outline-variant">/</span>
-              <span class="rds-build-title font-body text-h1 text-primary-container" title="${escapeHtml(id)}">${escapeHtml(displayName)}</span>
+              <span class="rds-build-title font-body text-h1 text-on-surface" title="${escapeHtml(id)}">${escapeHtml(displayName)}</span>
               ${showHeaderStatus ? statusBadge(row) : ""}
               ${showHeaderStage ? `<span class="rds-current-stage inline-flex items-center gap-2 rounded-DEFAULT border border-primary-container/35 bg-primary-container/10 px-3 py-1 text-primary-container" title="Current pipeline stage">
                 ${icon(row.running ? "sync" : "flag", 15, row.running ? "animate-spin" : "")}
@@ -5921,15 +5945,11 @@ app.get("/b/:id", async (c) => {
           <div class="rds-mobile-actions rds-build-actions rds-header-actions flex items-center gap-component-gap flex-wrap">
             ${(() => {
               const buttons: string[] = [];
+              // The status card below owns the next action (Open app, Pause,
+              // Resume, Spawn fixer). The header only carries Stop, quietly,
+              // so a view never shows the same loud button twice.
               if (row.running) {
-                if (canOpenPreview) {
-                  const previewLabel = row.hasZoService ? "Open live preview" : "Open local preview";
-                  buttons.push(`<a class="js-open-preview-action px-3 py-1.5 bg-primary-container hover:bg-surface-tint text-on-primary-container rounded-DEFAULT font-ribbon text-ribbon font-bold transition-colors flex items-center gap-1" href="${escapeHtml(previewUrl)}" target="_blank" title="${escapeHtml(previewUrl)}">${icon("open_in_new", 14)}<span>${previewLabel}</span></a>`);
-                }
-                buttons.push(actionBtn(`<span class="flex items-center gap-1">${icon("pause", 14)}Pause build</span>`, `onclick="cmd('pause')" title="Pause this build and resume it later from the active stage."`));
-                buttons.push(actionBtn(`<span class="flex items-center gap-1">${icon("stop", 14)}Stop build</span>`, `onclick="cmd('stop')"`, "primary"));
-              } else if (row.paused || row.runnerMissing) {
-                buttons.push(actionBtn(`<span class="flex items-center gap-1">${icon("play_arrow", 14)}Resume build</span>`, `onclick="cmd('resume')" title="Resume this build from the current stage."`, "primary"));
+                buttons.push(actionBtn(`<span class="flex items-center gap-1">${icon("stop", 14)}Stop build</span>`, `onclick="cmd('stop')" title="Stop this build. Use Pause if you want to continue later."`));
               }
               return buttons.join("\n");
             })()}
@@ -5968,8 +5988,6 @@ app.get("/b/:id", async (c) => {
 
       ${row.reviewStatus === "pending" ? "" : reviewBanner}
       ${stuckBanner}
-      ${runnerMissingBanner}
-      ${failedBanner}
       ${idleBanner}
       ${iterationBanner}
 
@@ -6154,6 +6172,7 @@ app.get("/b/:id", async (c) => {
 
     <script>
       window.RDS_BUILD_ID = ${JSON.stringify(id)};
+      window.RDS_BUILD_RUNNING = ${row.running || iterationState.running || fixerState.running ? "true" : "false"};
       ${clientScript()}
       ${detailScript(row.running)}
       ${chatScript()}
@@ -7847,7 +7866,7 @@ app.get("/docs", (c) => {
       <div class="rds-page-header">
         <div>
           <div class="rds-page-eyebrow">Reference</div>
-          <h1 class="rds-page-title flex items-center gap-2">${icon("menu_book", 24, "text-primary-container")}<span>RDS Documentation</span></h1>
+          <h1 class="rds-page-title">RDS Documentation</h1>
           <p class="rds-page-copy">Operator-facing map of the documentation for this RDS install.</p>
         </div>
         <a class="rds-action-secondary" href="https://github.com/chrissotraidis/RDS" target="_blank" rel="noopener noreferrer">${icon("open_in_new", 14)}<span>GitHub</span></a>
@@ -7955,13 +7974,13 @@ app.get("/agents", (c) => {
       </td>
       <td class="px-3 py-2">
         <div class="flex flex-wrap gap-1 font-ribbon text-ribbon">
-          <button type="button" onclick="agentSessionAction('${escapeHtml(s.id)}','status')" class="px-2 py-1 border border-outline-variant rounded text-on-surface hover:border-primary-container">Status</button>
-          <button type="button" onclick="agentSessionAction('${escapeHtml(s.id)}','diff')" class="px-2 py-1 border border-outline-variant rounded text-on-surface hover:border-primary-container">Diff</button>
-          <button type="button" onclick="agentSessionAction('${escapeHtml(s.id)}','review')" class="px-2 py-1 border border-outline-variant rounded text-on-surface hover:border-primary-container">Review</button>
-          <button type="button" onclick="agentSessionAction('${escapeHtml(s.id)}','handoff')" class="px-2 py-1 border border-outline-variant rounded text-on-surface hover:border-primary-container">Handoff</button>
-          <button type="button" onclick="agentSessionAction('${escapeHtml(s.id)}','stop')" class="px-2 py-1 border border-outline-variant rounded text-on-surface hover:border-primary-container">Stop</button>
-          <button type="button" onclick="agentSessionAction('${escapeHtml(s.id)}','merge')" class="px-2 py-1 border border-secondary/40 rounded text-secondary hover:bg-secondary-container/10">Merge</button>
-          <button type="button" onclick="agentSessionAction('${escapeHtml(s.id)}','discard')" class="px-2 py-1 border border-error/40 rounded text-error hover:bg-error/10">Discard</button>
+          <button type="button" onclick="agentSessionAction(${jsArg(s.id)},'status')" class="px-2 py-1 border border-outline-variant rounded text-on-surface hover:border-primary-container">Status</button>
+          <button type="button" onclick="agentSessionAction(${jsArg(s.id)},'diff')" class="px-2 py-1 border border-outline-variant rounded text-on-surface hover:border-primary-container">Diff</button>
+          <button type="button" onclick="agentSessionAction(${jsArg(s.id)},'review')" class="px-2 py-1 border border-outline-variant rounded text-on-surface hover:border-primary-container">Review</button>
+          <button type="button" onclick="agentSessionAction(${jsArg(s.id)},'handoff')" class="px-2 py-1 border border-outline-variant rounded text-on-surface hover:border-primary-container">Handoff</button>
+          <button type="button" onclick="agentSessionAction(${jsArg(s.id)},'stop')" class="px-2 py-1 border border-outline-variant rounded text-on-surface hover:border-primary-container">Stop</button>
+          <button type="button" onclick="agentSessionAction(${jsArg(s.id)},'merge')" class="px-2 py-1 border border-secondary/40 rounded text-secondary hover:bg-secondary-container/10">Merge</button>
+          <button type="button" onclick="agentSessionAction(${jsArg(s.id)},'discard')" class="px-2 py-1 border border-error/40 rounded text-error hover:bg-error/10">Discard</button>
         </div>
       </td>
     </tr>`;
@@ -7971,7 +7990,7 @@ app.get("/agents", (c) => {
       <div class="rds-page-header">
         <div>
           <div class="rds-page-eyebrow">Workers</div>
-          <h1 class="rds-page-title flex items-center gap-2">${icon("smart_toy", 24, "text-primary-container")}<span>Agent Sessions</span></h1>
+          <h1 class="rds-page-title">Agent Sessions</h1>
           <p class="rds-page-copy">Persistent Claude Code or Codex workers in isolated git worktrees, managed from one operator control plane.</p>
         </div>
         <a class="rds-action-secondary" href="/docs">${icon("menu_book", 14)}<span>Docs</span></a>
@@ -8061,14 +8080,12 @@ app.get("/chat", (c) => {
     <div class="rds-chat-page h-auto md:h-full flex flex-col" style="min-height:calc(100dvh - 80px)">
       <div class="rds-chat-header rds-page-header shrink-0">
         <div class="min-w-0">
-          <a href="/" class="md:hidden inline-flex mb-1 font-ribbon text-ribbon text-on-surface-variant hover:text-on-surface">← hub</a>
           <div class="rds-page-eyebrow hidden md:block">Command thread</div>
           <h1 class="rds-page-title">Chat with RDS</h1>
           <p class="rds-page-copy hidden md:block">Persistent server-side threads. Send a message and navigate freely; RDS keeps thinking and the reply lands in the thread when ready.</p>
         </div>
         <div class="flex items-center gap-2 shrink-0">
           <button type="button" onclick="toggleChatThreads()" class="md:hidden rds-action-secondary">${icon("forum", 14)}<span>Threads</span></button>
-          <a href="/" class="hidden md:inline-flex font-ribbon text-ribbon text-on-surface-variant hover:text-on-surface">← back to hub</a>
         </div>
       </div>
       <div class="rds-chat-grid flex-1 min-h-0 rds-mobile-stack grid grid-cols-[260px_minmax(0,1fr)] gap-3">
@@ -8135,10 +8152,9 @@ app.get("/settings", (c) => {
       <div class="rds-page-header">
         <div>
           <div class="rds-page-eyebrow">Control surface</div>
-          <h1 class="rds-page-title flex items-center gap-2">${icon("settings", 24, "text-primary-container")}<span>Settings</span></h1>
+          <h1 class="rds-page-title">Settings</h1>
           <p class="rds-page-copy">Operational defaults and registry health. These settings affect future builds; active builds keep the provider/model recorded at build start.</p>
         </div>
-        <a class="rds-action-secondary" href="/">${icon("arrow_back", 14)}<span>Hub</span></a>
       </div>
 
       <div class="flex items-center gap-2 flex-wrap">
@@ -8341,7 +8357,7 @@ app.get("/settings/stacks", (c) => {
       <div class="rds-page-header">
         <div>
           <div class="rds-page-eyebrow">Runtime reference</div>
-          <h1 class="rds-page-title flex items-center gap-2">${icon("layers", 24, "text-primary-container")}<span>Build Types</span></h1>
+          <h1 class="rds-page-title">Build Types</h1>
           <p class="rds-page-copy">A build type combines the runtime stack with the app-type lens QA and taste review should use.</p>
         </div>
         <div class="flex items-center gap-3 shrink-0">
@@ -8439,7 +8455,7 @@ app.get("/settings/skills", (c) => {
       <div class="rds-page-header">
         <div>
           <div class="rds-page-eyebrow">Capability catalog</div>
-          <h1 class="rds-page-title flex items-center gap-2">${icon("extension", 24, "text-primary-container")}<span>Skills Catalog</span></h1>
+          <h1 class="rds-page-title">Skills Catalog</h1>
           <p class="rds-page-copy">Skills are RDS capability packs. They add context, verification, integrations, deploy instructions, or stack-specific recipes when the PRD calls for them.</p>
         </div>
         <div class="flex items-center gap-3 shrink-0">
@@ -8514,7 +8530,7 @@ app.get("/settings/skills", (c) => {
         </summary>
         <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-2 mt-gutter">
           ${Array.from(bySource.entries()).map(([source, group]) => `
-            <button type="button" onclick="document.getElementById('skill-category-filter').value='${escapeHtml(source)}'; rdsFilterSkillCatalog(); document.getElementById('skill-results').scrollIntoView({behavior:'smooth', block:'start'});" class="text-left bg-surface border border-outline-variant rounded-DEFAULT p-3 hover:border-primary-container transition-colors">
+            <button type="button" onclick="document.getElementById('skill-category-filter').value=${jsArg(source)}; rdsFilterSkillCatalog(); document.getElementById('skill-results').scrollIntoView({behavior:'smooth', block:'start'});" class="text-left bg-surface border border-outline-variant rounded-DEFAULT p-3 hover:border-primary-container transition-colors">
               <div class="font-ribbon text-ribbon text-on-surface">${escapeHtml(source)}</div>
               <div class="font-table text-table text-on-surface-variant">${group.filter((skill) => skill.status === "ready").length} ready</div>
             </button>
@@ -8580,7 +8596,7 @@ app.get("/settings/components", (c) => {
       <div class="rds-page-header">
         <div>
           <div class="rds-page-eyebrow">Inventory</div>
-          <h1 class="rds-page-title flex items-center gap-2">${icon("inventory_2", 24, "text-primary-container")}<span>Components</span></h1>
+          <h1 class="rds-page-title">Components</h1>
           <p class="rds-page-copy">Vendored components, source paths, and upgrade implications for RDS.</p>
         </div>
         <a class="rds-action-secondary" href="/settings">${icon("arrow_back", 14)}<span>Settings</span></a>
@@ -8736,18 +8752,17 @@ app.get("/audit", (c) => {
 
   return c.html(layout("Audit log", `
     <div class="flex flex-col gap-component-gap">
-      <div class="bg-surface-container border border-outline-variant rounded-DEFAULT px-container-padding py-gutter flex items-center justify-between gap-3 flex-wrap">
-        <div class="flex items-center gap-3 flex-wrap">
-          <h1 class="font-h1 text-h1 text-on-surface flex items-center gap-2">${icon("analytics", 20, "text-primary-container")}<span>Audit log</span></h1>
+      <div class="rds-page-header">
+        <div>
+          <div class="rds-page-eyebrow">Activity</div>
+          <h1 class="rds-page-title">Audit log <span class="font-code text-[13px] font-normal text-outline align-middle">${entries.length} ${entries.length === 1 ? "entry" : "entries"}</span></h1>
+          <p class="rds-page-copy">Every write action in one append-only record: build start and stop, deploys, approvals, watchdog changes, and uploads. Stored in <code class="font-code text-code" title="${escapeHtml(AUDIT_LOG)}">${escapeHtml(basename(AUDIT_LOG))}</code> in the dashboard state folder.</p>
         </div>
-        <div class="flex items-center gap-3 font-ribbon text-ribbon flex-wrap">
-          <span class="inline-flex items-center gap-1 px-2 py-1 rounded-DEFAULT bg-surface-container-high border border-outline-variant text-on-surface"><b>${entries.length}</b><span class="text-on-surface-variant">entries</span></span>
-          <a class="inline-flex items-center gap-1 px-2 py-1 rounded-DEFAULT bg-surface-container-high border border-outline-variant text-on-surface hover:bg-surface-bright transition-colors" href="/audit?format=csv" download>${icon("download", 14)}<span>Export CSV</span></a>
-          <a class="inline-flex items-center gap-1 px-2 py-1 rounded-DEFAULT bg-surface-container-high border border-outline-variant text-on-surface hover:bg-surface-bright transition-colors" href="/audit?format=json" download>${icon("data_object", 14)}<span>Export JSON</span></a>
-          <a class="text-outline hover:text-on-surface flex items-center gap-1" href="/">${icon("arrow_back", 14)}<span>Hub</span></a>
+        <div class="flex items-center gap-2 flex-wrap">
+          <a class="rds-action-secondary" href="/audit?format=csv" download>${icon("download", 14)}<span>Export CSV</span></a>
+          <a class="rds-action-secondary" href="/audit?format=json" download>${icon("data_object", 14)}<span>Export JSON</span></a>
         </div>
       </div>
-      <p class="text-on-surface-variant font-body text-body">Append-only log of all write actions (build start/stop, deploy, approve/reject, watchdog toggle, PRD upload). Source: <code class="font-code text-code" title="${escapeHtml(AUDIT_LOG)}">${escapeHtml(basename(AUDIT_LOG))}</code> <span class="text-outline">in the dashboard state dir</span></p>
       <div class="md:hidden space-y-3">
         ${mobileRows || `<div class="px-3 py-6 text-center text-on-surface-variant italic">No audit entries yet.</div>`}
       </div>
@@ -8938,7 +8953,7 @@ function statusKind(b: BuildRow): "running" | "stuck" | "failed" | "paused" | "d
   if (b.stuck || b.runnerMissing || b.status === "stalled") return "stuck";
   if (b.running) return "running";
   if (b.status === "failed") return "failed";
-  if (b.status === "complete" || b.status === "done") return "done";
+  if (b.status === "complete" || b.status === "completed" || b.status === "done" || b.status === "passed" || b.reviewStatus === "approved") return "done";
   return "other";
 }
 
@@ -8971,7 +8986,9 @@ function statusBadge(b: BuildRow): string {
     failed:  { label: "Failed", cls: "bg-error/10 text-error border border-error/30" },
     paused:  { label: "Paused", cls: "bg-tertiary-container/10 text-tertiary-container border border-tertiary-container/30" },
     done:    { label: "Done",   cls: "bg-surface-container text-on-surface-variant border border-outline-variant" },
-    other:   { label: humanStatus(b.status), cls: "bg-surface-container text-on-surface-variant border border-outline-variant" },
+    other:   b.stateUnreadable
+      ? { label: "State unreadable", cls: "bg-error/10 text-error border border-error/30" }
+      : { label: humanStatus(b.status), cls: "bg-surface-container text-on-surface-variant border border-outline-variant" },
   };
   const entry = map[k];
   return `<span class="rds-status-badge inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[11px] font-medium ${entry.cls}">${escapeHtml(entry.label)}</span>`;
@@ -8999,12 +9016,13 @@ function tagPill(text: string, variant: "default" | "live" | "offline" = "defaul
   return `<span class="inline-block px-1.5 py-0.5 rounded text-[10px] border ${cls}">${escapeHtml(text)}</span>`;
 }
 
-function hostingPill(b: BuildRow): string {
+function hostingPill(b: BuildRow, opts: { quietWhenUnhosted?: boolean } = {}): string {
   if (b.liveOnZo) return tagPill("Zo live", "live");
   if (b.hasZoService) return tagPill("Zo check");
   if (b.serviceStatus === "deregistered") return tagPill("Zo offline", "offline");
   if (b.localPreviewRunning) return tagPill("local running");
-  return tagPill("not hosted");
+  // Absence is the normal case; lists say nothing rather than repeat it.
+  return opts.quietWhenUnhosted ? "" : tagPill("not hosted");
 }
 
 function hostingLabel(b: BuildRow): string {
@@ -9886,8 +9904,10 @@ function renderBuildCommandCenter(opts: {
   fixerRunning: boolean;
   iterationRunning: boolean;
   engine: { provider: "claude" | "codex"; claudeModel: string; codexModel: string };
+  failureReason?: string;
 }): string {
-  const { id, row, evidenceLedger, qualityLedger, previewUrl, canOpenPreview, evidenceBlocksApproval, fixerRunning, iterationRunning, engine } = opts;
+  const { id, row, evidenceLedger, qualityLedger, previewUrl, canOpenPreview, evidenceBlocksApproval, fixerRunning, iterationRunning, engine, failureReason } = opts;
+  const failedIdle = !row.running && !iterationRunning && !fixerRunning && row.status === "failed";
   const evidenceVerdict = evidenceLedger?.verdict || "";
   const staleLiveEvidence = !row.running && !fixerRunning && !iterationRunning && ["building", "recovering"].includes(evidenceVerdict);
   const activeRecovery = iterationRunning || fixerRunning;
@@ -9910,6 +9930,10 @@ function renderBuildCommandCenter(opts: {
     ? `Running ${displayTokenLabel(row.stage || "build")}`
     : row.paused
       ? `Paused at ${displayTokenLabel(row.stage || "build")}`
+      : row.stateUnreadable
+        ? "State file unreadable"
+      : failedIdle && row.stage
+        ? `Failed at ${displayTokenLabel(row.stage)}`
       : staleTasteOnly
         ? "Blocked by stale review evidence"
       : evidenceBlocksApproval && row.reviewStatus === "pending"
@@ -9925,7 +9949,11 @@ function renderBuildCommandCenter(opts: {
     bad ? "block" :
     verdict === "approved" ? "verified" :
     "fact_check";
-  const nextAction = runnerMissing
+  const nextAction = row.stateUnreadable
+    ? "This build's state.json could not be parsed, so its stage, stack, and review status are unknown. Restore or repair the file, then reload."
+    : failedIdle && failureReason
+    ? failureReason
+    : runnerMissing
     ? `No RDS runner is attached. Resume from ${displayTokenLabel(row.stage || "current stage")}.`
     : iterationRunning
     ? "RDS is applying changes, then checks, QA, and redeploy."
@@ -9940,7 +9968,11 @@ function renderBuildCommandCenter(opts: {
     : staleLiveEvidence
     ? "No live RDS runner is attached to this build. Inspect logs or continue the RDS Goal loop."
     : evidenceLedger?.summary?.nextAction
-    || (row.running ? "Watch the live log until the current stage finishes." : row.reviewStatus === "pending" ? "Review the live app and approve or reject." : "Open the app or inspect logs.");
+    || (row.running ? "Watch the live log until the current stage finishes."
+      : row.reviewStatus === "pending" ? "Review the live app and approve or reject."
+      : row.reviewStatus === "approved" ? "Approved. Nothing else is needed unless you want another iteration."
+      : canOpenPreview ? "Open the app to check the result."
+      : "Nothing is running. Inspect the logs, or continue with a goal or iteration.");
   const blockerSource = staleTasteOnly
     ? (evidenceLedger?.blockers || []).filter((b) => b.code === "taste_review_stale" || b.code === "taste_review_blocking")
     : (evidenceLedger?.blockers || []);
@@ -9975,7 +10007,9 @@ function renderBuildCommandCenter(opts: {
   // Idle-build chips only state what is known: absent evidence stays quiet
   // ("scenarios missing · 0/0 skills · no recovery attempts" on a clean build
   // reads like a problem when nothing is wrong).
-  const idleChips: string[] = [blockerClass === "none" ? "no blockers" : displayTokenLabel(blockerClass)];
+  const idleChips: string[] = [blockerClass === "none"
+    ? (row.stateUnreadable ? "state unknown" : failedIdle ? "run failed" : "no blockers")
+    : displayTokenLabel(blockerClass)];
   if (qualityLedger?.scenarios?.executed || qualityLedger?.scenarios?.available) idleChips.push(scenarioStatus);
   if ((qualityLedger?.skills?.requested?.length ?? 0) > 0) idleChips.push(skillCount);
   if (attempts.fixerStarted || attempts.iterateStarted || attempts.needsReview) idleChips.push(attemptText);
@@ -10018,6 +10052,8 @@ function renderBuildCommandCenter(opts: {
       ${hiddenBlockers ? `<button type="button" onclick="document.getElementById('quality-ledger-details')?.setAttribute('open','open');document.getElementById('quality-ledger-details')?.scrollIntoView({behavior:'smooth',block:'start'});" class="rds-command-link">Show ${hiddenBlockers} more in evidence</button>` : ""}`
     : row.running && !row.stuck && !runnerMissing
       ? `<p class="rds-command-muted">Scaffold is actively working. Use the detailed task progress below; intervene only if output goes stale.</p>`
+      : failedIdle
+      ? `<p class="rds-command-muted">No QA evidence explains this failure yet. Spawn fixer to have the builder diagnose the stage, or read the stage logs.</p>`
       : `<p class="rds-command-muted">No blocking evidence recorded.</p>`;
   const action = (label: string, onclick: string, kind: "primary" | "secondary" | "danger" = "secondary", disabled = false) => {
     const cls = kind === "primary"
@@ -10080,7 +10116,7 @@ function renderBuildCommandCenter(opts: {
         <div class="rds-command-live-row">
           ${icon(row.hasZoService ? "cloud_done" : "computer", 16)}
           <a href="${escapeHtml(previewUrl)}" target="_blank" title="${escapeHtml(previewUrl)}">${escapeHtml(previewUrl)}</a>
-          <button type="button" onclick="navigator.clipboard.writeText('${escapeHtml(previewUrl)}').then(function(){rdsToast('URL copied.','info');})">${icon("content_copy", 13)}<span>Copy</span></button>
+          <button type="button" onclick="navigator.clipboard.writeText(${jsArg(previewUrl)}).then(function(){rdsToast('URL copied.','info');})">${icon("content_copy", 13)}<span>Copy</span></button>
         </div>
       </div>`
     : "";
@@ -10261,7 +10297,7 @@ function stageProgressBar(timeline: StagePoint[], currentStage: string | undefin
     }
 
     return `
-      <button type="button" onclick="toggleStageSummary('${escapeHtml(def.id)}')" data-stage-chip="${escapeHtml(def.id)}" class="flex-[1_0_142px] min-w-[142px] flex items-center gap-2 px-3 text-left hover:bg-surface-bright focus:outline-none focus:ring-1 focus:ring-primary-container ${isLast ? "" : "border-r border-outline-variant"} ${segCls}" title="${escapeHtml(def.id)} · ${escapeHtml(status)}">
+      <button type="button" onclick="toggleStageSummary(${jsArg(def.id)})" data-stage-chip="${escapeHtml(def.id)}" class="flex-[1_0_142px] min-w-[142px] flex items-center gap-2 px-3 text-left hover:bg-surface-bright focus:outline-none focus:ring-1 focus:ring-primary-container ${isLast ? "" : "border-r border-outline-variant"} ${segCls}" title="${escapeHtml(def.id)} · ${escapeHtml(status)}">
         <span class="material-symbols-outlined text-[16px] ${iconCls}" ${iconName === "sync" ? `style="animation-duration:3s"` : ""}>${iconName}</span>
         <div class="flex flex-col justify-center min-w-0">
           <span class="font-ribbon text-ribbon ${labelCls} whitespace-nowrap truncate">${escapeHtml(def.label)}</span>
@@ -11616,7 +11652,8 @@ function detailScript(initialRunning: boolean): string {
       }).join('');
     }
     var lg = new EventSource('/b/' + encodeURIComponent(id) + '/log');
-    lg.addEventListener('open',  function () { setConn('conn-log', 'on');  setLogState('streaming', 'bg-primary-container'); });
+    // An open connection to an idle build's log is not "streaming"; say so.
+    lg.addEventListener('open',  function () { setConn('conn-log', 'on');  if (window.RDS_BUILD_RUNNING) setLogState('streaming', 'bg-primary-container'); else setLogState('idle', 'bg-outline'); });
     lg.addEventListener('error', function () { setConn('conn-log', 'off'); setLogState('disconnected', 'bg-error'); });
     lg.addEventListener('source', function(e) {
       try {
@@ -12264,21 +12301,28 @@ function chatScript(): string {
 
     function relativeTime(ts) {
       if (!ts) return '';
-      var s = Math.max(1, Math.round((Date.now() - ts) / 1000));
+      var s = Math.round((Date.now() - ts) / 1000);
+      if (s < 5) return 'just now';
       if (s < 60) return s + 's ago';
       var m = Math.round(s / 60); if (m < 60) return m + 'm ago';
       var h = Math.round(m / 60); if (h < 48) return h + 'h ago';
       var d = Math.round(h / 24); return d + 'd ago';
     }
 
+    function visibleChatSessions() {
+      return rdsChatState.sessions.filter(function (s) {
+        return !s.build_id || !!s.last_message || s.pending || s.id === rdsChatState.activeId;
+      });
+    }
     function renderSessionList() {
       var list = document.getElementById('chat-session-list');
       if (!list) return;
-      if (!rdsChatState.sessions.length) {
+      var sessions = visibleChatSessions();
+      if (!sessions.length) {
         list.innerHTML = '<li class="px-3 py-3 text-on-surface-variant font-table text-table italic">No threads yet. "+ new" to start one.</li>';
         return;
       }
-      list.innerHTML = rdsChatState.sessions.map(function (s) {
+      list.innerHTML = sessions.map(function (s) {
         var active = s.id === rdsChatState.activeId;
         var pendingDot = s.pending
           ? '<span class="w-1.5 h-1.5 rounded-full bg-tertiary-container animate-pulse shrink-0" title="reply in progress"></span>'
@@ -12983,8 +13027,8 @@ function chatScript(): string {
         }
       } else if (stored && rdsChatState.sessions.find(function (s) { return s.id === stored; })) {
         pickId = stored;
-      } else if (rdsChatState.sessions[0]) {
-        pickId = rdsChatState.sessions[0].id;
+      } else if (visibleChatSessions()[0]) {
+        pickId = visibleChatSessions()[0].id;
       }
       // If nothing exists yet, render the empty-but-typeable state.
       if (!pickId) renderActiveSession(null);
@@ -13026,7 +13070,7 @@ function chatScript(): string {
 
 function layout(title: string, body: string, opts: { nav?: NavKey; topbarTab?: "builds" | "overview" } = {}): string {
   const navKey: NavKey = opts.nav ?? "hub";
-  // Styles are precompiled (tailwind.config.js → public/tailwind.css) and
+  // Styles are precompiled (tailwind.config.cjs → public/tailwind.css) and
   // served from /static — no CDN JIT, no unstyled flash, works offline.
   return `<!doctype html>
 <html class="dark" lang="en">
@@ -13147,7 +13191,7 @@ function layout(title: string, body: string, opts: { nav?: NavKey; topbarTab?: "
     margin-bottom: 16px;
   }
   .rds-page-eyebrow {
-    color: #6ad7a3;
+    color: #75817a;
     font-family: var(--font-ribbon);
     font-size: 11px;
     line-height: 15px;
@@ -13369,9 +13413,7 @@ function layout(title: string, body: string, opts: { nav?: NavKey; topbarTab?: "
     transition: border-color .16s ease, transform .16s ease, box-shadow .16s ease;
   }
   .rds-hub-card:hover {
-    border-color: rgba(106,215,163,.28);
-    transform: translateY(-1px);
-    box-shadow: inset 0 1px 0 rgba(255,255,255,.035), 0 18px 44px -34px rgba(0,0,0,.8);
+    border-color: rgba(117,129,122,.45);
   }
   .rds-hub-card h2 {
     letter-spacing: 0;
@@ -13396,19 +13438,17 @@ function layout(title: string, body: string, opts: { nav?: NavKey; topbarTab?: "
   .rds-recent-build-row {
     display: flex;
     flex-direction: column;
-    gap: 5px;
-    min-height: 68px;
+    gap: 3px;
     border: 1px solid rgba(36,43,40,.58);
     border-radius: 8px;
     padding: 8px 10px;
     background: rgba(7,9,8,.34);
     color: #e9eeea;
-    transition: background .15s ease, border-color .15s ease, transform .15s ease;
+    transition: background .15s ease, border-color .15s ease;
   }
   .rds-recent-build-row:hover {
     background: rgba(27,33,30,.82);
-    border-color: rgba(106,215,163,.28);
-    transform: translateY(-1px);
+    border-color: rgba(117,129,122,.45);
   }
   .rds-recent-build-top,
   .rds-recent-build-title-wrap,
@@ -13433,7 +13473,17 @@ function layout(title: string, body: string, opts: { nav?: NavKey; topbarTab?: "
   }
   .rds-recent-build-bottom {
     gap: 6px;
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
+    overflow: hidden;
+    padding-left: 16px;
+  }
+  .rds-recent-build-bottom > span { flex: 0 0 auto; }
+  .rds-recent-build-bottom > .rds-recent-build-mode { flex: 0 1 auto; min-width: 0; display: block; }
+  .rds-recent-build-id { display: none; }
+  .rds-recent-build-bottom > span + span::before {
+    content: "·";
+    margin-right: 6px;
+    color: #4a554f;
   }
   .rds-recent-build-title,
   .rds-recent-build-id,
@@ -13459,27 +13509,18 @@ function layout(title: string, body: string, opts: { nav?: NavKey; topbarTab?: "
   .rds-recent-build-stage,
   .rds-recent-build-review,
   .rds-recent-build-mode {
-    min-height: 22px;
     display: inline-flex;
     align-items: center;
     max-width: 100%;
-    border: 1px solid rgba(36,43,40,.78);
-    border-radius: 999px;
-    background: rgba(16,20,18,.62);
-    padding: 2px 8px;
     font-family: var(--font-ribbon);
-    font-size: 11px;
+    font-size: 11.5px;
     line-height: 16px;
     color: #a5b0a9;
   }
-  .rds-recent-build-stage {
-    color: #8beebb;
-    border-color: rgba(106,215,163,.22);
-    background: rgba(106,215,163,.055);
-  }
-  .rds-recent-build-review {
-    color: #d3ddd6;
-  }
+  .rds-recent-build-review { color: #d3ddd6; }
+  .rds-recent-build-review.is-bad { color: #ffb4ab; }
+  .rds-recent-build-review.is-warn { color: #f0b869; }
+  .rds-recent-build-review.is-live { color: #6ad7a3; }
   .rds-recent-build-age {
     color: #a5b0a9;
     font-family: var(--font-code);

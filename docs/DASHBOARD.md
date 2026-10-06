@@ -66,7 +66,7 @@ bun run dev        # --hot reload; or `bun run start`
 Styles are precompiled: `dashboard/public/tailwind.css` is vendored and served
 from `/static/tailwind.css`, so there is no CSS build step just to run the
 dashboard. If you add or change Tailwind classes or tokens, regenerate it with
-`bun run build:css` (config: `dashboard/tailwind.config.js`).
+`bun run build:css` (config: `dashboard/tailwind.config.cjs`).
 
 Then open `http://localhost:4000` — with no credentials configured the
 dashboard runs in localhost-only setup mode, so a fresh clone works
