@@ -106,3 +106,14 @@ Notes for macOS:
 build rows, build-detail controls, toast accessibility. It needs
 `RDS_DASHBOARD_PASSWORD` and a Playwright Chromium
 (`bunx playwright install chromium`).
+On a clean machine, seed the fixture builds the suite expects first, so no
+check is skipped for a missing build:
+
+```bash
+cd dashboard
+bun run tests/seed-selftest-fixtures.ts   # uses RDS_BUILDS_DIR; never overwrites existing builds
+```
+
+CI does exactly this in the `dashboard-selftest` job of
+`.github/workflows/public-checks.yml`: temp data folders, seeded fixtures,
+credentials set, and the full suite run on every push and pull request.
