@@ -95,7 +95,7 @@ async function main() {
   await check("hub surfaces hosted live builds before stale recent builds", async () => {
     await page!.goto(BASE, { waitUntil: "domcontentloaded" });
     const body = await page!.locator("body").innerText();
-    if (!body.includes("Zo Hosting") || !body.includes("Zo live")) return;
+    if (!/zo hosting/i.test(body) || !body.includes("Zo live")) return;
     const recentText = await page!.locator("text=Recent Builds").locator("xpath=ancestor::div[contains(@class,'bg-surface-container')]").innerText();
     if (!recentText.includes("Zo live")) throw new Error("Recent Builds did not include the live hosted build");
     const firstRecent = await page!.locator("text=Recent Builds").locator("xpath=ancestor::div[contains(@class,'bg-surface-container')]").locator(`a[href^="/b/"]`).first().innerText();

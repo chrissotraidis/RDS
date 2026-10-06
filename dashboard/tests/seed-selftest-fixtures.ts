@@ -8,6 +8,7 @@
 //     (selftest prefers a row whose id contains "pong")
 //   - the pending-review Trove build
 //   - an approved terminal build
+//   - an older build that is live on Zo (the Hub must list it first)
 //
 // Usage: RDS_BUILDS_DIR=/tmp/rds/builds bun run tests/seed-selftest-fixtures.ts
 // Existing folders are left alone, so this never overwrites real builds.
@@ -103,4 +104,24 @@ seed(approvedId, {
     inference: { provider: "claude" },
     stages: allStages,
   },
+});
+
+const hostedId = "field-notes-hosted-20251201-000000";
+seed(hostedId, {
+  "state.json": {
+    build_id: hostedId,
+    display_name: "Field Notes",
+    mode: "green",
+    app_type: "content-site",
+    stack: "astro",
+    status: "done",
+    stage: "approved",
+    preview_url: "https://field-notes.example.com",
+    started_at: iso(400),
+    updated_at: iso(399),
+    review: { status: "approved", decided_by: "operator" },
+    inference: { provider: "codex" },
+    stages: allStages,
+  },
+  "service.json": { service_id: "svc-selftest", label: "field-notes", url: "https://field-notes.example.com", status: "live" },
 });

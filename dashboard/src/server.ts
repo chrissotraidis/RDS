@@ -4323,7 +4323,6 @@ app.get("/", async (c) => {
   const runningBuilds = builds.filter((b) => b.running);
   const activeBuildHref = runningBuilds.length === 1 ? `/b/${encodeURIComponent(runningBuilds[0].id)}` : "/builds?status=running";
   const hostedBuilds = builds.filter((b) => b.hasZoService);
-  const lastFailed = failedBuilds[0];
 
   // pull last 12 audit entries to seed the live activity card
   const auditEntries: { ts?: string; route?: string; build_id?: string; outcome?: string; note?: string }[] = existsSync(AUDIT_LOG)
@@ -4380,16 +4379,6 @@ app.get("/", async (c) => {
       <span class="shrink-0 font-table text-[11px] text-on-surface-variant">${rowActivityMs(b) ? escapeHtml(relativeTime(rowActivityMs(b))) : "—"}</span>
     </a>`).join("");
 
-  const pendingItems = pending.length
-    ? pending.map((b) => `
-      <div data-review-card="${escapeHtml(b.id)}" class="bg-[#101412] panel-border p-2 rounded flex justify-between items-center gap-2 group hover:bg-[#1b211e] transition-colors">
-        <a href="/b/${escapeHtml(b.id)}" class="min-w-0 flex-1">
-          <div class="font-body text-body text-on-surface truncate" title="${escapeHtml(b.id)}">${escapeHtml(b.displayName || compactBuildId(b.id))}</div>
-          <div class="font-table text-table text-on-surface-variant truncate">${escapeHtml([b.stack ? stackDisplayLabel(b.stack) : "", b.mode ? modeDisplayLabel(b.mode) : "", b.provider ? builderDisplayLabel(b.provider) : ""].filter(Boolean).join(" · ") || "—")}</div>
-        </a>
-        <button type="button" onclick="dismissReview(${jsArg(b.id)})" class="shrink-0 font-ribbon text-ribbon text-on-surface bg-[#1b211e] px-2 py-1 rounded hover:bg-[#242b28] transition-colors border border-[#242b28]" title="Hide this build from the Needs Review queue">Dismiss</button>
-      </div>`).join("")
-    : `<div class="text-on-surface-variant font-table text-table italic">Nothing waiting on review.</div>`;
 
   const activityRows = auditEntries.length ? auditEntries.map((e) => {
     const time = e.ts ? new Date(e.ts).toISOString().slice(11, 19) : "";
@@ -4415,181 +4404,111 @@ app.get("/", async (c) => {
       </span>
     </button>`;
 
-  const criticalCard = lastFailed
-    ? `<div class="bg-[#101412] border border-[#ffb4ab]/30 p-2 rounded flex flex-col gap-1">
-        <div class="flex justify-between items-start gap-2 min-w-0">
-          <div class="min-w-0">
-            <div class="font-body text-body text-on-surface truncate">${escapeHtml(lastFailed.displayName || lastFailed.slug || lastFailed.id)}</div>
-            <div class="font-code text-[10px] leading-4 text-on-surface-variant truncate">${escapeHtml(lastFailed.id)}</div>
-          </div>
-          <span class="font-ribbon text-ribbon text-error shrink-0">Failed${lastFailed.lastActivityMs ? ` · ${escapeHtml(relativeTime(lastFailed.lastActivityMs))}` : ""}</span>
-        </div>
-        <div class="font-table text-table text-on-surface-variant truncate">${lastFailed.stage ? `Failed at ${escapeHtml(displayTokenLabel(lastFailed.stage))}` : "Failed before a stage was recorded"}</div>
-        <div class="mt-1 flex justify-end gap-2">
-          <button type="button" onclick="dismissAlert(${jsArg(lastFailed.id)})" class="font-ribbon text-ribbon text-on-surface bg-[#1b211e] px-2 py-1 rounded hover:bg-[#242b28] transition-colors border border-[#242b28]">Dismiss</button>
-          <a href="/b/${escapeHtml(lastFailed.id)}" class="font-ribbon text-ribbon text-on-surface bg-[#1b211e] px-2 py-1 rounded hover:bg-[#242b28] transition-colors border border-[#242b28]">View build</a>
-        </div>
-      </div>`
-    : `<div class="text-on-surface-variant font-table text-table italic">No critical alerts.</div>`;
+
+  // "Needs you": everything that is waiting on the operator, worst first.
+  // Same classifier and wording as the Builds table and build pages.
+  type HubNeed = { b: BuildRow; reason: string; tone: "bad" | "warn"; dismiss?: "alert" | "review" };
+  const unreadableBuilds = builds.filter((b) => b.stateUnreadable);
+  const stuckBuilds = builds.filter((b) => !b.stateUnreadable && statusKind(b) === "stuck");
+  const needs: HubNeed[] = [
+    ...failedBuilds.filter((b) => !b.stateUnreadable).map((b): HubNeed => ({ b, tone: "bad", dismiss: "alert",
+      reason: b.stage ? `Failed at ${displayTokenLabel(b.stage)}` : "Failed before a stage was recorded" })),
+    ...unreadableBuilds.map((b): HubNeed => ({ b, tone: "bad", reason: "State file unreadable" })),
+    ...stuckBuilds.map((b): HubNeed => ({ b, tone: "warn",
+      reason: b.runnerMissing || b.status === "stalled"
+        ? `Runner stopped at ${displayTokenLabel(b.stage || "build")}`
+        : `No output at ${displayTokenLabel(b.stage || "build")}` })),
+    ...pending.filter((b) => !b.stateUnreadable).map((b): HubNeed => ({ b, tone: "warn", dismiss: "review", reason: "Waiting for your review" })),
+  ];
+  const needsShown = needs.slice(0, 6);
+  const needsRows = needsShown.map(({ b, reason, tone, dismiss }) => {
+    const age = rowActivityMs(b) ? relativeTime(rowActivityMs(b)) : "";
+    const dismissBtn = dismiss === "review"
+      ? `<button type="button" onclick="dismissReview(${jsArg(b.id)})" class="rds-need-dismiss" title="Hide this build from the review queue">Dismiss</button>`
+      : dismiss === "alert"
+        ? `<button type="button" onclick="dismissAlert(${jsArg(b.id)})" class="rds-need-dismiss" title="Hide this failure from the Hub">Dismiss</button>`
+        : "";
+    return `<div class="rds-need-row" ${dismiss === "review" ? `data-review-card="${escapeHtml(b.id)}"` : ""}>
+        <a href="/b/${escapeHtml(b.id)}" class="rds-need-main">
+          <span class="rds-need-dot is-${tone}"></span>
+          <span class="rds-need-text">
+            <span class="rds-need-title" title="${escapeHtml(b.id)}">${escapeHtml(b.displayName || compactBuildId(b.id))}</span>
+            <span class="rds-need-reason is-${tone}">${escapeHtml(reason)}${age ? `<span class="rds-need-age"> · ${escapeHtml(age)}</span>` : ""}</span>
+          </span>
+        </a>
+        <span class="rds-need-actions">${dismissBtn}<a href="/b/${escapeHtml(b.id)}" class="rds-need-open">Open</a></span>
+      </div>`;
+  }).join("");
+  const needsEmpty = builds.length
+    ? `<div class="rds-need-empty">${icon("task_alt", 18, "text-primary-container")}<span>Nothing needs you right now. Failures, stopped runners, and reviews show up here.</span></div>`
+    : `<div class="rds-need-empty">${icon("rocket_launch", 18, "text-on-surface-variant")}<span>No builds yet. <a href="/new" class="text-primary-container hover:underline">Start your first build</a>.</span></div>`;
 
   return c.html(layout("Hub", `
     <div class="max-w-[1400px] mx-auto">
       <div class="rds-page-header">
         <div>
           <div class="rds-page-eyebrow">Operator console</div>
-          <h1 class="rds-page-title">Hub Overview</h1>
-          <p class="rds-page-copy">System health, build movement, review queues, hosted services, and live activity in one scan.</p>
-        </div>
-        <div class="flex items-center gap-2 font-ribbon text-ribbon text-on-surface-variant">
-          <a href="/audit" class="rds-action-secondary">${icon("analytics", 14)}<span>Audit log</span></a>
+          <h1 class="rds-page-title">Hub</h1>
+          <p class="rds-page-copy">What needs you, what is running, and what changed.</p>
         </div>
       </div>
 
-      <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-gutter">
-
-        <!-- Build Engine -->
-        <div class="rds-hub-card rds-hub-card-compact bg-surface-container panel-border rounded-DEFAULT flex flex-col p-unit">
-          <div class="flex justify-between items-center mb-unit border-b border-[#242b28] pb-unit">
-            <h2 class="font-h2 text-h2 text-on-surface flex items-center gap-2">
-              ${icon("speed", 16, "text-primary-container")}<span>Build Engine</span>
-            </h2>
-            <span class="flex items-center gap-1 font-ribbon text-ribbon text-primary-container bg-primary-container/10 px-2 py-0.5 rounded">
-              <span class="w-1.5 h-1.5 rounded-full bg-primary-container"></span>${running > 0 ? "Running" : "Idle"}
-            </span>
-          </div>
-          <div class="md:hidden flex items-center justify-between gap-3 py-1">
-            <div class="font-table text-table text-on-surface-variant">
-              <a href="${escapeHtml(activeBuildHref)}" class="font-code text-code text-primary-container hover:underline">${running}</a> active build${running === 1 ? "" : "s"}
-            </div>
-            <a href="/new" class="rds-action-primary shrink-0">
-              ${icon("play_arrow", 14)}<span>Start</span>
-            </a>
-          </div>
-          <div class="hidden md:flex flex-1 flex-col justify-center items-center py-4 text-center">
-            <a href="${escapeHtml(activeBuildHref)}" class="text-[30px] leading-9 font-body font-bold tabular-nums text-primary-container hover:underline" title="${runningBuilds.length === 1 ? `Open ${runningBuilds[0].id}` : "View running builds"}">${running}</a>
-            <a href="${escapeHtml(activeBuildHref)}" class="font-ribbon text-ribbon text-on-surface-variant hover:text-primary-container mb-4 uppercase tracking-wider">Active Builds</a>
-            <a href="/new" class="rds-action-primary w-full">
-              ${icon("play_arrow", 18)}<span>New Build</span>
-            </a>
-          </div>
-        </div>
-
-        <!-- PRD Inbox -->
-        <div class="rds-hub-card rds-hub-card-compact bg-surface-container panel-border rounded-DEFAULT flex flex-col p-unit">
-          <div class="flex justify-between items-center mb-unit border-b border-[#242b28] pb-unit">
-            <h2 class="font-h2 text-h2 text-on-surface flex items-center gap-2">
-              ${icon("inbox", 16, "text-tertiary")}<span>PRD Inbox</span>
-            </h2>
-            <span class="font-ribbon text-ribbon text-on-surface-variant">drop a file</span>
-          </div>
-          <a href="/new" class="md:hidden border border-dashed border-[#242b28] rounded flex items-center justify-between gap-3 p-3 bg-[#101412]/50 hover:bg-[#101412] hover:border-primary-container transition-colors cursor-pointer group">
-            <div class="min-w-0">
-              <div class="font-body text-body text-on-surface truncate">Drop a PRD markdown file</div>
-              <div class="font-table text-table text-on-surface-variant truncate">opens the build composer</div>
-            </div>
-            ${icon("cloud_upload", 22, "text-on-surface-variant group-hover:text-primary-container transition-colors shrink-0")}
-          </a>
-          <a href="/new" class="hidden md:flex flex-1 border border-dashed border-[#242b28] rounded flex-col items-center justify-center p-4 bg-[#101412]/50 text-center hover:bg-[#101412] hover:border-primary-container transition-colors cursor-pointer group min-h-[180px]">
-            ${icon("cloud_upload", 28, "text-on-surface-variant mb-2 group-hover:text-primary-container transition-colors")}
-            <div class="font-body text-body text-on-surface mb-1">Drop a PRD markdown file</div>
-            <div class="font-table text-table text-on-surface-variant">opens the build composer</div>
-          </a>
-        </div>
-
-        <!-- Watchdog -->
-        <div class="rds-hub-card rds-hub-card-compact bg-surface-container panel-border rounded-DEFAULT flex flex-col p-unit">
-          <div class="flex justify-between items-center mb-unit border-b border-[#242b28] pb-unit">
-            <h2 class="font-h2 text-h2 text-on-surface flex items-center gap-2">
-              ${icon("monitor_heart", 16, "text-on-surface-variant")}<span>Watchdog</span>
-              <span class="relative group inline-flex items-center" tabindex="0">
-                ${icon("help", 14, "text-on-surface-variant cursor-help")}
-                <span class="hidden group-hover:block group-focus:block absolute left-5 top-1/2 -translate-y-1/2 z-50 w-72 p-2 rounded bg-[#070908] border border-[#242b28] font-body text-body text-on-surface-variant shadow-lg">
-                  Background process that watches running builds. If a build hasn't written anything for a while it's flagged as stuck and you get a Telegram alert. Toggle it on for long-running builds; leave it off if you don't need pages.
-                </span>
+      <section class="rds-hub-strip" aria-label="System status">
+        <a href="${escapeHtml(activeBuildHref)}" class="rds-strip-cell" title="${runningBuilds.length === 1 ? `Open ${escapeHtml(runningBuilds[0].id)}` : "View running builds"}">
+          <span class="rds-strip-label">Build engine</span>
+          <span class="rds-strip-value"><span class="rds-strip-dot ${running > 0 ? "is-live" : ""}"></span>${running > 0 ? `${running} running` : "Idle"}</span>
+        </a>
+        <div class="rds-strip-cell">
+          <span class="rds-strip-label">Watchdog
+            <span class="relative group inline-flex items-center normal-case tracking-normal" tabindex="0">
+              ${icon("help", 13, "text-outline cursor-help")}
+              <span class="hidden group-hover:block group-focus:block absolute left-5 top-1/2 -translate-y-1/2 z-50 w-72 p-2 rounded bg-[#070908] border border-[#242b28] font-body text-body text-on-surface-variant shadow-lg">
+                Background process that watches running builds. If a build stops writing output it is flagged as stuck and you get a Telegram alert.
               </span>
-            </h2>
-            <span id="watchdog-stat" class="${wd.running ? "" : "hidden"}"></span>
-            ${wdToggle}
-          </div>
-          <div class="rds-watchdog-strip">
-            <span class="font-ribbon text-ribbon ${wd.running ? "text-primary-container" : "text-on-surface-variant"} flex items-center gap-1">
-              ${icon(wd.running ? "shield" : "shield_lock", 14)}<span>${wd.running ? "Protected" : "Idle"}</span>
             </span>
-            <span class="font-code text-code text-on-surface-variant">PID ${wd.running && wd.pid ? wd.pid : "—"}</span>
-            <span class="font-code text-code ${stuck ? "text-tertiary-container" : "text-on-surface-variant"}">${stuck} stuck</span>
+          </span>
+          <span class="rds-strip-value">${wdToggle}<span>${wd.running ? "On" : "Off"}</span><span class="rds-strip-meta ${stuck ? "text-tertiary-container" : ""}">${stuck} stuck</span></span>
+          <span id="watchdog-stat" class="hidden"></span>
+        </div>
+        <a href="/builds?hosting=hosted" class="rds-strip-cell">
+          <span class="rds-strip-label">Zo hosting</span>
+          <span class="rds-strip-value">${hostedBuilds.length} ${hostedBuilds.length === 1 ? "service" : "services"}</span>
+        </a>
+        <a href="/new" class="rds-strip-cell rds-strip-drop">
+          <span class="rds-strip-label">PRD inbox</span>
+          <span class="rds-strip-value">${icon("cloud_upload", 16, "text-on-surface-variant")}<span>Drop a PRD or brief</span></span>
+        </a>
+      </section>
+
+      <div class="grid grid-cols-1 lg:grid-cols-[minmax(0,1.35fr)_minmax(0,1fr)] gap-gutter mt-gutter items-start">
+        <div class="rds-hub-card bg-surface-container panel-border rounded-DEFAULT flex flex-col p-unit">
+          <div class="flex justify-between items-center mb-unit border-b border-[#242b28] pb-unit">
+            <h2 class="font-h2 text-h2 text-on-surface flex items-center gap-2">${icon("notifications_active", 16, needs.length ? "text-tertiary-container" : "text-on-surface-variant")}<span>Needs you</span></h2>
+            <span class="font-ribbon text-ribbon ${needs.length ? "text-on-surface" : "text-on-surface-variant"}">${needs.length ? `${needs.length} ${needs.length === 1 ? "item" : "items"}` : "All clear"}</span>
+          </div>
+          <div class="flex flex-col gap-1.5">${needsRows || needsEmpty}</div>
+          ${needs.length > needsShown.length ? `<a href="/builds" class="mt-2 font-ribbon text-ribbon text-on-surface-variant hover:text-on-surface">${needs.length - needsShown.length} more in Builds →</a>` : ""}
+        </div>
+
+        <div class="rds-hub-card bg-surface-container panel-border rounded-DEFAULT flex flex-col p-unit">
+          <div class="flex justify-between items-center mb-unit border-b border-[#242b28] pb-unit">
+            <h2 class="font-h2 text-h2 text-on-surface flex items-center gap-2">${icon("history", 16)}<span>Recent builds</span></h2>
+            <a class="font-ribbon text-ribbon text-on-surface-variant hover:text-on-surface" href="/builds">View all</a>
+          </div>
+          <div class="md:hidden flex-1">
+            ${recentMobileItems || `<div class="py-2 font-table text-table text-on-surface-variant italic">No builds yet.</div>`}
+          </div>
+          <div class="hidden md:flex flex-1 flex-col gap-1">
+            ${recentRows || `<div class="py-2 px-2 font-table text-table text-on-surface-variant italic">No builds yet.</div>`}
           </div>
         </div>
 
-        <!-- Hosted Services -->
-        <div class="rds-hub-card bg-surface-container panel-border rounded-DEFAULT flex flex-col p-unit lg:min-h-[200px] lg:self-start">
+        <div class="rds-hub-card rds-hub-activity bg-surface-container panel-border rounded-DEFAULT flex flex-col p-unit lg:col-span-2">
           <div class="flex justify-between items-center mb-unit border-b border-[#242b28] pb-unit">
-            <h2 class="font-h2 text-h2 text-on-surface flex items-center gap-2">
-              ${icon("cloud_done", 16, "text-primary-container")}<span>Zo Hosting</span>
-            </h2>
-            <a class="font-ribbon text-ribbon text-primary-container hover:underline" href="/builds?hosting=hosted">${hostedBuilds.length} services</a>
+            <h2 class="font-h2 text-h2 text-on-surface flex items-center gap-2">${icon("list_alt", 16)}<span>Live activity</span></h2>
+            <a href="/audit" class="font-ribbon text-ribbon text-on-surface-variant hover:text-on-surface">Audit log →</a>
           </div>
-          <div class="flex-1 overflow-y-auto custom-scrollbar pr-1 space-y-2">
-            ${hostedBuilds.length ? hostedBuilds.slice(0, 5).map((b) => `
-              <a href="/b/${escapeHtml(b.id)}" class="bg-[#101412] panel-border p-2 rounded flex justify-between items-center gap-2 group hover:bg-[#1b211e] transition-colors">
-                <div class="min-w-0">
-                  <div class="font-body text-body text-on-surface truncate" title="${escapeHtml(b.id)}">${escapeHtml(b.displayName || compactBuildId(b.id))}</div>
-                  <div class="font-table text-table text-on-surface-variant truncate">${escapeHtml(hostingLabel(b))}</div>
-                </div>
-                <span class="shrink-0">${hostingPill(b)}</span>
-              </a>`).join("") : `<div class="text-on-surface-variant font-table text-table italic">No RDS builds are consuming Zo service slots.</div>`}
-          </div>
-        </div>
-
-        <!-- Needs Review -->
-        <div class="rds-hub-card bg-surface-container panel-border rounded-DEFAULT flex flex-col p-unit lg:self-start ${pending.length ? "lg:min-h-[200px]" : "rds-compact-empty"}">
-          <div class="flex justify-between items-center mb-unit border-b border-[#242b28] pb-unit">
-            <h2 class="font-h2 text-h2 text-on-surface flex items-center gap-2">
-              ${icon("pending_actions", 16, "text-error")}<span>Needs Review</span>
-            </h2>
-            <a class="font-ribbon text-ribbon bg-[#1b211e] text-on-surface-variant px-2 py-0.5 rounded hover:text-on-surface transition-colors" href="/builds?status=pending_review" title="${pendingAll.length === pending.length ? "" : `${pendingAll.length - pending.length} dismissed on this hub`}">${pending.length} Pending</a>
-          </div>
-          <div class="flex-1 overflow-y-auto custom-scrollbar pr-1 space-y-2 ${pending.length ? "" : "md:min-h-[120px]"}">${pendingItems}</div>
-        </div>
-
-        <!-- Recent Builds -->
-        <div class="rds-hub-card bg-surface-container panel-border rounded-DEFAULT flex flex-col p-unit lg:min-h-[200px]">
-          <div class="flex justify-between items-center mb-unit border-b border-[#242b28] pb-unit">
-            <h2 class="font-h2 text-h2 text-on-surface flex items-center gap-2">
-              ${icon("history", 16)}<span>Recent Builds</span>
-            </h2>
-            <a class="font-ribbon text-ribbon text-primary-container hover:underline" href="/builds">View All</a>
-          </div>
-          <div class="md:hidden flex-1 overflow-y-auto custom-scrollbar pr-1">
-            ${recentMobileItems || `<div class="py-2 font-table text-table text-on-surface-variant italic">No builds yet — <a href="/new" class="text-primary-container hover:underline not-italic">start your first build</a>.</div>`}
-          </div>
-          <div class="hidden md:flex flex-1 flex-col gap-1 overflow-y-auto custom-scrollbar pr-1">
-            ${recentRows || `<div class="py-2 px-2 font-table text-table text-on-surface-variant italic">No builds yet — <a href="/new" class="text-primary-container hover:underline not-italic">start your first build</a>.</div>`}
-          </div>
-        </div>
-
-        <!-- Critical Alerts -->
-        <div class="rds-hub-card bg-surface-container panel-border rounded-DEFAULT flex flex-col p-unit ${lastFailed ? "lg:min-h-[200px]" : "rds-compact-empty md:hidden"}">
-          <div class="flex justify-between items-center mb-unit border-b border-[#242b28] pb-unit">
-            <h2 class="font-h2 text-h2 text-on-surface flex items-center gap-2">
-              ${icon("warning", 16, "text-error")}<span>Critical Alerts</span>
-            </h2>
-            <span class="font-ribbon text-ribbon ${failed ? "bg-error/10 text-error" : "bg-[#1b211e] text-on-surface-variant"} px-2 py-0.5 rounded">${failed} ${failed === 1 ? "Active" : "Active"}</span>
-          </div>
-          <div class="flex-1 flex flex-col gap-2 ${lastFailed ? "" : "md:min-h-[120px]"}">${criticalCard}</div>
-        </div>
-
-        <!-- Live Activity (full width) -->
-        <div class="rds-hub-card rds-hub-activity bg-surface-container panel-border rounded-DEFAULT flex flex-col p-unit md:col-span-2 lg:col-span-3 lg:min-h-[280px]">
-          <div class="flex justify-between items-center mb-unit border-b border-[#242b28] pb-unit">
-            <h2 class="font-h2 text-h2 text-on-surface flex items-center gap-2">
-              ${icon("list_alt", 16)}<span>Live Activity</span>
-            </h2>
-            <div class="flex items-center gap-3">
-              <a href="/chat" class="font-ribbon text-ribbon text-on-surface-variant hover:text-on-surface flex items-center gap-1">${icon("chat", 14)}<span>open chat</span></a>
-              <a href="/audit" class="font-ribbon text-ribbon text-primary-container hover:underline">audit log ↗</a>
-            </div>
-          </div>
-          <div class="flex-1 max-h-[220px] md:max-h-none overflow-y-auto custom-scrollbar pr-1 leading-tight space-y-1 overscroll-contain">${activityRows}</div>
+          <div class="max-h-[220px] overflow-y-auto custom-scrollbar pr-1 leading-tight space-y-1 overscroll-contain">${activityRows}</div>
         </div>
       </div>
     </div>
@@ -13415,6 +13334,73 @@ function layout(title: string, body: string, opts: { nav?: NavKey; topbarTab?: "
   .rds-hub-card .font-table {
     color: #b8c3bb;
   }
+  .rds-hub-strip {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    border: 1px solid rgba(36,43,40,.9);
+    border-radius: 8px;
+    background: #101412;
+    overflow: hidden;
+  }
+  .rds-strip-cell {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 12px 16px;
+    min-width: 0;
+    color: #e9eeea;
+    transition: background .15s ease;
+  }
+  .rds-strip-cell + .rds-strip-cell { border-left: 1px solid rgba(36,43,40,.9); }
+  a.rds-strip-cell:hover { background: #141917; }
+  .rds-strip-label {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 11px; line-height: 15px; font-weight: 600;
+    letter-spacing: .06em; text-transform: uppercase; color: #75817a;
+  }
+  .rds-strip-value {
+    display: inline-flex; align-items: center; gap: 8px;
+    font-size: 14px; line-height: 20px; font-weight: 600; color: #e9eeea;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .rds-strip-meta { font-family: var(--font-code); font-size: 12px; font-weight: 400; color: #a5b0a9; }
+  .rds-strip-dot { width: 8px; height: 8px; border-radius: 999px; background: #3a4440; flex: 0 0 auto; }
+  .rds-strip-dot.is-live { background: #6ad7a3; box-shadow: 0 0 8px rgba(106,215,163,.45); }
+  .rds-strip-drop .rds-strip-value { font-weight: 500; color: #a5b0a9; }
+  .rds-strip-drop:hover .rds-strip-value { color: #e9eeea; }
+  @media (max-width: 767px) {
+    .rds-hub-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .rds-strip-cell:nth-child(3) { border-left: 0; }
+    .rds-strip-cell:nth-child(n+3) { border-top: 1px solid rgba(36,43,40,.9); }
+  }
+  .rds-need-row {
+    display: flex; align-items: center; gap: 10px;
+    border: 1px solid rgba(36,43,40,.58); border-radius: 8px;
+    padding: 8px 10px; background: rgba(7,9,8,.34);
+    transition: background .15s ease, border-color .15s ease;
+  }
+  .rds-need-row:hover { background: rgba(27,33,30,.82); border-color: rgba(117,129,122,.45); }
+  .rds-need-main { display: flex; align-items: center; gap: 10px; min-width: 0; flex: 1 1 auto; }
+  .rds-need-dot { width: 8px; height: 8px; border-radius: 999px; flex: 0 0 auto; }
+  .rds-need-dot.is-bad { background: #ffb4ab; box-shadow: 0 0 8px rgba(255,180,171,.35); }
+  .rds-need-dot.is-warn { background: #f0b869; }
+  .rds-need-text { display: flex; flex-direction: column; min-width: 0; }
+  .rds-need-title { font-size: 13.5px; line-height: 19px; color: #e9eeea; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .rds-need-reason { font-size: 12px; line-height: 17px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .rds-need-reason.is-bad { color: #ffb4ab; }
+  .rds-need-reason.is-warn { color: #f0b869; }
+  .rds-need-age { color: #75817a; }
+  .rds-need-actions { display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+  .rds-need-dismiss, .rds-need-open {
+    display: inline-flex; align-items: center; box-sizing: border-box;
+    height: 30px !important; min-height: 30px !important;
+    font-size: 12px; line-height: 16px; font-weight: 600; white-space: nowrap;
+    padding: 5px 10px; border-radius: 6px; border: 1px solid #242b28;
+    background: #141917; color: #d3ddd6; transition: background .15s ease, color .15s ease;
+  }
+  .rds-need-dismiss { background: transparent; color: #a5b0a9; }
+  .rds-need-dismiss:hover, .rds-need-open:hover { background: #1b211e; color: #e9eeea; }
+  .rds-need-empty { display: flex; align-items: center; gap: 10px; padding: 12px 4px; font-size: 13px; color: #a5b0a9; }
   .rds-hub-card-compact {
     min-height: 136px;
   }
